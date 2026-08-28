@@ -1,12 +1,13 @@
 {
-  "name": "@raddus/canvas",
+  "name": "@raddus/graph",
   "version": "1.3.0",
   "private": false,
-  "description": "Raddus Canvas local Anthropic canvas app.",
+  "description": "Raddus Graph local CLI agent graph app.",
   "type": "module",
   "main": "server/index.mjs",
   "bin": {
-    "raddus-canvas": "./bin/raddus-canvas.mjs"
+    "raddus-graph": "./bin/raddus-graph.mjs",
+    "raddus-canvas": "./bin/raddus-graph.mjs"
   },
   "files": [
     "bin",
@@ -17,26 +18,23 @@
   ],
   "scripts": {
     "ensure-deps": "[ -x node_modules/.bin/tsc ] && [ -x node_modules/.bin/vite ] || npm ci",
-    "dev": "npm run ensure-deps && node bin/raddus-canvas.mjs --dev",
+    "dev": "npm run ensure-deps && node bin/raddus-graph.mjs --dev",
     "build": "npm run ensure-deps && tsc --noEmit && vite build",
     "prepack": "npm run build",
     "publish:patch": "npm ci && npm version patch && npm publish --access public && git push --follow-tags",
     "publish:minor": "npm ci && npm version minor && npm publish --access public && git push --follow-tags",
     "publish:major": "npm ci && npm version major && npm publish --access public && git push --follow-tags",
-    "preview": "npm run ensure-deps && node bin/raddus-canvas.mjs",
-    "start": "npm run ensure-deps && node bin/raddus-canvas.mjs"
+    "preview": "npm run ensure-deps && node bin/raddus-graph.mjs",
+    "start": "npm run ensure-deps && node bin/raddus-graph.mjs"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.115.0",
     "@vitejs/plugin-react": "^6.0.2",
     "lucide-react": "^1.21.0",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",
-    "react-markdown": "^10.1.0",
-    "remark-gfm": "^4.0.1",
     "typescript": "^6.0.3",
     "vite": "^8.0.16"
   },

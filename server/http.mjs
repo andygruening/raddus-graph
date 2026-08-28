@@ -1,10 +1,8 @@
 import { createServer } from "node:http";
-import { handleAnthropic } from "./anthropicProxy.mjs";
-import { authPayload, ensureSession, handleLogin, handleLogout } from "./auth.mjs";
-import { bareAnthropicRoutes, bareLocalRoutes, host } from "./config.mjs";
+import { host, removedCanvasRoutes, removedProviderRoutes } from "./config.mjs";
 import { HttpError } from "./errors.mjs";
+import { handleGraphApi } from "./graphApi.mjs";
 import { sendError, sendJson } from "./httpUtils.mjs";
-import { handleLocalStore } from "./localStore.mjs";
 import { assertLocalRequest } from "./security.mjs";
 import { serveStatic } from "./staticAssets.mjs";
 
@@ -28,15 +26,14 @@ export async function createRaddusHttpServer({ isDev = false, defaultPort = 5174
         await handleApi(req, res, url);
         return;
       }
-      if (isBareAnthropicRoute(url.pathname)) {
+      if (isRemovedProviderRoute(url.pathname)) {
         assertLocalRequest(req);
-        const proxyUrl = new URL(`/api/anthropic${url.pathname}${url.search}`, url);
-        await handleAnthropic(req, res, proxyUrl);
+        throw new HttpError(410, "Raddus Graph no longer proxies Anthropic SDK routes. Use /api/graph/*.");
         return;
       }
-      if (isBareLocalRoute(url.pathname)) {
+      if (isRemovedCanvasRoute(url.pathname)) {
         assertLocalRequest(req);
-        throw new HttpError(410, "This endpoint is handled in the local browser store. Use the Raddus Canvas frontend or /api/anthropic/* for Anthropic proxy calls.");
+        throw new HttpError(410, "This Raddus Canvas endpoint was removed. Use the Raddus Graph frontend or /api/graph/*.");
       }
       if (vite) {
         vite.middlewares(req, res, (error) => {
@@ -81,37 +78,26 @@ async function handleApi(req, res, url) {
     return;
   }
   assertLocalRequest(req);
-  if (url.pathname === "/api/auth/login" && req.method === "POST") {
-    await handleLogin(req, res);
+  if (url.pathname === "/api/health" && req.method === "GET") {
+    sendJson(res, 200, { ok: true, name: "Raddus Graph" });
     return;
   }
-  if (url.pathname === "/api/auth/session" && req.method === "GET") {
-    const session = await ensureSession(req, res);
-    sendJson(res, 200, authPayload(session));
+  if (url.pathname.startsWith("/api/graph/")) {
+    await handleGraphApi(req, res, url);
     return;
   }
-  if (url.pathname === "/api/auth/logout" && req.method === "POST") {
-    await handleLogout(req, res);
-    return;
+  if (url.pathname.startsWith("/api/auth/") || url.pathname.startsWith("/api/anthropic/") || url.pathname.startsWith("/api/local-store/")) {
+    throw new HttpError(410, "This Raddus Canvas API was removed during the Raddus Graph migration.");
   }
-  if (url.pathname.startsWith("/api/local-store/")) {
-    const session = await ensureSession(req, res);
-    await handleLocalStore(req, res, url, session);
-    return;
-  }
-  if (url.pathname.startsWith("/api/anthropic/")) {
-    await handleAnthropic(req, res, url);
-    return;
-  }
-  throw new HttpError(404, "Unknown local API endpoint.");
+  throw new HttpError(404, "Unknown Raddus Graph API endpoint.");
 }
 
-function isBareAnthropicRoute(pathname) {
+function isRemovedProviderRoute(pathname) {
   const [root] = pathname.split("/").filter(Boolean);
-  return Boolean(root && bareAnthropicRoutes.has(root));
+  return Boolean(root && removedProviderRoutes.has(root));
 }
 
-function isBareLocalRoute(pathname) {
+function isRemovedCanvasRoute(pathname) {
   const [root] = pathname.split("/").filter(Boolean);
-  return Boolean(root && bareLocalRoutes.has(root));
+  return Boolean(root && removedCanvasRoutes.has(root));
 }
