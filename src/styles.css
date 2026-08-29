@@ -385,27 +385,40 @@ a:focus-visible {
   pointer-events: none;
 }
 
+.project-edge-group {
+  --edge-color: var(--brand-border);
+}
+
+.project-edge-group.runs {
+  --edge-color: var(--brand-hover);
+}
+
+.project-edge-group.evaluates {
+  --edge-color: #8a63d2;
+}
+
+.project-edge-group.routes {
+  --edge-color: var(--success-fg);
+}
+
 .project-edge {
   fill: none;
-  stroke: var(--brand-border);
+  stroke: var(--edge-color);
   stroke-width: 2;
   stroke-dasharray: 1;
   stroke-dashoffset: 1;
-  marker-end: url("#project-edge-arrow");
+  stroke-linecap: square;
+  stroke-linejoin: miter;
   animation: projectEdgeDrawIn 360ms cubic-bezier(0.16, 1, 0.3, 1) both;
   pointer-events: none;
+  transition: stroke-width 160ms ease, filter 160ms ease;
 }
 
-.project-edge.runs {
-  stroke: var(--brand-hover);
-}
-
-.project-edge.evaluates {
-  stroke: #8a63d2;
-}
-
-.project-edge.routes {
-  stroke: var(--success-fg);
+.project-edge-arrow {
+  fill: var(--edge-color);
+  pointer-events: none;
+  opacity: 0.94;
+  transition: opacity 160ms ease, filter 160ms ease;
 }
 
 .project-edge-preview {
@@ -426,12 +439,48 @@ a:focus-visible {
   fill: none;
   stroke: transparent;
   stroke-width: 18;
-  cursor: pointer;
+  cursor: grab;
   pointer-events: stroke;
 }
 
-.project-edge-hit:hover + .project-edge {
-  stroke: var(--danger-fg);
+.project-edge-group:hover .project-edge,
+.project-edge-group.selected .project-edge,
+.project-edge-group.dragging .project-edge {
+  stroke-width: 2.4;
+  filter: drop-shadow(0 0 7px color-mix(in srgb, var(--edge-color) 28%, transparent));
+}
+
+.project-edge-group:hover .project-edge-arrow,
+.project-edge-group.selected .project-edge-arrow,
+.project-edge-group.dragging .project-edge-arrow {
+  opacity: 1;
+  filter: drop-shadow(0 0 7px color-mix(in srgb, var(--edge-color) 32%, transparent));
+}
+
+.project-edge-group.dragging .project-edge-hit {
+  cursor: grabbing;
+}
+
+.project-edge-handle {
+  fill: var(--surface-bg);
+  stroke: var(--edge-color);
+  stroke-width: 2;
+  cursor: grab;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 140ms ease, r 140ms ease, filter 140ms ease;
+}
+
+.project-edge-group:hover .project-edge-handle,
+.project-edge-group.selected .project-edge-handle,
+.project-edge-group.dragging .project-edge-handle {
+  opacity: 1;
+  pointer-events: all;
+  filter: drop-shadow(0 0 8px color-mix(in srgb, var(--edge-color) 34%, transparent));
+}
+
+.project-edge-group.dragging .project-edge-handle {
+  cursor: grabbing;
 }
 
 .project-edge-label {

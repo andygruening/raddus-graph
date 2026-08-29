@@ -42,6 +42,7 @@ export interface GraphEdge {
   target: string;
   type: GraphEdgeType;
   resultId?: string;
+  bend?: { x: number; y: number } | null;
 }
 
 export interface GraphDocument {

@@ -38,8 +38,16 @@ import {
 
 type OverlayPanel = "agents" | null;
 type SaveStatus = "idle" | "saving" | "saved" | "error";
+type Point = { x: number; y: number };
 type CanvasViewport = { x: number; y: number; zoom: number };
 type ConnectionState = "idle" | "source" | "valid" | "invalid";
+type EdgeGeometry = {
+  path: string;
+  points: Point[];
+  handle: Point;
+  label: Point;
+  arrow: Point & { angle: number };
+};
 type DialogState =
   | { type: "agent-create" }
   | { type: "agent-details"; agentId: string }
@@ -88,6 +96,8 @@ export default function App() {
   const [routeResultByExpressionId, setRouteResultByExpressionId] = React.useState<Record<string, string>>({});
   const [camera, setCamera] = React.useState<CanvasViewport>(defaultCanvasViewport);
   const [draggingNodeId, setDraggingNodeId] = React.useState<string | null>(null);
+  const [draggingEdgeId, setDraggingEdgeId] = React.useState<string | null>(null);
+  const [selectedEdgeId, setSelectedEdgeId] = React.useState<string | null>(null);
   const [nodeDropTargetId, setNodeDropTargetId] = React.useState<string | null>(null);
   const [connectingFromId, setConnectingFromId] = React.useState<string | null>(null);
   const [draggingPaletteItemKey, setDraggingPaletteItemKey] = React.useState<string | null>(null);
@@ -98,6 +108,7 @@ export default function App() {
   const cameraFrameRef = React.useRef<number | null>(null);
   const latestState = React.useRef<GraphState | null>(null);
   const suppressNodeClickRef = React.useRef(false);
+  const edgeDragMovedRef = React.useRef(false);
 
   React.useEffect(() => {
     latestState.current = state;
@@ -363,6 +374,17 @@ export default function App() {
     setState(next);
   }
 
+  function moveEdgeBendLocally(edgeId: string, bend: Point) {
+    const current = latestState.current;
+    if (!current) return;
+    const next = updateEdgeInState(current, edgeId, (edge) => ({
+      ...edge,
+      bend: { x: Math.round(bend.x), y: Math.round(bend.y) },
+    }));
+    latestState.current = next;
+    setState(next);
+  }
+
   function removeEdge(edgeId: string) {
     mutateState((current) => (
       withActiveGraph(current, {
@@ -370,6 +392,7 @@ export default function App() {
         edges: current.graph.edges.filter((edge) => edge.id !== edgeId),
       })
     ));
+    if (selectedEdgeId === edgeId) setSelectedEdgeId(null);
   }
 
   function connectExplicitNodes(sourceId: string, targetId: string) {
@@ -505,6 +528,7 @@ export default function App() {
     const startX = event.clientX;
     const startY = event.clientY;
     suppressNodeClickRef.current = false;
+    setSelectedEdgeId(null);
     setDraggingNodeId(nodeId);
     setNodeDropTargetId(null);
     event.currentTarget.setPointerCapture(event.pointerId);
@@ -535,9 +559,46 @@ export default function App() {
     window.addEventListener("pointerup", onUp);
   }
 
+  function beginEdgeDrag(event: React.PointerEvent<SVGElement>, edgeId: string, handle: Point) {
+    event.preventDefault();
+    event.stopPropagation();
+    const current = latestState.current;
+    if (!current?.graph.edges.some((edge) => edge.id === edgeId)) return;
+    const pointerStart = screenToWorld(event.clientX, event.clientY);
+    const offsetX = pointerStart.x - handle.x;
+    const offsetY = pointerStart.y - handle.y;
+    const startX = event.clientX;
+    const startY = event.clientY;
+    edgeDragMovedRef.current = false;
+    setSelectedEdgeId(edgeId);
+    setDraggingEdgeId(edgeId);
+    event.currentTarget.setPointerCapture(event.pointerId);
+
+    function onMove(moveEvent: PointerEvent) {
+      const moved = Math.hypot(moveEvent.clientX - startX, moveEvent.clientY - startY) > 3;
+      if (moved) edgeDragMovedRef.current = true;
+      if (!edgeDragMovedRef.current) return;
+      const nextWorld = screenToWorld(moveEvent.clientX, moveEvent.clientY);
+      moveEdgeBendLocally(edgeId, { x: nextWorld.x - offsetX, y: nextWorld.y - offsetY });
+    }
+
+    function onUp() {
+      setDraggingEdgeId(null);
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      if (!edgeDragMovedRef.current) return;
+      const latest = latestState.current;
+      if (latest) void persistState(latest);
+    }
+
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  }
+
   function beginConnection(event: React.PointerEvent, nodeId: string) {
     event.preventDefault();
     event.stopPropagation();
+    setSelectedEdgeId(null);
     setConnectingFromId(nodeId);
     updateConnectionPreview(event.clientX, event.clientY);
 
@@ -679,7 +740,8 @@ export default function App() {
   }
 
   function handleCanvasPointerDown(event: React.PointerEvent<HTMLDivElement>) {
-    if (eventTargetClosest(event.target, ".project-node, .project-controls-overlay, .project-workspace-overlay, .project-card-palette")) return;
+    if (eventTargetClosest(event.target, ".project-node, .project-edge-hit, .project-edge-handle, .project-controls-overlay, .project-workspace-overlay, .project-card-palette")) return;
+    setSelectedEdgeId(null);
     const startX = event.clientX;
     const startY = event.clientY;
     const startCamera = cameraRef.current;
@@ -745,7 +807,7 @@ export default function App() {
         <div className="workspace">
           <section className="projects-view">
             <div
-              className={`project-canvas ${connectingFromId ? "connecting" : ""} ${draggingPaletteItemKey ? "palette-dragging" : ""} ${paletteDragPreview ? "palette-drop-ready" : ""} ${draggingNodeId ? "node-dragging" : ""}`}
+              className={`project-canvas ${connectingFromId ? "connecting" : ""} ${draggingPaletteItemKey ? "palette-dragging" : ""} ${paletteDragPreview ? "palette-drop-ready" : ""} ${draggingNodeId ? "node-dragging" : ""} ${draggingEdgeId ? "edge-dragging" : ""}`}
               ref={canvasRef}
               onPointerDown={handleCanvasPointerDown}
               onWheel={handleCanvasWheel}
@@ -829,34 +891,42 @@ export default function App() {
 
               <div className="project-world" style={{ transform: `translate(${camera.x}px, ${camera.y}px) scale(${camera.zoom})` }}>
                 <svg className="project-edges" aria-hidden="true">
-                  <defs>
-                    <marker id="project-edge-arrow" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto" markerUnits="strokeWidth">
-                      <path d="M 0 0 L 10 5 L 0 10 z" fill="context-stroke" />
-                    </marker>
-                  </defs>
                   {graph.edges.map((edge, edgeIndex) => {
                     const source = graph.nodes.find((node) => node.id === edge.source);
                     const target = graph.nodes.find((node) => node.id === edge.target);
                     if (!source || !target) return null;
-                    const path = edgePath(source, target);
-                    const labelPoint = edgeStatusPoint(source, target);
+                    const geometry = edgeGeometry(edge, source, target);
+                    const selected = selectedEdgeId === edge.id;
+                    const dragging = draggingEdgeId === edge.id;
                     return (
-                      <g key={edge.id}>
+                      <g className={`project-edge-group ${edge.type} ${selected ? "selected" : ""} ${dragging ? "dragging" : ""}`} key={edge.id}>
                         <path
                           className="project-edge-hit"
-                          d={path}
-                          onPointerDown={(event) => event.stopPropagation()}
-                          onClick={(event) => {
+                          d={geometry.path}
+                          onPointerDown={(event) => beginEdgeDrag(event, edge.id, geometry.handle)}
+                          onDoubleClick={(event) => {
                             event.stopPropagation();
                             removeEdge(edge.id);
                           }}
                         />
-                        <path className={`project-edge ${edge.type}`} d={path} pathLength={1} style={{ animationDelay: `${Math.min(edgeIndex * 18 + 70, 260)}ms` }} />
+                        <path className={`project-edge ${edge.type}`} d={geometry.path} pathLength={1} style={{ animationDelay: `${Math.min(edgeIndex * 18 + 70, 260)}ms` }} />
+                        <path
+                          className={`project-edge-arrow ${edge.type}`}
+                          d="M -3.5 -3.5 L 3.5 0 L -3.5 3.5 Z"
+                          transform={`translate(${geometry.arrow.x} ${geometry.arrow.y}) rotate(${geometry.arrow.angle})`}
+                        />
                         {edge.resultId ? (
-                          <text className="project-edge-label" x={labelPoint.x} y={labelPoint.y - 10}>
+                          <text className="project-edge-label" x={geometry.label.x} y={geometry.label.y - 12}>
                             {edge.resultId}
                           </text>
                         ) : null}
+                        <circle
+                          className={`project-edge-handle ${edge.type}`}
+                          cx={geometry.handle.x}
+                          cy={geometry.handle.y}
+                          r={7}
+                          onPointerDown={(event) => beginEdgeDrag(event, edge.id, geometry.handle)}
+                        />
                       </g>
                     );
                   })}
@@ -1860,28 +1930,133 @@ function selectedRouteResultForExpression(
   return state.results.find((result) => !result.reserved)?.id ?? "unknown";
 }
 
-function edgePath(source: GraphNode, target: GraphNode): string {
+function edgeGeometry(edge: Pick<GraphEdge, "bend">, source: GraphNode, target: GraphNode): EdgeGeometry {
   const sourceCenter = projectNodeCenter(source);
   const targetCenter = projectNodeCenter(target);
-  const sourcePoint = projectNodeBoundaryPoint(source, targetCenter);
-  const targetPoint = projectNodeBoundaryPoint(target, sourceCenter, 4);
-  const midX = (sourcePoint.x + targetPoint.x) / 2;
-  return `M ${sourcePoint.x} ${sourcePoint.y} C ${midX} ${sourcePoint.y}, ${midX} ${targetPoint.y}, ${targetPoint.x} ${targetPoint.y}`;
-}
-
-function edgeStatusPoint(source: GraphNode, target: GraphNode): { x: number; y: number } {
-  const sourcePoint = projectNodeCenter(source);
-  const targetPoint = projectNodeCenter(target);
+  const bend = edge.bend ?? defaultEdgeBend(source, target);
+  const sourcePoint = projectNodeBoundaryPoint(source, bend);
+  const targetPoint = projectNodeBoundaryPoint(target, bend, 4);
+  const horizontalFirst = Math.abs(targetCenter.x - sourceCenter.x) >= Math.abs(targetCenter.y - sourceCenter.y);
+  const points = compactEdgePoints(horizontalFirst ? [
+    sourcePoint,
+    { x: bend.x, y: sourcePoint.y },
+    bend,
+    { x: targetPoint.x, y: bend.y },
+    targetPoint,
+  ] : [
+    sourcePoint,
+    { x: sourcePoint.x, y: bend.y },
+    bend,
+    { x: bend.x, y: targetPoint.y },
+    targetPoint,
+  ]);
+  const arrow = pointOnPolyline(points, 0.5);
   return {
-    x: (sourcePoint.x + targetPoint.x) / 2,
-    y: (sourcePoint.y + targetPoint.y) / 2,
+    path: edgePathFromPoints(points),
+    points,
+    handle: bend,
+    label: arrow,
+    arrow,
   };
 }
 
-function connectionPreviewPath(source: GraphNode, target: { x: number; y: number }): string {
+function edgePath(source: GraphNode, target: GraphNode, bend?: Point | null): string {
+  return edgeGeometry({ bend }, source, target).path;
+}
+
+function connectionPreviewPath(source: GraphNode, target: Point): string {
   const sourcePoint = projectNodeBoundaryPoint(source, target);
-  const midX = (sourcePoint.x + target.x) / 2;
-  return `M ${sourcePoint.x} ${sourcePoint.y} C ${midX} ${sourcePoint.y}, ${midX} ${target.y}, ${target.x} ${target.y}`;
+  const bend = {
+    x: (sourcePoint.x + target.x) / 2,
+    y: (sourcePoint.y + target.y) / 2,
+  };
+  const horizontalFirst = Math.abs(target.x - sourcePoint.x) >= Math.abs(target.y - sourcePoint.y);
+  const points = compactEdgePoints(horizontalFirst ? [
+    sourcePoint,
+    { x: bend.x, y: sourcePoint.y },
+    bend,
+    { x: target.x, y: bend.y },
+    target,
+  ] : [
+    sourcePoint,
+    { x: sourcePoint.x, y: bend.y },
+    bend,
+    { x: bend.x, y: target.y },
+    target,
+  ]);
+  return edgePathFromPoints(points);
+}
+
+function defaultEdgeBend(source: GraphNode, target: GraphNode): Point {
+  const sourceCenter = projectNodeCenter(source);
+  const targetCenter = projectNodeCenter(target);
+  return {
+    x: (sourceCenter.x + targetCenter.x) / 2,
+    y: (sourceCenter.y + targetCenter.y) / 2,
+  };
+}
+
+function compactEdgePoints(points: Point[]): Point[] {
+  const deduped = points.reduce<Point[]>((result, point) => {
+    const previous = result.at(-1);
+    if (!previous || Math.abs(previous.x - point.x) > 0.01 || Math.abs(previous.y - point.y) > 0.01) {
+      result.push(point);
+    }
+    return result;
+  }, []);
+  if (deduped.length <= 2) return deduped;
+  return deduped.filter((point, index, list) => {
+    if (index === 0 || index === list.length - 1) return true;
+    const previous = list[index - 1];
+    const next = list[index + 1];
+    const horizontal = Math.abs(previous.y - point.y) <= 0.01 && Math.abs(point.y - next.y) <= 0.01;
+    const vertical = Math.abs(previous.x - point.x) <= 0.01 && Math.abs(point.x - next.x) <= 0.01;
+    return !horizontal && !vertical;
+  });
+}
+
+function edgePathFromPoints(points: Point[]): string {
+  return points.map((point, index) => `${index === 0 ? "M" : "L"} ${svgNumber(point.x)} ${svgNumber(point.y)}`).join(" ");
+}
+
+function pointOnPolyline(points: Point[], ratio: number): Point & { angle: number } {
+  const segments = points.slice(1).map((point, index) => {
+    const previous = points[index];
+    const dx = point.x - previous.x;
+    const dy = point.y - previous.y;
+    return { previous, point, dx, dy, length: Math.hypot(dx, dy) };
+  }).filter((segment) => segment.length > 0.01);
+  const totalLength = segments.reduce((sum, segment) => sum + segment.length, 0);
+  if (!segments.length || totalLength <= 0) {
+    const first = points[0] ?? { x: 0, y: 0 };
+    return { x: first.x, y: first.y, angle: 0 };
+  }
+
+  const targetLength = totalLength * ratio;
+  let traveled = 0;
+  for (const segment of segments) {
+    if (traveled + segment.length >= targetLength) {
+      const progress = (targetLength - traveled) / segment.length;
+      return {
+        x: segment.previous.x + segment.dx * progress,
+        y: segment.previous.y + segment.dy * progress,
+        angle: Math.atan2(segment.dy, segment.dx) * 180 / Math.PI,
+      };
+    }
+    traveled += segment.length;
+  }
+
+  const last = segments.at(-1);
+  return {
+    x: last?.point.x ?? 0,
+    y: last?.point.y ?? 0,
+    angle: last ? Math.atan2(last.dy, last.dx) * 180 / Math.PI : 0,
+  };
+}
+
+function svgNumber(value: number): string {
+  const rounded = Math.round(value * 100) / 100;
+  return Object.is(rounded, -0) ? "0" : String(rounded);
 }
 
 function projectNodeCenter(node: GraphNode): { x: number; y: number } {
@@ -1931,6 +2106,13 @@ function updateNodeInState(state: GraphState, nodeId: string, update: (node: Gra
   return withActiveGraph(state, {
     ...state.graph,
     nodes: state.graph.nodes.map((node) => node.id === nodeId ? update(node) : node),
+  });
+}
+
+function updateEdgeInState(state: GraphState, edgeId: string, update: (edge: GraphEdge) => GraphEdge): GraphState {
+  return withActiveGraph(state, {
+    ...state.graph,
+    edges: state.graph.edges.map((edge) => edge.id === edgeId ? update(edge) : edge),
   });
 }
 

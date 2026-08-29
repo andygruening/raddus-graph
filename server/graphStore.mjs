@@ -321,13 +321,22 @@ function normalizeGraphEdge(value, nodeIds) {
   const type = stringValue(record.type);
   if (type !== "runs" && type !== "evaluates" && type !== "routes") return null;
   const resultId = normalizeResultId(record.resultId);
+  const bend = normalizePoint(record.bend);
   return {
     id: stringValue(record.id) || cryptoId("edge"),
     source,
     target,
     type,
     ...(type === "routes" && resultId ? { resultId } : {}),
+    ...(bend ? { bend } : {}),
   };
+}
+
+function normalizePoint(value) {
+  const record = asRecord(value);
+  const x = numberValue(record.x, Number.NaN);
+  const y = numberValue(record.y, Number.NaN);
+  return Number.isFinite(x) && Number.isFinite(y) ? { x, y } : null;
 }
 
 function normalizeGraphSession(value) {
