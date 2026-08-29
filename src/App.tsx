@@ -22,12 +22,14 @@ import {
   type AgentSpec,
   type BranchListResult,
   type GraphEdge,
+  type GraphDocument,
   type GraphNode,
   type GraphNodeType,
   type GraphSession,
   type GraphState,
   type ModelCatalogEntry,
   type NodeStatus,
+  type ProjectRecord,
   type RepositoryListResult,
   type RepositoryOption,
   type ResultDefinition,
@@ -46,8 +48,10 @@ type DialogState =
   | { type: "results" }
   | { type: "sessions" }
   | { type: "help" }
+  | { type: "project-create" }
   | null;
 type AgentDraft = Pick<AgentSpec, "name" | "model" | "systemPrompt">;
+type ProjectDraft = Pick<ProjectRecord, "name">;
 type PaletteItem = { type: "agent"; agentId: string };
 type PaletteDropConnection = {
   source: GraphNode;
@@ -168,6 +172,8 @@ export default function App() {
       const saved = await api.saveState({
         agents: nextState.agents,
         results: nextState.results,
+        projects: nextState.projects,
+        selectedProjectId: nextState.selectedProjectId,
         graph: nextState.graph,
       });
       setState((current) => {
@@ -190,6 +196,35 @@ export default function App() {
     latestState.current = next;
     setState(next);
     if (persist) void persistState(next);
+  }
+
+  function selectProject(projectId: string) {
+    mutateState((current) => selectProjectInState(current, projectId));
+    setCamera(defaultCanvasViewport);
+    setRouteResultByExpressionId({});
+  }
+
+  function createProject(draft: ProjectDraft): ProjectRecord | null {
+    const name = draft.name.trim();
+    if (!name) {
+      setError("Project name is required.");
+      return null;
+    }
+    const now = new Date().toISOString();
+    const project: ProjectRecord = {
+      id: newId("project"),
+      name,
+      graph: defaultProjectGraph(),
+      createdAt: now,
+      updatedAt: now,
+    };
+    mutateState((current) => selectProjectInState({
+      ...current,
+      projects: [...current.projects, project],
+    }, project.id));
+    setCamera(defaultCanvasViewport);
+    setRouteResultByExpressionId({});
+    return project;
   }
 
   function createAgent(draft: AgentDraft): AgentSpec | null {
@@ -225,16 +260,23 @@ export default function App() {
   }
 
   function deleteAgent(agentId: string) {
-    mutateState((current) => ({
-      ...current,
-      agents: current.agents.filter((agent) => agent.id !== agentId),
-      graph: {
-        nodes: current.graph.nodes.map((node) => (
-          node.type === "agent" && node.agentId === agentId ? { ...node, agentId: null } : node
-        )),
-        edges: current.graph.edges,
-      },
-    }));
+    mutateState((current) => {
+      const projects = current.projects.map((project) => ({
+        ...project,
+        graph: {
+          ...project.graph,
+          nodes: project.graph.nodes.map((node) => (
+            node.type === "agent" && node.agentId === agentId ? { ...node, agentId: null } : node
+          )),
+        },
+        updatedAt: new Date().toISOString(),
+      }));
+      return withSelectedProjectGraph({
+        ...current,
+        agents: current.agents.filter((agent) => agent.id !== agentId),
+        projects,
+      });
+    });
     if (dialog?.type === "agent-details" && dialog.agentId === agentId) setDialog(null);
   }
 
@@ -268,14 +310,15 @@ export default function App() {
 
   function deleteResult(resultId: string) {
     if (reservedResultIds.has(resultId)) return;
-    mutateState((current) => ({
-      ...current,
-      results: current.results.filter((result) => result.id !== resultId),
-      graph: {
+    mutateState((current) => (
+      withActiveGraph({
+        ...current,
+        results: current.results.filter((result) => result.id !== resultId),
+      }, {
         nodes: current.graph.nodes,
         edges: current.graph.edges.filter((edge) => edge.resultId !== resultId),
-      },
-    }));
+      })
+    ));
   }
 
   function addNodeAt(type: GraphNodeType, x: number, y: number, agentId?: string | null) {
@@ -288,10 +331,7 @@ export default function App() {
         ...(type === "play" ? { prompt: "", repository: null, branch: null } : {}),
         ...(type === "agent" ? { agentId: agentId ?? current.agents[0]?.id ?? null } : {}),
       };
-      return {
-        ...current,
-        graph: { ...current.graph, nodes: [...current.graph.nodes, node] },
-      };
+      return withActiveGraph(current, { ...current.graph, nodes: [...current.graph.nodes, node] });
     });
   }
 
@@ -302,13 +342,12 @@ export default function App() {
   }
 
   function deleteNode(nodeId: string) {
-    mutateState((current) => ({
-      ...current,
-      graph: {
+    mutateState((current) => (
+      withActiveGraph(current, {
         nodes: current.graph.nodes.filter((node) => node.id !== nodeId),
         edges: current.graph.edges.filter((edge) => edge.source !== nodeId && edge.target !== nodeId),
-      },
-    }));
+      })
+    ));
     if (dialog && "nodeId" in dialog && dialog.nodeId === nodeId) setDialog(null);
   }
 
@@ -325,13 +364,12 @@ export default function App() {
   }
 
   function removeEdge(edgeId: string) {
-    mutateState((current) => ({
-      ...current,
-      graph: {
+    mutateState((current) => (
+      withActiveGraph(current, {
         ...current.graph,
         edges: current.graph.edges.filter((edge) => edge.id !== edgeId),
-      },
-    }));
+      })
+    ));
   }
 
   function connectExplicitNodes(sourceId: string, targetId: string) {
@@ -355,16 +393,15 @@ export default function App() {
   }
 
   function connectRoute(source: string, resultId: string, target: string | null) {
-    mutateState((current) => ({
-      ...current,
-      graph: {
+    mutateState((current) => (
+      withActiveGraph(current, {
         nodes: current.graph.nodes,
         edges: [
           ...current.graph.edges.filter((edge) => !(edge.source === source && edge.type === "routes" && edge.resultId === resultId)),
           ...(target ? [{ id: newId("edge"), source, target, type: "routes" as const, resultId }] : []),
         ],
-      },
-    }));
+      })
+    ));
   }
 
   async function runPlayNode(node: GraphNode) {
@@ -380,11 +417,18 @@ export default function App() {
     setRunningPlayNodeId(node.id);
     setError(null);
     try {
-      const saved = await api.saveState({ agents: current.agents, results: current.results, graph: current.graph });
+      const saved = await api.saveState({
+        agents: current.agents,
+        results: current.results,
+        projects: current.projects,
+        selectedProjectId: current.selectedProjectId,
+        graph: current.graph,
+      });
       const repository = freshNode.repository || null;
       const repositoryOption = repositoryResult?.repositories.find((candidate) => candidate.nameWithOwner === repository);
       const payload = await api.createSession({
         playNodeId: freshNode.id,
+        projectId: current.selectedProjectId,
         prompt,
         repository,
         repositoryUrl: repositoryOption?.url,
@@ -574,13 +618,10 @@ export default function App() {
       const nextEdges = connection
         ? upsertEdges(current.graph.edges, edgeFromDropConnection(connection))
         : current.graph.edges;
-      return {
-        ...current,
-        graph: {
-          nodes: [...current.graph.nodes, node],
-          edges: nextEdges,
-        },
-      };
+      return withActiveGraph(current, {
+        nodes: [...current.graph.nodes, node],
+        edges: nextEdges,
+      });
     });
   }
 
@@ -711,12 +752,24 @@ export default function App() {
             >
               <div className="grid-field" aria-hidden="true" />
               <div className="project-controls-overlay">
-                <div className="canvas-control-group project-brand-group">
-                  <img src="/raddus-logo.png" alt="" />
-                  <span>
-                    <strong>Raddus Graph</strong>
-                    <small>{state?.dataDir ?? ".raddus-graph"}</small>
-                  </span>
+                <div className="canvas-control-group project-select-group">
+                  <select
+                    className="project-select"
+                    value={state?.selectedProjectId ?? ""}
+                    onChange={(event) => selectProject(event.target.value)}
+                    onPointerDown={(event) => event.stopPropagation()}
+                    aria-label="Project"
+                    disabled={!state}
+                  >
+                    {state?.projects.map((project) => (
+                      <option value={project.id} key={project.id}>
+                        {project.name}
+                      </option>
+                    ))}
+                  </select>
+                  <button className="icon-button" type="button" onClick={() => setDialog({ type: "project-create" })} title="Create project" aria-label="Create project">
+                    <Plus size={16} aria-hidden="true" />
+                  </button>
                 </div>
                 <div className="canvas-control-group">
                   <button className="icon-button" type="button" onClick={() => setOverlayPanel((panel) => panel === "agents" ? null : "agents")} title="Agent specs" aria-label="Agent specs">
@@ -776,6 +829,11 @@ export default function App() {
 
               <div className="project-world" style={{ transform: `translate(${camera.x}px, ${camera.y}px) scale(${camera.zoom})` }}>
                 <svg className="project-edges" aria-hidden="true">
+                  <defs>
+                    <marker id="project-edge-arrow" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto" markerUnits="strokeWidth">
+                      <path d="M 0 0 L 10 5 L 0 10 z" fill="context-stroke" />
+                    </marker>
+                  </defs>
                   {graph.edges.map((edge, edgeIndex) => {
                     const source = graph.nodes.find((node) => node.id === edge.source);
                     const target = graph.nodes.find((node) => node.id === edge.target);
@@ -864,6 +922,15 @@ export default function App() {
           onSave={(draft) => {
             const agent = createAgent(draft);
             if (agent) setDialog({ type: "agent-details", agentId: agent.id });
+          }}
+        />
+      ) : null}
+      {state && dialog?.type === "project-create" ? (
+        <ProjectCreateDialog
+          onClose={() => setDialog(null)}
+          onCreate={(draft) => {
+            const project = createProject(draft);
+            if (project) setDialog(null);
           }}
         />
       ) : null}
@@ -981,7 +1048,8 @@ function ProjectNodeCard({
     >
       {node.type === "agent" ? (
         <>
-          <div className="agent-node-actions">
+          <div className="project-node-head">
+            <span>Agent</span>
             <button className="project-connector" type="button" onPointerDown={onConnectorPointerDown} title="Drag to connect" aria-label="Drag to connect" />
             <button className="icon-button compact-icon project-card-remove" type="button" onClick={onRemove} title="Remove card" aria-label="Remove card">
               <X size={12} aria-hidden="true" />
@@ -1154,6 +1222,45 @@ function PaletteNodePreview({ preview, agents }: { preview: PaletteDragPreview; 
         <span>{agent?.name ?? "Agent"}</span>
       </div>
     </article>
+  );
+}
+
+function ProjectCreateDialog({
+  onClose,
+  onCreate,
+}: {
+  onClose: () => void;
+  onCreate: (draft: ProjectDraft) => void;
+}) {
+  const [draft, setDraft] = React.useState<ProjectDraft>({ name: "" });
+
+  return (
+    <Modal title="New Project" onClose={onClose} plainHeader>
+      <form
+        className="form-grid"
+        onSubmit={(event) => {
+          event.preventDefault();
+          onCreate(draft);
+        }}
+      >
+        <FormSection title="Project">
+          <label>
+            <span>Name</span>
+            <input value={draft.name} onChange={(event) => setDraft({ name: event.target.value })} required autoFocus />
+          </label>
+        </FormSection>
+        <div className="dialog-actions">
+          <button className="secondary-button" type="button" onClick={onClose}>
+            <X size={16} aria-hidden="true" />
+            Close
+          </button>
+          <button className="primary-button" type="submit">
+            <Plus size={16} aria-hidden="true" />
+            Create
+          </button>
+        </div>
+      </form>
+    </Modal>
   );
 }
 
@@ -1518,6 +1625,7 @@ function SessionsDialog({
                   </div>
                 </header>
                 <div className="session-meta">
+                  <span>{session.projectName ?? "Project"}</span>
                   <span>{formatDateTime(session.createdAt)}</span>
                   <span>{session.repository ? `${session.repository.nameWithOwner}@${session.repository.branch}` : "None"}</span>
                   <span>{session.workspacePath}</span>
@@ -1716,13 +1824,10 @@ function edgeFromDropConnection(connection: PaletteDropConnection): Omit<GraphEd
 }
 
 function withGraphEdge(state: GraphState, edge: Omit<GraphEdge, "id">): GraphState {
-  return {
-    ...state,
-    graph: {
-      ...state.graph,
-      edges: upsertEdges(state.graph.edges, edge),
-    },
-  };
+  return withActiveGraph(state, {
+    ...state.graph,
+    edges: upsertEdges(state.graph.edges, edge),
+  });
 }
 
 function upsertEdges(edges: GraphEdge[], edge: Omit<GraphEdge, "id">): GraphEdge[] {
@@ -1734,10 +1839,13 @@ function upsertEdges(edges: GraphEdge[], edge: Omit<GraphEdge, "id">): GraphEdge
   );
   if (duplicate) return edges;
   const filtered = edges.filter((candidate) => {
-    if (edge.type === "runs" || edge.type === "evaluates") {
+    if (edge.type === "runs") {
       return !(candidate.source === edge.source && candidate.type === edge.type);
     }
-    return !(candidate.source === edge.source && candidate.type === "routes" && candidate.resultId === edge.resultId);
+    if (edge.type === "routes") {
+      return !(candidate.source === edge.source && candidate.type === "routes" && candidate.resultId === edge.resultId);
+    }
+    return true;
   });
   return [...filtered, { id: newId("edge"), ...edge }];
 }
@@ -1753,8 +1861,10 @@ function selectedRouteResultForExpression(
 }
 
 function edgePath(source: GraphNode, target: GraphNode): string {
-  const sourcePoint = projectNodeCenter(source);
-  const targetPoint = projectNodeCenter(target);
+  const sourceCenter = projectNodeCenter(source);
+  const targetCenter = projectNodeCenter(target);
+  const sourcePoint = projectNodeBoundaryPoint(source, targetCenter);
+  const targetPoint = projectNodeBoundaryPoint(target, sourceCenter, 4);
   const midX = (sourcePoint.x + targetPoint.x) / 2;
   return `M ${sourcePoint.x} ${sourcePoint.y} C ${midX} ${sourcePoint.y}, ${midX} ${targetPoint.y}, ${targetPoint.x} ${targetPoint.y}`;
 }
@@ -1769,7 +1879,7 @@ function edgeStatusPoint(source: GraphNode, target: GraphNode): { x: number; y: 
 }
 
 function connectionPreviewPath(source: GraphNode, target: { x: number; y: number }): string {
-  const sourcePoint = projectNodeCenter(source);
+  const sourcePoint = projectNodeBoundaryPoint(source, target);
   const midX = (sourcePoint.x + target.x) / 2;
   return `M ${sourcePoint.x} ${sourcePoint.y} C ${midX} ${sourcePoint.y}, ${midX} ${target.y}, ${target.x} ${target.y}`;
 }
@@ -1777,6 +1887,21 @@ function connectionPreviewPath(source: GraphNode, target: { x: number; y: number
 function projectNodeCenter(node: GraphNode): { x: number; y: number } {
   const size = projectNodeSizeForType(node.type);
   return { x: node.x + size.width / 2, y: node.y + size.height / 2 };
+}
+
+function projectNodeBoundaryPoint(node: GraphNode, toward: { x: number; y: number }, padding = 0): { x: number; y: number } {
+  const center = projectNodeCenter(node);
+  const size = projectNodeSizeForType(node.type);
+  const dx = toward.x - center.x;
+  const dy = toward.y - center.y;
+  if (dx === 0 && dy === 0) return center;
+  const scaleX = dx === 0 ? Number.POSITIVE_INFINITY : (size.width / 2 + padding) / Math.abs(dx);
+  const scaleY = dy === 0 ? Number.POSITIVE_INFINITY : (size.height / 2 + padding) / Math.abs(dy);
+  const scale = Math.min(scaleX, scaleY);
+  return {
+    x: center.x + dx * scale,
+    y: center.y + dy * scale,
+  };
 }
 
 function projectNodeSizeForType(type: GraphNodeType): { width: number; height: number } {
@@ -1803,12 +1928,55 @@ function canvasRectsOverlap(
 }
 
 function updateNodeInState(state: GraphState, nodeId: string, update: (node: GraphNode) => GraphNode): GraphState {
+  return withActiveGraph(state, {
+    ...state.graph,
+    nodes: state.graph.nodes.map((node) => node.id === nodeId ? update(node) : node),
+  });
+}
+
+function withActiveGraph(state: GraphState, graph: GraphDocument): GraphState {
+  const now = new Date().toISOString();
   return {
     ...state,
-    graph: {
-      ...state.graph,
-      nodes: state.graph.nodes.map((node) => node.id === nodeId ? update(node) : node),
-    },
+    graph,
+    projects: state.projects.map((project) => (
+      project.id === state.selectedProjectId ? { ...project, graph, updatedAt: now } : project
+    )),
+  };
+}
+
+function withSelectedProjectGraph(state: GraphState): GraphState {
+  const project = state.projects.find((candidate) => candidate.id === state.selectedProjectId) ?? state.projects[0];
+  return {
+    ...state,
+    selectedProjectId: project.id,
+    graph: project.graph,
+  };
+}
+
+function selectProjectInState(state: GraphState, projectId: string): GraphState {
+  const project = state.projects.find((candidate) => candidate.id === projectId) ?? state.projects[0];
+  return {
+    ...state,
+    selectedProjectId: project.id,
+    graph: project.graph,
+  };
+}
+
+function defaultProjectGraph(): GraphDocument {
+  return {
+    nodes: [
+      {
+        id: newId("play"),
+        type: "play",
+        x: 72,
+        y: 96,
+        prompt: "Describe the graph session you want to run.",
+        repository: null,
+        branch: null,
+      },
+    ],
+    edges: [],
   };
 }
 

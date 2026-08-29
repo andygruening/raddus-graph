@@ -49,6 +49,14 @@ export interface GraphDocument {
   edges: GraphEdge[];
 }
 
+export interface ProjectRecord {
+  id: string;
+  name: string;
+  graph: GraphDocument;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface NodeStatus {
   id: string;
   nodeId: string;
@@ -88,6 +96,8 @@ export interface GraphSession {
   branchName: string | null;
   prUrl: string | null;
   activeNodeId: string | null;
+  projectId: string | null;
+  projectName: string | null;
   nodeStatuses: Record<string, NodeStatus[]>;
   nodeOutcomes: Record<string, TerminalOutcome>;
   error: string | null;
@@ -99,6 +109,8 @@ export interface GraphState {
   version: number;
   agents: AgentSpec[];
   results: ResultDefinition[];
+  projects: ProjectRecord[];
+  selectedProjectId: string;
   graph: GraphDocument;
   sessions: GraphSession[];
   updatedAt: string;
@@ -142,7 +154,7 @@ export class RaddusGraphApi {
     return requestJson<GraphState>("/api/graph/state");
   }
 
-  saveState(state: Pick<GraphState, "agents" | "results" | "graph">): Promise<GraphState> {
+  saveState(state: Pick<GraphState, "agents" | "results" | "graph"> & Partial<Pick<GraphState, "projects" | "selectedProjectId">>): Promise<GraphState> {
     return requestJson<GraphState>("/api/graph/state", jsonInit("PUT", state));
   }
 
@@ -162,7 +174,7 @@ export class RaddusGraphApi {
     return requestJson<{ sessions: GraphSession[] }>("/api/graph/sessions");
   }
 
-  createSession(payload: { playNodeId: string; prompt: string; repository?: string | null; repositoryUrl?: string; branch?: string | null }): Promise<{ session: GraphSession }> {
+  createSession(payload: { projectId?: string; playNodeId: string; prompt: string; repository?: string | null; repositoryUrl?: string; branch?: string | null }): Promise<{ session: GraphSession }> {
     return requestJson<{ session: GraphSession }>("/api/graph/sessions", jsonInit("POST", payload));
   }
 

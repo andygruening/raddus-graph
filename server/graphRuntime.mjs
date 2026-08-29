@@ -24,7 +24,10 @@ export async function createGraphSession(body) {
   const payload = asRecord(body);
   const playNodeId = stringValue(payload.playNodeId);
   const prompt = stringValue(payload.prompt);
-  const playNode = state.graph.nodes.find((node) => node.id === playNodeId && node.type === "play");
+  const projectId = nullableString(payload.projectId) ?? state.selectedProjectId;
+  const project = state.projects?.find((candidate) => candidate.id === projectId) ?? state.projects?.[0] ?? null;
+  const graph = project?.graph ?? state.graph;
+  const playNode = graph.nodes.find((node) => node.id === playNodeId && node.type === "play");
   if (!playNode) throw new Error("Select a play node before running the graph.");
   if (!prompt) throw new Error("Enter a play prompt before running the graph.");
 
@@ -62,7 +65,9 @@ export async function createGraphSession(body) {
     branchName: null,
     prUrl: null,
     activeNodeId: null,
-    graphSnapshot: state.graph,
+    projectId: project?.id ?? null,
+    projectName: project?.name ?? null,
+    graphSnapshot: graph,
     agentsSnapshot: state.agents,
     resultsSnapshot: state.results,
     nodeStatuses: {},
@@ -346,22 +351,25 @@ function firstAgentNodeForPlay(graph, playNodeId) {
 }
 
 function nextAgentNodeFromOutcome({ graph, currentAgentNode, outcome }) {
-  const expressionEdge = graph.edges.find((edge) => edge.source === currentAgentNode.id && edge.type === "evaluates");
-  const expressionNode = expressionEdge
-    ? graph.nodes.find((node) => node.id === expressionEdge.target && node.type === "expression")
-    : null;
-  if (!expressionNode) return null;
-
   const routedResultId = outcome.routedResultId;
   if (!routedResultId || outcome.state === "stopped") return null;
 
+  const expressionNodes = graph.edges
+    .filter((edge) => edge.source === currentAgentNode.id && edge.type === "evaluates")
+    .flatMap((edge) => {
+      const node = graph.nodes.find((candidate) => candidate.id === edge.target && candidate.type === "expression");
+      return node ? [node] : [];
+    });
+  if (expressionNodes.length === 0) return null;
+
+  const expressionIds = new Set(expressionNodes.map((node) => node.id));
   const matchingRoute = graph.edges.find((edge) =>
-    edge.source === expressionNode.id &&
+    expressionIds.has(edge.source) &&
     edge.type === "routes" &&
     edge.resultId === routedResultId
   );
   const fallbackRoute = graph.edges.find((edge) =>
-    edge.source === expressionNode.id &&
+    expressionIds.has(edge.source) &&
     edge.type === "routes" &&
     edge.resultId === "fallback"
   );

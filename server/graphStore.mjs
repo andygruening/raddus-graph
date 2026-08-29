@@ -25,9 +25,19 @@ export async function readGraphData() {
 
 export async function replaceGraphState(payload) {
   return updateGraphData((current) => {
+    const body = asRecord(payload);
+    const selectedProjectId = stringValue(body.selectedProjectId) || current.selectedProjectId;
+    const projects = Array.isArray(body.projects)
+      ? body.projects
+      : current.projects.map((project) => (
+        project.id === selectedProjectId && isPlainRecord(body.graph)
+          ? { ...project, graph: body.graph, updatedAt: new Date().toISOString() }
+          : project
+      ));
     const incoming = normalizeGraphData({
       ...current,
-      ...asRecord(payload),
+      ...body,
+      projects,
       sessions: current.sessions,
     });
     return {
@@ -128,24 +138,20 @@ async function writeGraphData(data) {
 
 function defaultGraphData() {
   const now = new Date().toISOString();
+  const graph = defaultGraphDocument();
+  const project = defaultProjectRecord({
+    id: "project-default",
+    name: "Default Project",
+    graph,
+    now,
+  });
   return {
     version: 1,
     agents: [],
     results: defaultResultDefinitions(),
-    graph: {
-      nodes: [
-        {
-          id: "play-start",
-          type: "play",
-          x: 72,
-          y: 96,
-          prompt: "Describe the graph session you want to run.",
-          repository: null,
-          branch: null,
-        },
-      ],
-      edges: [],
-    },
+    projects: [project],
+    selectedProjectId: project.id,
+    graph,
     sessions: [],
     updatedAt: now,
   };
@@ -153,14 +159,89 @@ function defaultGraphData() {
 
 function normalizeGraphData(value) {
   const record = asRecord(value);
+  const projects = normalizeProjects(record.projects, record.graph);
+  const selectedProjectId = selectedProjectIdValue(record.selectedProjectId, projects);
+  const selectedProject = projects.find((project) => project.id === selectedProjectId) ?? projects[0];
   return {
     version: 1,
     agents: normalizeAgents(record.agents),
     results: normalizeResults(record.results),
-    graph: normalizeGraph(record.graph),
+    projects,
+    selectedProjectId: selectedProject.id,
+    graph: selectedProject.graph,
     sessions: Array.isArray(record.sessions) ? record.sessions.map(normalizeGraphSession).filter(Boolean) : [],
     updatedAt: typeof record.updatedAt === "string" && record.updatedAt ? record.updatedAt : new Date().toISOString(),
   };
+}
+
+function defaultGraphDocument() {
+  return {
+    nodes: [
+      {
+        id: "play-start",
+        type: "play",
+        x: 72,
+        y: 96,
+        prompt: "Describe the graph session you want to run.",
+        repository: null,
+        branch: null,
+      },
+    ],
+    edges: [],
+  };
+}
+
+function defaultProjectRecord({ id, name, graph, now }) {
+  return {
+    id,
+    name,
+    graph,
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+function normalizeProjects(value, legacyGraph) {
+  const now = new Date().toISOString();
+  const seen = new Set();
+  const projects = Array.isArray(value)
+    ? value.flatMap((project) => {
+      const record = asRecord(project);
+      const id = stringValue(record.id) || cryptoId("project");
+      if (seen.has(id)) return [];
+      seen.add(id);
+      return [defaultProjectRecord({
+        id,
+        name: stringValue(record.name) || "Untitled Project",
+        graph: normalizeGraph(record.graph),
+        now,
+      })];
+    })
+    : [];
+
+  if (projects.length > 0) {
+    return projects.map((project, index) => {
+      const record = asRecord(value[index]);
+      return {
+        ...project,
+        createdAt: stringValue(record.createdAt) || project.createdAt,
+        updatedAt: stringValue(record.updatedAt) || project.updatedAt,
+      };
+    });
+  }
+
+  return [defaultProjectRecord({
+    id: "project-default",
+    name: "Default Project",
+    graph: normalizeGraph(legacyGraph),
+    now,
+  })];
+}
+
+function selectedProjectIdValue(value, projects) {
+  const id = stringValue(value);
+  if (id && projects.some((project) => project.id === id)) return id;
+  return projects[0]?.id ?? "project-default";
 }
 
 function normalizeAgents(value) {
@@ -203,7 +284,7 @@ function normalizeResults(value) {
 
 function normalizeGraph(value) {
   const record = asRecord(value);
-  const nodes = Array.isArray(record.nodes) ? record.nodes.map(normalizeGraphNode).filter(Boolean) : defaultGraphData().graph.nodes;
+  const nodes = Array.isArray(record.nodes) ? record.nodes.map(normalizeGraphNode).filter(Boolean) : defaultGraphDocument().nodes;
   const nodeIds = new Set(nodes.map((node) => node.id));
   const edges = Array.isArray(record.edges)
     ? record.edges.map((edge) => normalizeGraphEdge(edge, nodeIds)).filter(Boolean)
@@ -266,6 +347,8 @@ function normalizeGraphSession(value) {
     branchName: nullableString(record.branchName),
     prUrl: nullableString(record.prUrl),
     activeNodeId: nullableString(record.activeNodeId),
+    projectId: nullableString(record.projectId),
+    projectName: nullableString(record.projectName),
     graphSnapshot: isPlainRecord(record.graphSnapshot) ? normalizeGraph(record.graphSnapshot) : null,
     agentsSnapshot: Array.isArray(record.agentsSnapshot) ? normalizeAgents(record.agentsSnapshot) : null,
     resultsSnapshot: Array.isArray(record.resultsSnapshot) ? normalizeResults(record.resultsSnapshot) : null,
