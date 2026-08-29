@@ -310,6 +310,9 @@ function normalizeGraphNode(value) {
     ...(type === "agent" ? {
       agentId: nullableString(record.agentId),
     } : {}),
+    ...(type === "expression" ? {
+      resultId: normalizeResultId(record.resultId) || "unknown",
+    } : {}),
   };
 }
 

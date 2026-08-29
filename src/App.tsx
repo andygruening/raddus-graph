@@ -9,6 +9,7 @@ import {
   Info,
   Layers,
   Loader2,
+  Menu,
   Play,
   Plus,
   RefreshCw,
@@ -37,7 +38,8 @@ import {
   RaddusGraphApi,
 } from "./api/RaddusGraphApi";
 
-type OverlayPanel = "agents" | null;
+type PaletteTab = "agents" | "expressions";
+type OverlayPanel = PaletteTab | null;
 type SaveStatus = "idle" | "saving" | "saved" | "error";
 type Point = { x: number; y: number };
 type CanvasViewport = { x: number; y: number; zoom: number };
@@ -60,14 +62,23 @@ type DialogState =
   | { type: "agent-details"; agentId: string }
   | { type: "play"; nodeId: string }
   | { type: "expression"; nodeId: string }
-  | { type: "results" }
+  | { type: "expression-definition"; resultId: string }
+  | { type: "result-create" }
   | { type: "sessions" }
   | { type: "help" }
   | { type: "project-create" }
   | null;
+type ConfirmationState = {
+  title: string;
+  message: string;
+  confirmLabel: string;
+  onConfirm: () => void;
+} | null;
 type AgentDraft = Pick<AgentSpec, "name" | "model" | "systemPrompt">;
 type ProjectDraft = Pick<ProjectRecord, "name">;
-type PaletteItem = { type: "agent"; agentId: string };
+type PaletteItem =
+  | { type: "agent"; agentId: string }
+  | { type: "expression"; resultId: string };
 type PaletteDropConnection = {
   source: GraphNode;
   target: GraphNode;
@@ -94,13 +105,14 @@ export default function App() {
   const [repositoryResult, setRepositoryResult] = React.useState<RepositoryListResult | null>(null);
   const [branchesByRepo, setBranchesByRepo] = React.useState<Record<string, BranchListResult>>({});
   const [overlayPanel, setOverlayPanel] = React.useState<OverlayPanel>("agents");
+  const [actionMenuOpen, setActionMenuOpen] = React.useState(false);
   const [dialog, setDialog] = React.useState<DialogState>(null);
+  const [confirmation, setConfirmation] = React.useState<ConfirmationState>(null);
   const [loading, setLoading] = React.useState(true);
   const [saveStatus, setSaveStatus] = React.useState<SaveStatus>("idle");
   const [error, setError] = React.useState<string | null>(null);
   const [runningPlayNodeId, setRunningPlayNodeId] = React.useState<string | null>(null);
   const [resultDraft, setResultDraft] = React.useState({ id: "", description: "" });
-  const [routeResultByExpressionId, setRouteResultByExpressionId] = React.useState<Record<string, string>>({});
   const [camera, setCamera] = React.useState<CanvasViewport>(defaultCanvasViewport);
   const [draggingNodeId, setDraggingNodeId] = React.useState<string | null>(null);
   const [draggingEdgeId, setDraggingEdgeId] = React.useState<string | null>(null);
@@ -223,7 +235,6 @@ export default function App() {
   function selectProject(projectId: string) {
     mutateState((current) => selectProjectInState(current, projectId));
     setCamera(defaultCanvasViewport);
-    setRouteResultByExpressionId({});
   }
 
   function createProject(draft: ProjectDraft): ProjectRecord | null {
@@ -245,7 +256,6 @@ export default function App() {
       projects: [...current.projects, project],
     }, project.id));
     setCamera(defaultCanvasViewport);
-    setRouteResultByExpressionId({});
     return project;
   }
 
@@ -302,25 +312,29 @@ export default function App() {
     if (dialog?.type === "agent-details" && dialog.agentId === agentId) setDialog(null);
   }
 
-  function addResult() {
+  function addResult(): ResultDefinition | null {
     const id = normalizeResultId(resultDraft.id);
     if (!id || !resultDraft.description.trim()) {
       setError("Result id and description are required.");
-      return;
+      return null;
     }
     if (reservedResultIds.has(id)) {
       setError(`${id} is a reserved system result.`);
-      return;
+      return null;
     }
+    if (latestState.current?.results.some((item) => item.id === id)) {
+      setError(`${id} already exists.`);
+      return null;
+    }
+    const result: ResultDefinition = { id, description: resultDraft.description.trim(), reserved: false };
     mutateState((current) => {
-      const result: ResultDefinition = { id, description: resultDraft.description.trim(), reserved: false };
-      const exists = current.results.some((item) => item.id === id);
       return {
         ...current,
-        results: exists ? current.results.map((item) => item.id === id ? result : item) : [...current.results, result],
+        results: [...current.results, result],
       };
     });
     setResultDraft({ id: "", description: "" });
+    return result;
   }
 
   function updateResult(resultId: string, description: string) {
@@ -332,18 +346,97 @@ export default function App() {
 
   function deleteResult(resultId: string) {
     if (reservedResultIds.has(resultId)) return;
-    mutateState((current) => (
-      withActiveGraph({
+    mutateState((current) => {
+      const now = new Date().toISOString();
+      const projects = current.projects.map((project) => {
+        const expressionNodeIds = new Set(project.graph.nodes
+          .filter((node) => node.type === "expression" && normalizeResultId(node.resultId ?? "") === resultId)
+          .map((node) => node.id));
+        return {
+          ...project,
+          graph: {
+            nodes: project.graph.nodes.filter((node) => !expressionNodeIds.has(node.id)),
+            edges: project.graph.edges.filter((edge) => (
+              edge.resultId !== resultId &&
+              !expressionNodeIds.has(edge.source) &&
+              !expressionNodeIds.has(edge.target)
+            )),
+          },
+          updatedAt: now,
+        };
+      });
+      const selectedProject = projects.find((project) => project.id === current.selectedProjectId) ?? projects[0];
+      return {
         ...current,
         results: current.results.filter((result) => result.id !== resultId),
-      }, {
-        nodes: current.graph.nodes,
-        edges: current.graph.edges.filter((edge) => edge.resultId !== resultId),
-      })
-    ));
+        projects,
+        graph: selectedProject.graph,
+      };
+    });
+    if (dialog?.type === "expression-definition" && dialog.resultId === resultId) setDialog(null);
   }
 
-  function addNodeAt(type: GraphNodeType, x: number, y: number, agentId?: string | null) {
+  function requestDeleteAgent(agentId: string) {
+    const agent = latestState.current?.agents.find((candidate) => candidate.id === agentId);
+    requestConfirmation({
+      title: "Delete Agent",
+      message: `Delete ${agent?.name ?? "this agent"}? Existing cards using this agent will become unassigned.`,
+      confirmLabel: "Delete",
+      onConfirm: () => deleteAgent(agentId),
+    });
+  }
+
+  function requestDeleteResult(resultId: string) {
+    const expressionCount = latestState.current?.projects.reduce((count, project) => (
+      count + project.graph.nodes.filter((node) => node.type === "expression" && normalizeResultId(node.resultId ?? "") === resultId).length
+    ), 0) ?? 0;
+    requestConfirmation({
+      title: "Remove Expression",
+      message: `Remove ${resultId}? This also removes ${expressionCount === 1 ? "1 expression card" : `${expressionCount} expression cards`} using it.`,
+      confirmLabel: "Remove",
+      onConfirm: () => deleteResult(resultId),
+    });
+  }
+
+  function requestDeleteNode(nodeId: string) {
+    const current = latestState.current;
+    const node = current?.graph.nodes.find((candidate) => candidate.id === nodeId);
+    requestConfirmation({
+      title: "Remove Card",
+      message: `Remove ${node && current ? nodeLabel(node, current) : "this card"} from the canvas? Connected lines will also be removed.`,
+      confirmLabel: "Remove",
+      onConfirm: () => deleteNode(nodeId),
+    });
+  }
+
+  function requestRemoveEdge(edgeId: string) {
+    requestConfirmation({
+      title: "Remove Line",
+      message: "Remove this connection from the canvas?",
+      confirmLabel: "Remove",
+      onConfirm: () => removeEdge(edgeId),
+    });
+  }
+
+  function requestStopSession(sessionId: string) {
+    requestConfirmation({
+      title: "Stop Session",
+      message: `Stop session ${sessionId}? This cannot be resumed.`,
+      confirmLabel: "Stop",
+      onConfirm: () => void stopSession(sessionId),
+    });
+  }
+
+  function requestConfirmation(nextConfirmation: Exclude<ConfirmationState, null>) {
+    setConfirmation(nextConfirmation);
+  }
+
+  function addNodeAt(
+    type: GraphNodeType,
+    x: number,
+    y: number,
+    options: { agentId?: string | null; resultId?: string } = {},
+  ) {
     mutateState((current) => {
       const node: GraphNode = {
         id: newId(type),
@@ -351,7 +444,8 @@ export default function App() {
         x,
         y,
         ...(type === "play" ? { prompt: "", repository: null, branch: null } : {}),
-        ...(type === "agent" ? { agentId: agentId ?? current.agents[0]?.id ?? null } : {}),
+        ...(type === "agent" ? { agentId: options.agentId ?? current.agents[0]?.id ?? null } : {}),
+        ...(type === "expression" ? { resultId: options.resultId ?? defaultExpressionResultId(current) } : {}),
       };
       return withActiveGraph(current, { ...current.graph, nodes: [...current.graph.nodes, node] });
     });
@@ -421,7 +515,7 @@ export default function App() {
     mutateState((current) => {
       const source = current.graph.nodes.find((node) => node.id === sourceId);
       const target = current.graph.nodes.find((node) => node.id === targetId);
-      const edge = source && target ? edgeForConnection(current, source, target, routeResultByExpressionId) : null;
+      const edge = source && target ? edgeForConnection(current, source, target) : null;
       if (!edge) return current;
       return withGraphEdge(current, edge);
     });
@@ -431,22 +525,10 @@ export default function App() {
     mutateState((current) => {
       const dragged = current.graph.nodes.find((node) => node.id === draggedId);
       const target = current.graph.nodes.find((node) => node.id === targetId);
-      const edge = dragged && target ? edgeForDrop(current, dragged, target, routeResultByExpressionId) : null;
+      const edge = dragged && target ? edgeForDrop(current, dragged, target) : null;
       if (!edge) return current;
       return withGraphEdge(current, edge);
     });
-  }
-
-  function connectRoute(source: string, resultId: string, target: string | null) {
-    mutateState((current) => (
-      withActiveGraph(current, {
-        nodes: current.graph.nodes,
-        edges: [
-          ...current.graph.edges.filter((edge) => !(edge.source === source && edge.type === "routes" && edge.resultId === resultId)),
-          ...(target ? [{ id: newId("edge"), source, target, type: "routes" as const, resultId }] : []),
-        ],
-      })
-    ));
   }
 
   async function runPlayNode(node: GraphNode) {
@@ -729,17 +811,11 @@ export default function App() {
 
   function addPaletteItemAt(item: PaletteItem, x: number, y: number, targetNodeId?: string) {
     mutateState((current) => {
-      const node: GraphNode = {
-        id: newId("agent"),
-        type: "agent",
-        agentId: item.agentId,
-        x,
-        y,
-      };
+      const node = nodeFromPaletteItem(item, x, y);
       const targetNode = targetNodeId ? current.graph.nodes.find((candidate) => candidate.id === targetNodeId) : undefined;
-      const connection = targetNode ? paletteConnectionForTarget(current, node, targetNode, routeResultByExpressionId) : null;
+      const connection = targetNode ? paletteConnectionForTarget(current, node, targetNode) : null;
       const nextEdges = connection
-        ? upsertEdges(current.graph.edges, edgeFromDropConnection(connection))
+        ? upsertGraphEdge(current.graph.edges, [...current.graph.nodes, node], edgeFromDropConnection(connection))
         : current.graph.edges;
       return withActiveGraph(current, {
         nodes: [...current.graph.nodes, node],
@@ -751,7 +827,7 @@ export default function App() {
   function paletteDragPreviewForPoint(item: PaletteItem, clientX: number, clientY: number): PaletteDragPreview | null {
     const current = latestState.current;
     if (!current || !isPaletteDropPoint(clientX, clientY)) return null;
-    const size = projectNodeSizeForType("agent");
+    const size = projectNodeSizeForType(item.type);
     const point = screenToWorld(clientX, clientY);
     let x = Math.round(point.x - size.width / 2);
     let y = Math.round(point.y - size.height / 2);
@@ -760,14 +836,8 @@ export default function App() {
 
     if (targetNode) {
       const connectedPosition = paletteConnectedDropPosition(current, targetNode, size);
-      const connectedCandidate: GraphNode = {
-        id: "palette-preview",
-        type: "agent",
-        agentId: item.agentId,
-        x: connectedPosition.x,
-        y: connectedPosition.y,
-      };
-      connection = paletteConnectionForTarget(current, connectedCandidate, targetNode, routeResultByExpressionId);
+      const connectedCandidate = nodeFromPaletteItem(item, connectedPosition.x, connectedPosition.y, "palette-preview");
+      connection = paletteConnectionForTarget(current, connectedCandidate, targetNode);
       if (connection) {
         x = connectedPosition.x;
         y = connectedPosition.y;
@@ -802,7 +872,7 @@ export default function App() {
   }
 
   function handleCanvasPointerDown(event: React.PointerEvent<HTMLDivElement>) {
-    if (eventTargetClosest(event.target, ".project-node, .project-edge-hit, .project-edge-handle, .project-edge-endpoint, .project-controls-overlay, .project-workspace-overlay, .project-card-palette")) return;
+    if (eventTargetClosest(event.target, ".project-node, .project-edge-hit, .project-edge-handle, .project-edge-endpoint, .project-controls-overlay, .project-workspace-overlay, .project-card-palette, .project-action-menu")) return;
     setSelectedEdgeId(null);
     const startX = event.clientX;
     const startY = event.clientY;
@@ -862,6 +932,14 @@ export default function App() {
   const repositories = repositoryResult?.repositories ?? [];
   const runningSessions = state?.sessions.filter((session) => session.status === "running").length ?? 0;
   const graph = state?.graph ?? { nodes: [], edges: [] };
+  const activeExpressionResultId = state && dialog?.type === "expression"
+    ? selectedRouteResultForExpression(state, dialog.nodeId)
+    : state && dialog?.type === "expression-definition"
+      ? dialog.resultId
+      : null;
+  const activeExpressionResult = activeExpressionResultId
+    ? state?.results.find((result) => result.id === activeExpressionResultId) ?? null
+    : null;
 
   return (
     <main className="app-shell projects-shell">
@@ -895,39 +973,60 @@ export default function App() {
                     <Plus size={16} aria-hidden="true" />
                   </button>
                 </div>
-                <div className="canvas-control-group">
-                  <button className="icon-button" type="button" onClick={() => setOverlayPanel((panel) => panel === "agents" ? null : "agents")} title="Agent specs" aria-label="Agent specs">
-                    <Layers size={18} aria-hidden="true" />
-                  </button>
-                  <button className="icon-button" type="button" onClick={() => setDialog({ type: "agent-create" })} title="Create agent" aria-label="Create agent">
-                    <Bot size={18} aria-hidden="true" />
-                  </button>
-                  <button className="icon-button" type="button" onClick={() => addNodeAtCanvasCenter("play")} title="Add play card" aria-label="Add play card">
-                    <Play size={18} aria-hidden="true" />
-                  </button>
-                  <button className="icon-button" type="button" onClick={() => addNodeAtCanvasCenter("expression")} title="Add expression card" aria-label="Add expression card">
-                    <Braces size={18} aria-hidden="true" />
-                  </button>
-                  <button className="icon-button" type="button" onClick={() => setDialog({ type: "results" })} title="Results" aria-label="Results">
-                    <CircleDot size={18} aria-hidden="true" />
-                  </button>
-                  <button className="icon-button" type="button" onClick={() => setDialog({ type: "sessions" })} title="Sessions" aria-label="Sessions">
-                    {runningSessions ? <Loader2 className="spin" size={18} aria-hidden="true" /> : <Database size={18} aria-hidden="true" />}
-                  </button>
-                  <button className="icon-button" type="button" onClick={() => void loadInitial()} title="Refresh" aria-label="Refresh">
-                    <RefreshCw size={18} aria-hidden="true" />
-                  </button>
-                  <button className="icon-button" type="button" onClick={resetCanvasViewport} title="Reset view" aria-label="Reset view">
-                    <RotateCcw size={18} aria-hidden="true" />
-                  </button>
-                  <button className="icon-button" type="button" onClick={() => setDialog({ type: "help" })} title="Canvas controls" aria-label="Canvas controls">
-                    <Info size={18} aria-hidden="true" />
-                  </button>
-                </div>
                 {saveStatus !== "idle" ? (
                   <div className={`canvas-control-group save-status ${saveStatus}`}>
                     {saveStatus === "saving" ? <Loader2 className="spin" size={16} aria-hidden="true" /> : <Save size={16} aria-hidden="true" />}
                     <span>{saveStatus}</span>
+                  </div>
+                ) : null}
+              </div>
+              <div className="project-action-menu" onPointerDown={(event) => event.stopPropagation()}>
+                <button
+                  className="project-menu-button"
+                  type="button"
+                  onClick={() => setActionMenuOpen((open) => !open)}
+                  title="Canvas menu"
+                  aria-label="Canvas menu"
+                  aria-expanded={actionMenuOpen}
+                >
+                  <Menu size={18} aria-hidden="true" />
+                  <span>Menu</span>
+                </button>
+                {actionMenuOpen ? (
+                  <div className="project-action-stack">
+                    <button
+                      className="project-action-button"
+                      type="button"
+                      onClick={() => {
+                        addNodeAtCanvasCenter("play");
+                        setActionMenuOpen(false);
+                      }}
+                    >
+                      <Play size={17} aria-hidden="true" />
+                      <span>Add play card</span>
+                    </button>
+                    <button
+                      className="project-action-button"
+                      type="button"
+                      onClick={() => {
+                        setDialog({ type: "sessions" });
+                        setActionMenuOpen(false);
+                      }}
+                    >
+                      {runningSessions ? <Loader2 className="spin" size={17} aria-hidden="true" /> : <Database size={17} aria-hidden="true" />}
+                      <span>Sessions</span>
+                    </button>
+                    <button
+                      className="project-action-button"
+                      type="button"
+                      onClick={() => {
+                        setDialog({ type: "help" });
+                        setActionMenuOpen(false);
+                      }}
+                    >
+                      <Info size={17} aria-hidden="true" />
+                      <span>Canvas controls</span>
+                    </button>
                   </div>
                 ) : null}
               </div>
@@ -940,14 +1039,20 @@ export default function App() {
                 </div>
               ) : null}
 
-              {state && overlayPanel === "agents" ? (
-                <AgentSpecPalette
+              {state && overlayPanel ? (
+                <CardPalette
+                  activeTab={overlayPanel}
                   agents={state.agents}
+                  results={state.results}
                   draggingItemKey={draggingPaletteItemKey}
+                  onActiveTabChange={setOverlayPanel}
                   onBeginDrag={beginPaletteItemDrag}
                   onCreateAgent={() => setDialog({ type: "agent-create" })}
+                  onCreateExpression={() => setDialog({ type: "result-create" })}
                   onOpenAgent={(agent) => setDialog({ type: "agent-details", agentId: agent.id })}
-                  onRemoveAgent={deleteAgent}
+                  onRemoveAgent={requestDeleteAgent}
+                  onOpenExpression={(result) => setDialog({ type: "expression-definition", resultId: result.id })}
+                  onRemoveExpression={requestDeleteResult}
                 />
               ) : null}
 
@@ -971,13 +1076,13 @@ export default function App() {
                           onPointerLeave={() => setHoveredEdgeId((current) => current === edge.id ? null : current)}
                           onClick={(event) => {
                             event.stopPropagation();
-                            if (!edgeDragMovedRef.current) removeEdge(edge.id);
+                            if (!edgeDragMovedRef.current) requestRemoveEdge(edge.id);
                           }}
                         />
                         <path className={`project-edge ${edge.type}`} d={geometry.path} pathLength={1} style={{ animationDelay: `${Math.min(edgeIndex * 18 + 70, 260)}ms` }} />
                         <path
                           className={`project-edge-arrow ${edge.type}`}
-                          d="M -3.5 -3.5 L 3.5 0 L -3.5 3.5 Z"
+                          d="M -5 -5 L 5 0 L -5 5 Z"
                           transform={`translate(${geometry.arrow.x} ${geometry.arrow.y}) rotate(${geometry.arrow.angle})`}
                         />
                         {edge.resultId ? (
@@ -1028,11 +1133,11 @@ export default function App() {
                     connectingFrom && connectingFrom.id === node.id
                       ? "source"
                       : connectingFrom
-                        ? edgeForConnection(state, connectingFrom, node, routeResultByExpressionId) ? "valid" : "invalid"
+                        ? edgeForConnection(state, connectingFrom, node) ? "valid" : "invalid"
                         : draggingNode && draggingNode.id === node.id
                           ? "source"
                           : draggingNode
-                            ? edgeForDrop(state, draggingNode, node, routeResultByExpressionId) ? "valid" : "invalid"
+                            ? edgeForDrop(state, draggingNode, node) ? "valid" : "invalid"
                             : paletteDragPreview?.connection?.targetNodeId === node.id
                               ? "valid"
                               : "idle";
@@ -1044,12 +1149,11 @@ export default function App() {
                       dragging={draggingNodeId === node.id}
                       dropTarget={nodeDropTargetId === node.id}
                       connectionState={connectionState}
-                      selectedRouteResult={selectedRouteResultForExpression(state, node.id, routeResultByExpressionId)}
                       running={runningPlayNodeId === node.id}
                       latestStatus={latestNodeStatus(state, node.id)}
                       onPointerDown={(event) => beginNodeDrag(event, node.id)}
                       onConnectorPointerDown={(event) => beginConnection(event, node.id)}
-                      onRemove={() => deleteNode(node.id)}
+                      onRemove={() => requestDeleteNode(node.id)}
                       onOpen={() => {
                         if (node.type === "agent" && node.agentId) setDialog({ type: "agent-details", agentId: node.agentId });
                         if (node.type === "play") setDialog({ type: "play", nodeId: node.id });
@@ -1057,13 +1161,12 @@ export default function App() {
                       }}
                       onPlayPromptChange={(prompt) => updateNode(node.id, { prompt })}
                       onRunPlay={() => void runPlayNode(node)}
-                      onRouteResultChange={(resultId) => setRouteResultByExpressionId((current) => ({ ...current, [node.id]: resultId }))}
                       shouldSuppressClick={suppressesNodeClick}
                       enterDelayMs={Math.min(nodeIndex * 24, 180)}
                     />
                   );
                 })}
-                {paletteDragPreview ? <PaletteNodePreview preview={paletteDragPreview} agents={state?.agents ?? []} /> : null}
+                {paletteDragPreview ? <PaletteNodePreview preview={paletteDragPreview} agents={state?.agents ?? []} results={state?.results ?? []} /> : null}
               </div>
             </div>
           </section>
@@ -1098,7 +1201,7 @@ export default function App() {
             updateAgent(dialog.agentId, draft);
             setDialog(null);
           }}
-          onDelete={() => deleteAgent(dialog.agentId)}
+          onDelete={() => requestDeleteAgent(dialog.agentId)}
         />
       ) : null}
       {state && dialog?.type === "play" ? (
@@ -1114,24 +1217,22 @@ export default function App() {
           onRun={(node) => void runPlayNode(node)}
         />
       ) : null}
-      {state && dialog?.type === "expression" ? (
-        <ExpressionDialog
-          node={state.graph.nodes.find((node) => node.id === dialog.nodeId && node.type === "expression") ?? null}
-          state={state}
-          selectedResult={selectedRouteResultForExpression(state, dialog.nodeId, routeResultByExpressionId)}
-          onSelectedResultChange={(resultId) => setRouteResultByExpressionId((current) => ({ ...current, [dialog.nodeId]: resultId }))}
+      {state && activeExpressionResultId && (dialog?.type === "expression" || dialog?.type === "expression-definition") ? (
+        <ExpressionDetailsDialog
+          resultId={activeExpressionResultId}
+          result={activeExpressionResult}
           onClose={() => setDialog(null)}
-          onConnectRoute={(resultId, target) => connectRoute(dialog.nodeId, resultId, target)}
+          onUpdate={updateResult}
         />
       ) : null}
-      {state && dialog?.type === "results" ? (
-        <ResultsDialog
-          results={state.results}
+      {state && dialog?.type === "result-create" ? (
+        <ResultCreateDialog
           draft={resultDraft}
           onDraftChange={setResultDraft}
-          onCreate={addResult}
-          onUpdate={updateResult}
-          onDelete={deleteResult}
+          onCreate={() => {
+            const result = addResult();
+            if (result) setDialog({ type: "expression-definition", resultId: result.id });
+          }}
           onClose={() => setDialog(null)}
         />
       ) : null}
@@ -1139,11 +1240,24 @@ export default function App() {
         <SessionsDialog
           sessions={state.sessions}
           onRefresh={() => void refreshSessions()}
-          onStop={(sessionId) => void stopSession(sessionId)}
+          onStop={requestStopSession}
           onClose={() => setDialog(null)}
         />
       ) : null}
       {dialog?.type === "help" ? <CanvasHelpDialog onClose={() => setDialog(null)} /> : null}
+      {confirmation ? (
+        <ConfirmationDialog
+          title={confirmation.title}
+          message={confirmation.message}
+          confirmLabel={confirmation.confirmLabel}
+          onCancel={() => setConfirmation(null)}
+          onConfirm={() => {
+            const action = confirmation.onConfirm;
+            setConfirmation(null);
+            action();
+          }}
+        />
+      ) : null}
     </main>
   );
 }
@@ -1154,7 +1268,6 @@ function ProjectNodeCard({
   dragging,
   dropTarget,
   connectionState,
-  selectedRouteResult,
   running,
   latestStatus,
   onPointerDown,
@@ -1163,7 +1276,6 @@ function ProjectNodeCard({
   onOpen,
   onPlayPromptChange,
   onRunPlay,
-  onRouteResultChange,
   shouldSuppressClick,
   enterDelayMs,
 }: {
@@ -1172,7 +1284,6 @@ function ProjectNodeCard({
   dragging: boolean;
   dropTarget: boolean;
   connectionState: ConnectionState;
-  selectedRouteResult: string;
   running: boolean;
   latestStatus: NodeStatus | null;
   onPointerDown: (event: React.PointerEvent<HTMLElement>) => void;
@@ -1181,13 +1292,12 @@ function ProjectNodeCard({
   onOpen: () => void;
   onPlayPromptChange: (prompt: string) => void;
   onRunPlay: () => void;
-  onRouteResultChange: (resultId: string) => void;
   shouldSuppressClick: () => boolean;
   enterDelayMs: number;
 }) {
   const agent = node.type === "agent" ? state.agents.find((record) => record.id === node.agentId) : undefined;
+  const expressionResultId = node.type === "expression" ? selectedRouteResultForExpression(state, node.id) : "";
   const statusTitle = latestStatus ? `${latestStatus.state}: ${latestStatus.summary || latestStatus.routeReason || "status"}` : "";
-  const routeCount = state.graph.edges.filter((edge) => edge.source === node.id && edge.type === "routes").length;
 
   return (
     <article
@@ -1248,23 +1358,7 @@ function ProjectNodeCard({
             </div>
           ) : (
             <div className="expression-node-body">
-              <Braces size={20} aria-hidden="true" />
-              <strong>Expression</strong>
-              <label className="node-editor-control expression-route-picker">
-                <span>Drag route</span>
-                <select
-                  value={selectedRouteResult}
-                  onChange={(event) => onRouteResultChange(event.target.value)}
-                  onPointerDown={(event) => event.stopPropagation()}
-                >
-                  {state.results.map((result) => (
-                    <option key={result.id} value={result.id}>
-                      {result.id}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <small>{routeCount === 1 ? "1 route" : `${routeCount} routes`}</small>
+              <strong className="expression-result-id">{expressionResultId}</strong>
             </div>
           )}
         </>
@@ -1273,41 +1367,93 @@ function ProjectNodeCard({
   );
 }
 
-function AgentSpecPalette({
+function CardPalette({
+  activeTab,
   agents,
+  results,
   draggingItemKey,
+  onActiveTabChange,
   onBeginDrag,
   onCreateAgent,
+  onCreateExpression,
   onOpenAgent,
   onRemoveAgent,
+  onOpenExpression,
+  onRemoveExpression,
 }: {
+  activeTab: PaletteTab;
   agents: AgentSpec[];
+  results: ResultDefinition[];
   draggingItemKey: string | null;
+  onActiveTabChange: (tab: PaletteTab) => void;
   onBeginDrag: (event: React.PointerEvent<HTMLElement>, item: PaletteItem, onOpen?: () => void) => void;
   onCreateAgent: () => void;
+  onCreateExpression: () => void;
   onOpenAgent: (agent: AgentSpec) => void;
   onRemoveAgent: (agentId: string) => void;
+  onOpenExpression: (result: ResultDefinition) => void;
+  onRemoveExpression: (resultId: string) => void;
 }) {
+  const addButtonTitle = activeTab === "agents" ? "Create agent" : "Create expression";
   return (
-    <aside className="project-card-palette agent-spec-palette" aria-label="Agent specs" onPointerDown={(event) => event.stopPropagation()} onWheel={(event) => event.stopPropagation()}>
+    <aside className="project-card-palette" aria-label="Card palette" onPointerDown={(event) => event.stopPropagation()} onWheel={(event) => event.stopPropagation()}>
       <div className="palette-header">
-        <strong>Agents</strong>
-        <button className="palette-tab-add-button" type="button" onClick={onCreateAgent} title="Create agent" aria-label="Create agent">
+        <div className="palette-tabs" role="tablist" aria-label="Cards">
+          <button
+            className={activeTab === "agents" ? "active" : ""}
+            type="button"
+            role="tab"
+            aria-selected={activeTab === "agents"}
+            onClick={() => onActiveTabChange("agents")}
+          >
+            <Bot size={14} aria-hidden="true" />
+            <span>Agents</span>
+          </button>
+          <button
+            className={activeTab === "expressions" ? "active" : ""}
+            type="button"
+            role="tab"
+            aria-selected={activeTab === "expressions"}
+            onClick={() => onActiveTabChange("expressions")}
+          >
+            <Braces size={14} aria-hidden="true" />
+            <span>Expressions</span>
+          </button>
+        </div>
+        <button className="palette-tab-add-button" type="button" onClick={activeTab === "agents" ? onCreateAgent : onCreateExpression} title={addButtonTitle} aria-label={addButtonTitle}>
           <Plus size={13} aria-hidden="true" />
         </button>
       </div>
       <div className="palette-list">
-        {agents.length === 0 ? <div className="palette-empty">No agents available</div> : null}
-        {agents.map((agent) => (
-          <PaletteAgentButton
-            agent={agent}
-            draggingItemKey={draggingItemKey}
-            onBeginDrag={onBeginDrag}
-            onOpen={() => onOpenAgent(agent)}
-            onRemove={() => onRemoveAgent(agent.id)}
-            key={agent.id}
-          />
-        ))}
+        {activeTab === "agents" ? (
+          <>
+            {agents.length === 0 ? <div className="palette-empty">No agents available</div> : null}
+            {agents.map((agent) => (
+              <PaletteAgentButton
+                agent={agent}
+                draggingItemKey={draggingItemKey}
+                onBeginDrag={onBeginDrag}
+                onOpen={() => onOpenAgent(agent)}
+                onRemove={() => onRemoveAgent(agent.id)}
+                key={agent.id}
+              />
+            ))}
+          </>
+        ) : (
+          <>
+            {results.length === 0 ? <div className="palette-empty">No expressions available</div> : null}
+            {results.map((result) => (
+              <PaletteExpressionButton
+                result={result}
+                draggingItemKey={draggingItemKey}
+                onBeginDrag={onBeginDrag}
+                onOpen={() => onOpenExpression(result)}
+                onRemove={result.reserved ? undefined : () => onRemoveExpression(result.id)}
+                key={result.id}
+              />
+            ))}
+          </>
+        )}
       </div>
     </aside>
   );
@@ -1364,17 +1510,73 @@ function PaletteAgentButton({
   );
 }
 
-function PaletteNodePreview({ preview, agents }: { preview: PaletteDragPreview; agents: AgentSpec[] }) {
-  const agent = agents.find((record) => record.id === preview.item.agentId);
+function PaletteExpressionButton({
+  result,
+  draggingItemKey,
+  onBeginDrag,
+  onOpen,
+  onRemove,
+}: {
+  result: ResultDefinition;
+  draggingItemKey: string | null;
+  onBeginDrag: (event: React.PointerEvent<HTMLElement>, item: PaletteItem, onOpen?: () => void) => void;
+  onOpen: () => void;
+  onRemove?: () => void;
+}) {
+  const item: PaletteItem = { type: "expression", resultId: result.id };
+  const itemKey = paletteItemKey(item);
+  return (
+    <div
+      className={`${draggingItemKey === itemKey ? "palette-drag-item dragging" : "palette-drag-item"}${onRemove ? " has-action" : ""}`}
+      role="button"
+      tabIndex={0}
+      onPointerDown={(event) => onBeginDrag(event, item, onOpen)}
+      onKeyDown={(event) => {
+        if (event.key !== "Enter" && event.key !== " ") return;
+        event.preventDefault();
+        onOpen();
+      }}
+      title={result.id}
+      aria-label={`${result.id}. Drag expression to canvas.`}
+    >
+      <Braces size={16} aria-hidden="true" />
+      <span>
+        <strong>{result.id}</strong>
+        <small>{result.description}</small>
+      </span>
+      {onRemove ? (
+        <button
+          className="icon-button compact-icon palette-remove-button"
+          type="button"
+          title="Remove expression"
+          aria-label="Remove expression"
+          onPointerDown={(event) => event.stopPropagation()}
+          onClick={(event) => {
+            event.stopPropagation();
+            onRemove();
+          }}
+        >
+          <Trash2 size={12} aria-hidden="true" />
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
+function PaletteNodePreview({ preview, agents, results }: { preview: PaletteDragPreview; agents: AgentSpec[]; results: ResultDefinition[] }) {
+  const item = preview.item;
+  const previewLabel = item.type === "agent"
+    ? agents.find((record) => record.id === item.agentId)?.name ?? "Agent"
+    : results.find((record) => record.id === item.resultId)?.id ?? item.resultId;
   return (
     <article
-      className={`project-node palette-node-preview agent ${preview.connection ? "connect-valid" : ""}`}
+      className={`project-node palette-node-preview ${preview.item.type} ${preview.connection ? "connect-valid" : ""}`}
       style={{ left: preview.x, top: preview.y, width: preview.width, height: preview.height, minHeight: preview.height }}
       aria-hidden="true"
     >
       <div className="palette-node-preview-label">
-        <Bot size={16} aria-hidden="true" />
-        <span>{agent?.name ?? "Agent"}</span>
+        {preview.item.type === "agent" ? <Bot size={16} aria-hidden="true" /> : <Braces size={16} aria-hidden="true" />}
+        <span>{previewLabel}</span>
       </div>
     </article>
   );
@@ -1450,7 +1652,7 @@ function AgentDialog({
   if (editing && !agent) return null;
 
   return (
-    <Modal title={editing ? "Agent details" : "Create agent"} onClose={onClose} side>
+    <Modal title={editing ? "Agent details" : "Create agent"} onClose={onClose}>
       <form
         className="form-grid"
         onSubmit={(event) => {
@@ -1525,7 +1727,7 @@ function PlayDialog({
   const branchOptions = repoBranches.length ? repoBranches : [node.branch].filter(Boolean) as string[];
 
   return (
-    <Modal title="Play" onClose={onClose} side>
+    <Modal title="Play" onClose={onClose}>
       <form
         className="form-grid"
         onSubmit={(event) => {
@@ -1589,95 +1791,80 @@ function PlayDialog({
   );
 }
 
-function ExpressionDialog({
-  node,
-  state,
-  selectedResult,
-  onSelectedResultChange,
+function ExpressionDetailsDialog({
+  resultId,
+  result,
   onClose,
-  onConnectRoute,
+  onUpdate,
 }: {
-  node: GraphNode | null;
-  state: GraphState;
-  selectedResult: string;
-  onSelectedResultChange: (resultId: string) => void;
+  resultId: string;
+  result: ResultDefinition | null;
   onClose: () => void;
-  onConnectRoute: (resultId: string, target: string | null) => void;
+  onUpdate: (resultId: string, description: string) => void;
 }) {
-  if (!node || node.type !== "expression") return null;
-  const agentNodes = state.graph.nodes.filter((candidate) => candidate.type === "agent");
-  const branchTargets = Object.fromEntries(state.graph.edges
-    .filter((edge) => edge.source === node.id && edge.type === "routes" && edge.resultId)
-    .map((edge) => [edge.resultId as string, edge.target]));
-  const incomingAgent = incomingAgentForExpression(state, node);
+  const editable = Boolean(result && !result.reserved);
+  const [description, setDescription] = React.useState(result?.description ?? "");
+
+  React.useEffect(() => {
+    setDescription(result?.description ?? "");
+  }, [result]);
 
   return (
-    <Modal title="Expression" onClose={onClose} side>
-      <form className="form-grid" onSubmit={(event) => event.preventDefault()}>
-        <FormSection title="Evaluation">
-          <div className="details-info-grid">
-            <InfoRow icon={<Bot size={15} />} label="Upstream" value={incomingAgent ?? "No upstream agent"} />
-            <InfoRow icon={<CircleDot size={15} />} label="Selected drag route" value={selectedResult} />
-          </div>
+    <Modal title="Expression" onClose={onClose}>
+      <form
+        className="form-grid"
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (!editable) return;
+          onUpdate(resultId, description.trim() || resultId);
+          onClose();
+        }}
+      >
+        <FormSection title="Details">
           <label>
-            <span>Result used when dragging from this expression</span>
-            <select value={selectedResult} onChange={(event) => onSelectedResultChange(event.target.value)}>
-              {state.results.map((result) => (
-                <option key={result.id} value={result.id}>
-                  {result.id}
-                </option>
-              ))}
-            </select>
+            <span>Result ID</span>
+            <input value={resultId} readOnly />
           </label>
-        </FormSection>
-        <FormSection title="Routes">
-          <div className="route-editor-list">
-            {state.results.map((result) => (
-              <label key={result.id}>
-                <span>{result.id}</span>
-                <select value={branchTargets[result.id] ?? ""} onChange={(event) => onConnectRoute(result.id, event.target.value || null)}>
-                  <option value="">None</option>
-                  {agentNodes.map((agentNode) => (
-                    <option key={agentNode.id} value={agentNode.id}>
-                      {nodeLabel(agentNode, state)}
-                    </option>
-                  ))}
-                </select>
-                <small>{result.description}</small>
-              </label>
-            ))}
-          </div>
+          <label>
+            <span>Description</span>
+            <textarea
+              rows={5}
+              value={description}
+              readOnly={!editable}
+              onChange={(event) => setDescription(event.target.value)}
+            />
+          </label>
         </FormSection>
         <div className="dialog-actions">
           <button className="secondary-button" type="button" onClick={onClose}>
             <X size={16} aria-hidden="true" />
             Close
           </button>
+          {editable ? (
+            <button className="primary-button" type="submit">
+              <Save size={16} aria-hidden="true" />
+              Save
+            </button>
+          ) : null}
         </div>
       </form>
     </Modal>
   );
 }
 
-function ResultsDialog({
-  results,
+function ResultCreateDialog({
   draft,
   onDraftChange,
   onCreate,
-  onUpdate,
-  onDelete,
   onClose,
 }: {
-  results: ResultDefinition[];
   draft: { id: string; description: string };
   onDraftChange: (draft: { id: string; description: string }) => void;
   onCreate: () => void;
-  onUpdate: (resultId: string, description: string) => void;
-  onDelete: (resultId: string) => void;
   onClose: () => void;
 }) {
   return (
-    <Modal title="Results" onClose={onClose} side>
+    <Modal title="New Expression" onClose={onClose}>
       <form
         className="form-grid"
         onSubmit={(event) => {
@@ -1685,7 +1872,7 @@ function ResultsDialog({
           onCreate();
         }}
       >
-        <FormSection title="New Result">
+        <FormSection title="Expression">
           <label>
             <span>ID</span>
             <input value={draft.id} onChange={(event) => onDraftChange({ ...draft, id: event.target.value })} placeholder="approved" />
@@ -1696,26 +1883,8 @@ function ResultsDialog({
           </label>
           <button className="primary-button" type="submit">
             <Plus size={16} aria-hidden="true" />
-            Add result
+            Create
           </button>
-        </FormSection>
-        <FormSection title="Catalog">
-          <div className="record-list">
-            {results.map((result) => (
-              <article className={`record-card ${result.reserved ? "reserved" : ""}`} key={result.id}>
-                <header>
-                  <Braces size={17} aria-hidden="true" />
-                  <strong>{result.id}</strong>
-                  {result.reserved ? <span className="status-pill">reserved</span> : (
-                    <button className="icon-button compact-icon danger" type="button" onClick={() => onDelete(result.id)} title="Delete result" aria-label="Delete result">
-                      <Trash2 size={12} aria-hidden="true" />
-                    </button>
-                  )}
-                </header>
-                <textarea rows={3} value={result.description} disabled={result.reserved} onChange={(event) => onUpdate(result.id, event.target.value)} />
-              </article>
-            ))}
-          </div>
         </FormSection>
         <div className="dialog-actions">
           <button className="secondary-button" type="button" onClick={onClose}>
@@ -1740,7 +1909,7 @@ function SessionsDialog({
   onClose: () => void;
 }) {
   return (
-    <Modal title="Sessions" onClose={onClose} side className="sessions-modal">
+    <Modal title="Sessions" onClose={onClose} className="sessions-modal">
       <div className="play-sessions-panel">
         <div className="modal-action-row">
           <button className="secondary-button" type="button" onClick={onRefresh}>
@@ -1821,12 +1990,43 @@ function CanvasHelpDialog({ onClose }: { onClose: () => void }) {
   );
 }
 
+function ConfirmationDialog({
+  title,
+  message,
+  confirmLabel,
+  onCancel,
+  onConfirm,
+}: {
+  title: string;
+  message: string;
+  confirmLabel: string;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  return (
+    <Modal title={title} onClose={onCancel}>
+      <div className="confirmation-dialog">
+        <p>{message}</p>
+        <div className="dialog-actions">
+          <button className="secondary-button" type="button" onClick={onCancel}>
+            <X size={16} aria-hidden="true" />
+            Cancel
+          </button>
+          <button className="danger-button" type="button" onClick={onConfirm}>
+            <Trash2 size={16} aria-hidden="true" />
+            {confirmLabel}
+          </button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
 function Modal({
   title,
   children,
   onClose,
   wide,
-  side,
   plainHeader,
   className: extraClassName,
 }: {
@@ -1834,21 +2034,12 @@ function Modal({
   children: React.ReactNode;
   onClose: () => void;
   wide?: boolean;
-  side?: boolean;
   plainHeader?: boolean;
   className?: string;
 }) {
-  const [entered, setEntered] = React.useState(false);
-
-  React.useEffect(() => {
-    const frame = window.requestAnimationFrame(() => setEntered(true));
-    return () => window.cancelAnimationFrame(frame);
-  }, []);
-
-  const className = `${side ? `modal side ${entered ? "entered" : ""}` : wide ? "modal wide" : "modal"}${extraClassName ? ` ${extraClassName}` : ""}`;
-  const backdropClassName = side ? `modal-backdrop side-backdrop ${entered ? "entered" : ""}` : "modal-backdrop";
+  const className = `${wide ? "modal wide" : "modal"}${extraClassName ? ` ${extraClassName}` : ""}`;
   return createPortal(
-    <div className={backdropClassName} role="presentation" onMouseDown={onClose}>
+    <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
       <section className={className} role="dialog" aria-modal="true" aria-label={title} onMouseDown={(event) => event.stopPropagation()}>
         <header className={plainHeader ? "modal-header plain" : "modal-header"}>
           <h1>{title}</h1>
@@ -1889,27 +2080,47 @@ function InfoRow({ icon, label, value }: { icon: React.ReactNode; label: string;
 }
 
 function paletteItemKey(item: PaletteItem): string {
-  return `${item.type}:${item.agentId}`;
+  return item.type === "agent" ? `${item.type}:${item.agentId}` : `${item.type}:${item.resultId}`;
+}
+
+function nodeFromPaletteItem(item: PaletteItem, x: number, y: number, id = newId(item.type)): GraphNode {
+  if (item.type === "agent") {
+    return {
+      id,
+      type: "agent",
+      agentId: item.agentId,
+      x,
+      y,
+    };
+  }
+  return {
+    id,
+    type: "expression",
+    resultId: item.resultId,
+    x,
+    y,
+  };
 }
 
 function paletteConnectionForTarget(
   state: GraphState,
   sourceCandidate: GraphNode,
   target: GraphNode,
-  selectedResults: Record<string, string>,
 ): PaletteDropConnection | null {
-  if (sourceCandidate.type !== "agent") return null;
-  if (target.type === "play") {
+  if (sourceCandidate.type === "agent" && target.type === "play") {
     return { source: target, target: sourceCandidate, type: "runs", targetNodeId: target.id };
   }
-  if (target.type === "expression") {
+  if (sourceCandidate.type === "agent" && target.type === "expression") {
     return {
       source: target,
       target: sourceCandidate,
       type: "routes",
-      resultId: selectedRouteResultForExpression(state, target.id, selectedResults),
+      resultId: selectedRouteResultForExpression(state, target.id),
       targetNodeId: target.id,
     };
+  }
+  if (sourceCandidate.type === "expression" && target.type === "agent") {
+    return { source: target, target: sourceCandidate, type: "evaluates", targetNodeId: target.id };
   }
   return null;
 }
@@ -1944,16 +2155,14 @@ function edgeForDrop(
   state: GraphState,
   dragged: GraphNode,
   target: GraphNode,
-  selectedResults: Record<string, string>,
 ): Omit<GraphEdge, "id"> | null {
-  return edgeForConnection(state, dragged, target, selectedResults) ?? edgeForConnection(state, target, dragged, selectedResults);
+  return edgeForConnection(state, dragged, target) ?? edgeForConnection(state, target, dragged);
 }
 
 function edgeForConnection(
   state: GraphState,
   source: GraphNode,
   target: GraphNode,
-  selectedResults: Record<string, string>,
 ): Omit<GraphEdge, "id"> | null {
   if (source.id === target.id) return null;
   if (source.type === "play" && target.type === "agent") return { source: source.id, target: target.id, type: "runs" };
@@ -1963,7 +2172,7 @@ function edgeForConnection(
       source: source.id,
       target: target.id,
       type: "routes",
-      resultId: selectedRouteResultForExpression(state, source.id, selectedResults),
+      resultId: selectedRouteResultForExpression(state, source.id),
     };
   }
   return null;
@@ -1981,11 +2190,11 @@ function edgeFromDropConnection(connection: PaletteDropConnection): Omit<GraphEd
 function withGraphEdge(state: GraphState, edge: Omit<GraphEdge, "id">): GraphState {
   return withActiveGraph(state, {
     ...state.graph,
-    edges: upsertEdges(state.graph.edges, edge),
+    edges: upsertGraphEdge(state.graph.edges, state.graph.nodes, edge),
   });
 }
 
-function upsertEdges(edges: GraphEdge[], edge: Omit<GraphEdge, "id">): GraphEdge[] {
+function upsertGraphEdge(edges: GraphEdge[], nodes: GraphNode[], edge: Omit<GraphEdge, "id">): GraphEdge[] {
   const duplicate = edges.some((candidate) =>
     candidate.source === edge.source &&
     candidate.target === edge.target &&
@@ -2002,17 +2211,72 @@ function upsertEdges(edges: GraphEdge[], edge: Omit<GraphEdge, "id">): GraphEdge
     }
     return true;
   });
-  return [...filtered, { id: newId("edge"), ...edge }];
+  return [...filtered, { id: newId("edge"), ...edgeWithInitialBend(nodes, filtered, edge) }];
+}
+
+function edgeWithInitialBend(nodes: GraphNode[], edges: GraphEdge[], edge: Omit<GraphEdge, "id">): Omit<GraphEdge, "id"> {
+  if (edge.bend) return edge;
+  const source = nodes.find((node) => node.id === edge.source);
+  const target = nodes.find((node) => node.id === edge.target);
+  if (!source || !target) return edge;
+  const relatedEdgeCount = edges.filter((candidate) => sameUnorderedEndpoints(candidate, edge)).length;
+  if (relatedEdgeCount === 0) return edge;
+  const bend = separatedEdgeBend(source, target, relatedEdgeCount);
+  return { ...edge, bend };
+}
+
+function sameUnorderedEndpoints(left: Pick<GraphEdge, "source" | "target">, right: Pick<GraphEdge, "source" | "target">): boolean {
+  return (
+    (left.source === right.source && left.target === right.target) ||
+    (left.source === right.target && left.target === right.source)
+  );
+}
+
+function separatedEdgeBend(source: GraphNode, target: GraphNode, relatedEdgeCount: number): Point {
+  const sourceCenter = projectNodeCenter(source);
+  const targetCenter = projectNodeCenter(target);
+  const baseBend = defaultBendForNodes(source, target);
+  const dx = targetCenter.x - sourceCenter.x;
+  const dy = targetCenter.y - sourceCenter.y;
+  const length = Math.hypot(dx, dy) || 1;
+  const normal = { x: -dy / length, y: dx / length };
+  const slot = edgeBendSlot(relatedEdgeCount);
+  const offset = slot * 58;
+  return {
+    x: Math.round(baseBend.x + normal.x * offset),
+    y: Math.round(baseBend.y + normal.y * offset),
+  };
+}
+
+function edgeBendSlot(relatedEdgeCount: number): number {
+  const slotIndex = Math.max(0, relatedEdgeCount - 1);
+  const magnitude = Math.floor(slotIndex / 2) + 1;
+  return slotIndex % 2 === 0 ? magnitude : -magnitude;
 }
 
 function selectedRouteResultForExpression(
   state: GraphState,
   expressionId: string,
-  selectedResults: Record<string, string>,
 ): string {
-  const selected = selectedResults[expressionId];
-  if (selected && state.results.some((result) => result.id === selected)) return selected;
-  return state.results.find((result) => !result.reserved)?.id ?? "unknown";
+  const node = state.graph.nodes.find((candidate) => candidate.id === expressionId && candidate.type === "expression");
+  if (!node) return defaultExpressionResultId(state);
+  return expressionResultIdForNode(state, node);
+}
+
+function expressionResultIdForNode(state: GraphState, node: GraphNode): string {
+  if (node.type !== "expression") return defaultExpressionResultId(state);
+  const fixedResultId = normalizeResultId(node.resultId ?? "");
+  if (fixedResultId) return fixedResultId;
+  const existingRoute = state.graph.edges.find((edge) => (
+    edge.source === node.id &&
+    edge.type === "routes" &&
+    edge.resultId
+  ));
+  return existingRoute?.resultId ?? defaultExpressionResultId(state);
+}
+
+function defaultExpressionResultId(state: Pick<GraphState, "results">): string {
+  return state.results.find((result) => !result.reserved)?.id ?? state.results[0]?.id ?? "unknown";
 }
 
 function edgeGeometry(edge: Pick<GraphEdge, "bend" | "sourceAnchor" | "targetAnchor">, source: GraphNode, target: GraphNode): EdgeGeometry {
@@ -2041,6 +2305,17 @@ function edgeGeometry(edge: Pick<GraphEdge, "bend" | "sourceAnchor" | "targetAnc
 
 function edgePath(source: GraphNode, target: GraphNode, bend?: Point | null): string {
   return edgeGeometry({ bend }, source, target).path;
+}
+
+function defaultBendForNodes(source: GraphNode, target: GraphNode): Point {
+  const sourceAnchor = cardAnchorForPoint(source, projectNodeCenter(target));
+  const targetAnchor = cardAnchorForPoint(target, projectNodeCenter(source));
+  const sourcePoint = projectNodeAnchorPoint(source, sourceAnchor);
+  const targetPoint = projectNodeAnchorPoint(target, targetAnchor);
+  return defaultEdgeBend(
+    offsetAnchorPoint(sourcePoint, sourceAnchor, 34),
+    offsetAnchorPoint(targetPoint, targetAnchor, 34),
+  );
 }
 
 function connectionPreviewPath(source: GraphNode, target: Point): string {
@@ -2192,7 +2467,7 @@ function projectNodeBoundaryPoint(node: GraphNode, toward: { x: number; y: numbe
 function projectNodeSizeForType(type: GraphNodeType): { width: number; height: number } {
   if (type === "play") return { width: 260, height: 132 };
   if (type === "agent") return { width: 180, height: 88 };
-  return { width: 220, height: 138 };
+  return { width: 220, height: 88 };
 }
 
 function projectNodeRect(node: GraphNode): { x: number; y: number; width: number; height: number } {
@@ -2281,13 +2556,6 @@ function nodeLabel(node: GraphNode, state: GraphState) {
   if (node.type === "expression") return `Expression ${shortId(node.id)}`;
   const agent = state.agents.find((candidate) => candidate.id === node.agentId);
   return agent?.name ?? `Agent ${shortId(node.id)}`;
-}
-
-function incomingAgentForExpression(state: GraphState, node: GraphNode) {
-  if (node.type !== "expression") return null;
-  const incoming = state.graph.edges.find((edge) => edge.target === node.id && edge.type === "evaluates");
-  const source = incoming ? state.graph.nodes.find((candidate) => candidate.id === incoming.source && candidate.type === "agent") : null;
-  return source ? nodeLabel(source, state) : null;
 }
 
 function latestNodeStatus(state: GraphState, nodeId: string): NodeStatus | null {
