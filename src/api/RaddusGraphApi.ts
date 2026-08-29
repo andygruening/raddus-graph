@@ -1,6 +1,7 @@
 export type RunnerId = "codex" | "claude";
 export type GraphNodeType = "play" | "agent" | "expression";
 export type GraphEdgeType = "runs" | "evaluates" | "routes";
+export type CardAnchor = "top" | "right" | "bottom" | "left";
 export type GraphSessionStatus = "running" | "completed" | "failed" | "stopped";
 export type NodeStatusState = "queued" | "started" | "working" | "blocked" | "completed" | "failed" | "stopped";
 
@@ -43,6 +44,8 @@ export interface GraphEdge {
   type: GraphEdgeType;
   resultId?: string;
   bend?: { x: number; y: number } | null;
+  sourceAnchor?: CardAnchor | null;
+  targetAnchor?: CardAnchor | null;
 }
 
 export interface GraphDocument {

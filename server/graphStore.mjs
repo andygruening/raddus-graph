@@ -322,6 +322,8 @@ function normalizeGraphEdge(value, nodeIds) {
   if (type !== "runs" && type !== "evaluates" && type !== "routes") return null;
   const resultId = normalizeResultId(record.resultId);
   const bend = normalizePoint(record.bend);
+  const sourceAnchor = cardAnchorValue(record.sourceAnchor);
+  const targetAnchor = cardAnchorValue(record.targetAnchor);
   return {
     id: stringValue(record.id) || cryptoId("edge"),
     source,
@@ -329,6 +331,8 @@ function normalizeGraphEdge(value, nodeIds) {
     type,
     ...(type === "routes" && resultId ? { resultId } : {}),
     ...(bend ? { bend } : {}),
+    ...(sourceAnchor ? { sourceAnchor } : {}),
+    ...(targetAnchor ? { targetAnchor } : {}),
   };
 }
 
@@ -337,6 +341,11 @@ function normalizePoint(value) {
   const x = numberValue(record.x, Number.NaN);
   const y = numberValue(record.y, Number.NaN);
   return Number.isFinite(x) && Number.isFinite(y) ? { x, y } : null;
+}
+
+function cardAnchorValue(value) {
+  const text = stringValue(value);
+  return text === "top" || text === "right" || text === "bottom" || text === "left" ? text : null;
 }
 
 function normalizeGraphSession(value) {

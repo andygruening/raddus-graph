@@ -450,6 +450,11 @@ a:focus-visible {
   filter: drop-shadow(0 0 7px color-mix(in srgb, var(--edge-color) 28%, transparent));
 }
 
+.project-edge-group.remove-hover .project-edge {
+  stroke: var(--danger-fg);
+  filter: drop-shadow(0 0 8px color-mix(in srgb, var(--danger-fg) 32%, transparent));
+}
+
 .project-edge-group:hover .project-edge-arrow,
 .project-edge-group.selected .project-edge-arrow,
 .project-edge-group.dragging .project-edge-arrow {
@@ -457,29 +462,56 @@ a:focus-visible {
   filter: drop-shadow(0 0 7px color-mix(in srgb, var(--edge-color) 32%, transparent));
 }
 
+.project-edge-group.remove-hover .project-edge-arrow {
+  fill: var(--danger-fg);
+  filter: drop-shadow(0 0 7px color-mix(in srgb, var(--danger-fg) 32%, transparent));
+}
+
 .project-edge-group.dragging .project-edge-hit {
   cursor: grabbing;
 }
 
-.project-edge-handle {
+.project-edge-handle,
+.project-edge-endpoint {
   fill: var(--surface-bg);
   stroke: var(--edge-color);
   stroke-width: 2;
   cursor: grab;
   opacity: 0;
   pointer-events: none;
-  transition: opacity 140ms ease, r 140ms ease, filter 140ms ease;
+  transition: opacity 140ms ease, filter 140ms ease, transform 140ms ease;
+  transform-box: fill-box;
+  transform-origin: center;
 }
 
 .project-edge-group:hover .project-edge-handle,
+.project-edge-group:hover .project-edge-endpoint,
 .project-edge-group.selected .project-edge-handle,
-.project-edge-group.dragging .project-edge-handle {
+.project-edge-group.selected .project-edge-endpoint,
+.project-edge-group.dragging .project-edge-handle,
+.project-edge-group.dragging .project-edge-endpoint {
   opacity: 1;
   pointer-events: all;
   filter: drop-shadow(0 0 8px color-mix(in srgb, var(--edge-color) 34%, transparent));
 }
 
-.project-edge-group.dragging .project-edge-handle {
+.project-edge-handle {
+  stroke-dasharray: 2 2;
+}
+
+.project-edge-endpoint {
+  fill: color-mix(in srgb, var(--surface-bg) 82%, var(--edge-color));
+}
+
+.project-edge-handle:hover,
+.project-edge-endpoint:hover,
+.project-edge-group.dragging .project-edge-handle,
+.project-edge-group.dragging .project-edge-endpoint {
+  transform: scale(1.12);
+}
+
+.project-edge-group.dragging .project-edge-handle,
+.project-edge-group.dragging .project-edge-endpoint {
   cursor: grabbing;
 }
 

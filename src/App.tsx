@@ -21,6 +21,7 @@ import {
 import {
   type AgentSpec,
   type BranchListResult,
+  type CardAnchor,
   type GraphEdge,
   type GraphDocument,
   type GraphNode,
@@ -41,12 +42,18 @@ type SaveStatus = "idle" | "saving" | "saved" | "error";
 type Point = { x: number; y: number };
 type CanvasViewport = { x: number; y: number; zoom: number };
 type ConnectionState = "idle" | "source" | "valid" | "invalid";
+type EdgeEndpoint = "source" | "target";
+type EdgeAnchorDrag = { edgeId: string; endpoint: EdgeEndpoint } | null;
 type EdgeGeometry = {
   path: string;
   points: Point[];
   handle: Point;
   label: Point;
   arrow: Point & { angle: number };
+  sourcePoint: Point;
+  targetPoint: Point;
+  sourceAnchor: CardAnchor;
+  targetAnchor: CardAnchor;
 };
 type DialogState =
   | { type: "agent-create" }
@@ -97,7 +104,10 @@ export default function App() {
   const [camera, setCamera] = React.useState<CanvasViewport>(defaultCanvasViewport);
   const [draggingNodeId, setDraggingNodeId] = React.useState<string | null>(null);
   const [draggingEdgeId, setDraggingEdgeId] = React.useState<string | null>(null);
+  const [draggingEdgeAnchor, setDraggingEdgeAnchor] = React.useState<EdgeAnchorDrag>(null);
   const [selectedEdgeId, setSelectedEdgeId] = React.useState<string | null>(null);
+  const [hoveredEdgeId, setHoveredEdgeId] = React.useState<string | null>(null);
+  const [hoveredEdgeControlId, setHoveredEdgeControlId] = React.useState<string | null>(null);
   const [nodeDropTargetId, setNodeDropTargetId] = React.useState<string | null>(null);
   const [connectingFromId, setConnectingFromId] = React.useState<string | null>(null);
   const [draggingPaletteItemKey, setDraggingPaletteItemKey] = React.useState<string | null>(null);
@@ -109,6 +119,7 @@ export default function App() {
   const latestState = React.useRef<GraphState | null>(null);
   const suppressNodeClickRef = React.useRef(false);
   const edgeDragMovedRef = React.useRef(false);
+  const edgeAnchorDragChangedRef = React.useRef(false);
 
   React.useEffect(() => {
     latestState.current = state;
@@ -385,6 +396,17 @@ export default function App() {
     setState(next);
   }
 
+  function moveEdgeAnchorLocally(edgeId: string, endpoint: EdgeEndpoint, anchor: CardAnchor) {
+    const current = latestState.current;
+    if (!current) return;
+    const next = updateEdgeInState(current, edgeId, (edge) => ({
+      ...edge,
+      ...(endpoint === "source" ? { sourceAnchor: anchor } : { targetAnchor: anchor }),
+    }));
+    latestState.current = next;
+    setState(next);
+  }
+
   function removeEdge(edgeId: string) {
     mutateState((current) => (
       withActiveGraph(current, {
@@ -595,6 +617,46 @@ export default function App() {
     window.addEventListener("pointerup", onUp);
   }
 
+  function beginEdgeAnchorDrag(
+    event: React.PointerEvent<SVGElement>,
+    edgeId: string,
+    endpoint: EdgeEndpoint,
+    node: GraphNode,
+    currentAnchor: CardAnchor,
+  ) {
+    event.preventDefault();
+    event.stopPropagation();
+    const current = latestState.current;
+    if (!current?.graph.edges.some((edge) => edge.id === edgeId)) return;
+    let activeAnchor = currentAnchor;
+    edgeAnchorDragChangedRef.current = false;
+    setSelectedEdgeId(edgeId);
+    setHoveredEdgeControlId(edgeId);
+    setDraggingEdgeAnchor({ edgeId, endpoint });
+    event.currentTarget.setPointerCapture(event.pointerId);
+
+    function onMove(moveEvent: PointerEvent) {
+      const nextAnchor = cardAnchorForPoint(node, screenToWorld(moveEvent.clientX, moveEvent.clientY));
+      if (nextAnchor === activeAnchor) return;
+      activeAnchor = nextAnchor;
+      edgeAnchorDragChangedRef.current = true;
+      moveEdgeAnchorLocally(edgeId, endpoint, nextAnchor);
+    }
+
+    function onUp() {
+      setDraggingEdgeAnchor(null);
+      setHoveredEdgeControlId(null);
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      if (!edgeAnchorDragChangedRef.current) return;
+      const latest = latestState.current;
+      if (latest) void persistState(latest);
+    }
+
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  }
+
   function beginConnection(event: React.PointerEvent, nodeId: string) {
     event.preventDefault();
     event.stopPropagation();
@@ -740,7 +802,7 @@ export default function App() {
   }
 
   function handleCanvasPointerDown(event: React.PointerEvent<HTMLDivElement>) {
-    if (eventTargetClosest(event.target, ".project-node, .project-edge-hit, .project-edge-handle, .project-controls-overlay, .project-workspace-overlay, .project-card-palette")) return;
+    if (eventTargetClosest(event.target, ".project-node, .project-edge-hit, .project-edge-handle, .project-edge-endpoint, .project-controls-overlay, .project-workspace-overlay, .project-card-palette")) return;
     setSelectedEdgeId(null);
     const startX = event.clientX;
     const startY = event.clientY;
@@ -807,7 +869,7 @@ export default function App() {
         <div className="workspace">
           <section className="projects-view">
             <div
-              className={`project-canvas ${connectingFromId ? "connecting" : ""} ${draggingPaletteItemKey ? "palette-dragging" : ""} ${paletteDragPreview ? "palette-drop-ready" : ""} ${draggingNodeId ? "node-dragging" : ""} ${draggingEdgeId ? "edge-dragging" : ""}`}
+              className={`project-canvas ${connectingFromId ? "connecting" : ""} ${draggingPaletteItemKey ? "palette-dragging" : ""} ${paletteDragPreview ? "palette-drop-ready" : ""} ${draggingNodeId ? "node-dragging" : ""} ${draggingEdgeId || draggingEdgeAnchor ? "edge-dragging" : ""}`}
               ref={canvasRef}
               onPointerDown={handleCanvasPointerDown}
               onWheel={handleCanvasWheel}
@@ -897,16 +959,19 @@ export default function App() {
                     if (!source || !target) return null;
                     const geometry = edgeGeometry(edge, source, target);
                     const selected = selectedEdgeId === edge.id;
-                    const dragging = draggingEdgeId === edge.id;
+                    const dragging = draggingEdgeId === edge.id || draggingEdgeAnchor?.edgeId === edge.id;
+                    const removeHover = hoveredEdgeId === edge.id && hoveredEdgeControlId !== edge.id && !dragging;
                     return (
-                      <g className={`project-edge-group ${edge.type} ${selected ? "selected" : ""} ${dragging ? "dragging" : ""}`} key={edge.id}>
+                      <g className={`project-edge-group ${edge.type} ${selected ? "selected" : ""} ${dragging ? "dragging" : ""} ${removeHover ? "remove-hover" : ""}`} key={edge.id}>
                         <path
                           className="project-edge-hit"
                           d={geometry.path}
                           onPointerDown={(event) => beginEdgeDrag(event, edge.id, geometry.handle)}
-                          onDoubleClick={(event) => {
+                          onPointerEnter={() => setHoveredEdgeId(edge.id)}
+                          onPointerLeave={() => setHoveredEdgeId((current) => current === edge.id ? null : current)}
+                          onClick={(event) => {
                             event.stopPropagation();
-                            removeEdge(edge.id);
+                            if (!edgeDragMovedRef.current) removeEdge(edge.id);
                           }}
                         />
                         <path className={`project-edge ${edge.type}`} d={geometry.path} pathLength={1} style={{ animationDelay: `${Math.min(edgeIndex * 18 + 70, 260)}ms` }} />
@@ -925,7 +990,27 @@ export default function App() {
                           cx={geometry.handle.x}
                           cy={geometry.handle.y}
                           r={7}
+                          onPointerEnter={() => setHoveredEdgeControlId(edge.id)}
+                          onPointerLeave={() => setHoveredEdgeControlId((current) => current === edge.id ? null : current)}
                           onPointerDown={(event) => beginEdgeDrag(event, edge.id, geometry.handle)}
+                        />
+                        <circle
+                          className={`project-edge-endpoint source ${edge.type}`}
+                          cx={geometry.sourcePoint.x}
+                          cy={geometry.sourcePoint.y}
+                          r={7}
+                          onPointerEnter={() => setHoveredEdgeControlId(edge.id)}
+                          onPointerLeave={() => setHoveredEdgeControlId((current) => current === edge.id ? null : current)}
+                          onPointerDown={(event) => beginEdgeAnchorDrag(event, edge.id, "source", source, geometry.sourceAnchor)}
+                        />
+                        <circle
+                          className={`project-edge-endpoint target ${edge.type}`}
+                          cx={geometry.targetPoint.x}
+                          cy={geometry.targetPoint.y}
+                          r={7}
+                          onPointerEnter={() => setHoveredEdgeControlId(edge.id)}
+                          onPointerLeave={() => setHoveredEdgeControlId((current) => current === edge.id ? null : current)}
+                          onPointerDown={(event) => beginEdgeAnchorDrag(event, edge.id, "target", target, geometry.targetAnchor)}
                         />
                       </g>
                     );
@@ -1930,26 +2015,16 @@ function selectedRouteResultForExpression(
   return state.results.find((result) => !result.reserved)?.id ?? "unknown";
 }
 
-function edgeGeometry(edge: Pick<GraphEdge, "bend">, source: GraphNode, target: GraphNode): EdgeGeometry {
-  const sourceCenter = projectNodeCenter(source);
-  const targetCenter = projectNodeCenter(target);
-  const bend = edge.bend ?? defaultEdgeBend(source, target);
-  const sourcePoint = projectNodeBoundaryPoint(source, bend);
-  const targetPoint = projectNodeBoundaryPoint(target, bend, 4);
-  const horizontalFirst = Math.abs(targetCenter.x - sourceCenter.x) >= Math.abs(targetCenter.y - sourceCenter.y);
-  const points = compactEdgePoints(horizontalFirst ? [
-    sourcePoint,
-    { x: bend.x, y: sourcePoint.y },
-    bend,
-    { x: targetPoint.x, y: bend.y },
-    targetPoint,
-  ] : [
-    sourcePoint,
-    { x: sourcePoint.x, y: bend.y },
-    bend,
-    { x: bend.x, y: targetPoint.y },
-    targetPoint,
-  ]);
+function edgeGeometry(edge: Pick<GraphEdge, "bend" | "sourceAnchor" | "targetAnchor">, source: GraphNode, target: GraphNode): EdgeGeometry {
+  const sourceAnchor = edge.sourceAnchor ?? cardAnchorForPoint(source, edge.bend ?? projectNodeCenter(target));
+  const targetAnchor = edge.targetAnchor ?? cardAnchorForPoint(target, edge.bend ?? projectNodeCenter(source));
+  const sourcePoint = projectNodeAnchorPoint(source, sourceAnchor);
+  const targetPoint = projectNodeAnchorPoint(target, targetAnchor);
+  const sourceStub = offsetAnchorPoint(sourcePoint, sourceAnchor, 34);
+  const targetStub = offsetAnchorPoint(targetPoint, targetAnchor, 34);
+  const bend = edge.bend ?? defaultEdgeBend(sourceStub, targetStub);
+  const routePoints = orthogonalRoutePoints(sourceStub, targetStub, bend);
+  const points = compactEdgePoints([sourcePoint, ...routePoints, targetPoint]);
   const arrow = pointOnPolyline(points, 0.5);
   return {
     path: edgePathFromPoints(points),
@@ -1957,6 +2032,10 @@ function edgeGeometry(edge: Pick<GraphEdge, "bend">, source: GraphNode, target: 
     handle: bend,
     label: arrow,
     arrow,
+    sourcePoint,
+    targetPoint,
+    sourceAnchor,
+    targetAnchor,
   };
 }
 
@@ -1965,35 +2044,66 @@ function edgePath(source: GraphNode, target: GraphNode, bend?: Point | null): st
 }
 
 function connectionPreviewPath(source: GraphNode, target: Point): string {
-  const sourcePoint = projectNodeBoundaryPoint(source, target);
-  const bend = {
-    x: (sourcePoint.x + target.x) / 2,
-    y: (sourcePoint.y + target.y) / 2,
-  };
-  const horizontalFirst = Math.abs(target.x - sourcePoint.x) >= Math.abs(target.y - sourcePoint.y);
-  const points = compactEdgePoints(horizontalFirst ? [
-    sourcePoint,
-    { x: bend.x, y: sourcePoint.y },
-    bend,
-    { x: target.x, y: bend.y },
-    target,
-  ] : [
-    sourcePoint,
-    { x: sourcePoint.x, y: bend.y },
-    bend,
-    { x: bend.x, y: target.y },
-    target,
-  ]);
-  return edgePathFromPoints(points);
+  const sourceAnchor = cardAnchorForPoint(source, target);
+  const sourcePoint = projectNodeAnchorPoint(source, sourceAnchor);
+  const sourceStub = offsetAnchorPoint(sourcePoint, sourceAnchor, 34);
+  const bend = defaultEdgeBend(sourceStub, target);
+  return edgePathFromPoints(compactEdgePoints([sourcePoint, ...orthogonalRoutePoints(sourceStub, target, bend)]));
 }
 
-function defaultEdgeBend(source: GraphNode, target: GraphNode): Point {
-  const sourceCenter = projectNodeCenter(source);
-  const targetCenter = projectNodeCenter(target);
+function orthogonalRoutePoints(start: Point, end: Point, bend: Point): Point[] {
+  const horizontalFirst = Math.abs(end.x - start.x) >= Math.abs(end.y - start.y);
+  return compactEdgePoints(horizontalFirst ? [
+    start,
+    { x: bend.x, y: start.y },
+    bend,
+    { x: end.x, y: bend.y },
+    end,
+  ] : [
+    start,
+    { x: start.x, y: bend.y },
+    bend,
+    { x: bend.x, y: end.y },
+    end,
+  ]);
+}
+
+function defaultEdgeBend(source: Point, target: Point): Point {
   return {
-    x: (sourceCenter.x + targetCenter.x) / 2,
-    y: (sourceCenter.y + targetCenter.y) / 2,
+    x: (source.x + target.x) / 2,
+    y: (source.y + target.y) / 2,
   };
+}
+
+function projectNodeAnchorPoint(node: GraphNode, anchor: CardAnchor): Point {
+  const size = projectNodeSizeForType(node.type);
+  if (anchor === "top") return { x: node.x + size.width / 2, y: node.y };
+  if (anchor === "right") return { x: node.x + size.width, y: node.y + size.height / 2 };
+  if (anchor === "bottom") return { x: node.x + size.width / 2, y: node.y + size.height };
+  return { x: node.x, y: node.y + size.height / 2 };
+}
+
+function offsetAnchorPoint(point: Point, anchor: CardAnchor, distance: number): Point {
+  const direction = anchorDirection(anchor);
+  return {
+    x: point.x + direction.x * distance,
+    y: point.y + direction.y * distance,
+  };
+}
+
+function cardAnchorForPoint(node: GraphNode, point: Point): CardAnchor {
+  const center = projectNodeCenter(node);
+  const dx = point.x - center.x;
+  const dy = point.y - center.y;
+  if (Math.abs(dx) > Math.abs(dy)) return dx >= 0 ? "right" : "left";
+  return dy >= 0 ? "bottom" : "top";
+}
+
+function anchorDirection(anchor: CardAnchor): Point {
+  if (anchor === "top") return { x: 0, y: -1 };
+  if (anchor === "right") return { x: 1, y: 0 };
+  if (anchor === "bottom") return { x: 0, y: 1 };
+  return { x: -1, y: 0 };
 }
 
 function compactEdgePoints(points: Point[]): Point[] {
