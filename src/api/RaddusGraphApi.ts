@@ -35,6 +35,7 @@ export interface GraphNode {
   repository?: string | null;
   branch?: string | null;
   agentId?: string | null;
+  resultId?: string;
 }
 
 export interface GraphEdge {
