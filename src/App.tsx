@@ -451,7 +451,7 @@ export default function App() {
   }
 
   function beginNodeDrag(event: React.PointerEvent<HTMLElement>, nodeId: string) {
-    if ((event.target as HTMLElement).closest("button, input, select, textarea, .project-connector, .node-editor-control")) return;
+    if (eventTargetClosest(event.target, "button, input, select, textarea, .project-connector, .node-editor-control")) return;
     const current = latestState.current;
     const node = current?.graph.nodes.find((item) => item.id === nodeId);
     if (!node) return;
@@ -619,7 +619,7 @@ export default function App() {
     const rect = canvas.getBoundingClientRect();
     if (clientX < rect.left || clientX > rect.right || clientY < rect.top || clientY > rect.bottom) return false;
     const target = document.elementFromPoint(clientX, clientY);
-    if (target instanceof HTMLElement && target.closest(".project-card-palette, .project-controls-overlay, .project-workspace-overlay")) return false;
+    if (target instanceof Element && target.closest(".project-card-palette, .project-controls-overlay, .project-workspace-overlay")) return false;
     return true;
   }
 
@@ -632,12 +632,13 @@ export default function App() {
 
   function nodeIdAtPoint(clientX: number, clientY: number): string | null {
     const target = document.elementFromPoint(clientX, clientY);
-    if (!(target instanceof HTMLElement)) return null;
-    return target.closest<HTMLElement>("[data-project-node-id]")?.dataset.projectNodeId ?? null;
+    if (!(target instanceof Element)) return null;
+    const nodeElement = target.closest<HTMLElement>("[data-project-node-id]");
+    return nodeElement?.dataset.projectNodeId ?? null;
   }
 
   function handleCanvasPointerDown(event: React.PointerEvent<HTMLDivElement>) {
-    if ((event.target as HTMLElement).closest(".project-node, .project-controls-overlay, .project-workspace-overlay, .project-card-palette")) return;
+    if (eventTargetClosest(event.target, ".project-node, .project-controls-overlay, .project-workspace-overlay, .project-card-palette")) return;
     const startX = event.clientX;
     const startY = event.clientY;
     const startCamera = cameraRef.current;
@@ -972,7 +973,7 @@ function ProjectNodeCard({
       style={{ left: node.x, top: node.y, animationDelay: `${enterDelayMs}ms` }}
       onPointerDown={onPointerDown}
       onClick={(event) => {
-        if ((event.target as HTMLElement).closest("button, input, select, textarea, .project-connector, .node-editor-control")) return;
+        if (eventTargetClosest(event.target, "button, input, select, textarea, .project-connector, .node-editor-control")) return;
         if (shouldSuppressClick()) return;
         onOpen();
       }}
@@ -1809,6 +1810,10 @@ function updateNodeInState(state: GraphState, nodeId: string, update: (node: Gra
       nodes: state.graph.nodes.map((node) => node.id === nodeId ? update(node) : node),
     },
   };
+}
+
+function eventTargetClosest(target: EventTarget | null, selector: string): Element | null {
+  return target instanceof Element ? target.closest(selector) : null;
 }
 
 function nodeLabel(node: GraphNode, state: GraphState) {
