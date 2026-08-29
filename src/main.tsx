@@ -9,7 +9,7 @@ type CanvasLocalGlobal = typeof globalThis & {
 };
 
 const rootElement = document.getElementById("root");
-if (!rootElement) throw new Error("Raddus Canvas root element is missing.");
+if (!rootElement) throw new Error("Raddus Graph root element is missing.");
 
 const canvasLocalGlobal = globalThis as CanvasLocalGlobal;
 const canvasLocalRoot = canvasLocalGlobal.__canvasLocalRoot ?? createRoot(rootElement);

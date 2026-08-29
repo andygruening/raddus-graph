@@ -1,4 +1,3 @@
-import { APIError } from "@anthropic-ai/sdk";
 import { maxBodyBytes } from "./config.mjs";
 import { HttpError } from "./errors.mjs";
 
@@ -8,15 +7,13 @@ export function sendJson(res, status, payload) {
 }
 
 export function sendError(res, error) {
-  const status = error instanceof HttpError ? error.status : error instanceof APIError ? error.status ?? 502 : 500;
-  const requestId = error instanceof APIError ? error.requestID ?? null : null;
-  const message = error instanceof HttpError || error instanceof APIError ? error.message : "Raddus Canvas server error.";
+  const status = error instanceof HttpError ? error.status : 500;
+  const message = error instanceof HttpError ? error.message : "Raddus Graph server error.";
   const headers = {
     "content-type": "application/json; charset=utf-8",
-    ...(requestId ? { "x-request-id": requestId } : {}),
   };
   res.writeHead(status, headers);
-  res.end(JSON.stringify({ error: { message }, request_id: requestId }));
+  res.end(JSON.stringify({ error: { message } }));
 }
 
 export async function readJsonBody(req) {

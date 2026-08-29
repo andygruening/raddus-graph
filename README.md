@@ -1,56 +1,58 @@
-# Raddus Canvas
+# Raddus Graph
 
-## Overview
+Raddus Graph is a local web app for designing and running CLI-backed agent graphs. It lets you define agent specs, result IDs, play nodes, and expression cards, then run graph sessions through local Codex or Claude CLI processes.
 
-Raddus Canvas is a local web app for building, configuring, and running Claude managed-agent projects from a visual canvas.
+[![npmjs.com](https://img.shields.io/badge/View%20on%20npmjs.com-6d9abf)](https://www.npmjs.com/package/@raddus/graph)
 
-The app is designed to run on your own machine. Your Anthropic API key is handled by the local server instead of being sent to a hosted Raddus backend, so you can use the canvas while keeping key storage under your control.
-
-[![npmjs.com](https://img.shields.io/badge/View%20on%20npmjs.com-6d9abf)](https://www.npmjs.com/package/@raddus/canvas)
-
-<img width="1233" height="527" alt="Raddus Canvas project canvas screenshot" src="https://github.com/user-attachments/assets/ffaf909c-a194-4254-96fc-aaaa4ef2018f" />
+<img width="1233" height="527" alt="Raddus Graph canvas screenshot" src="https://github.com/user-attachments/assets/ffaf909c-a194-4254-96fc-aaaa4ef2018f" />
 
 ## Features
 
-- Create and manage Claude agents from a canvas UI.
-- Connect agents to trigger cards, MCP servers, skills, vaults, and environments.
-- Start sessions from the canvas and inspect recent messages and status updates.
-- Store project settings locally so projects, canvas position, and app preferences persist across localhost ports.
-- Run as a local loopback app with a small Node.js server and React frontend.
+- Create local agent specs from a model, name, and system prompt.
+- Build graph sessions from play nodes, agent nodes, and expression cards.
+- Define graph-scoped result IDs and route terminal outcomes through expression cards.
+- Persist graph data, agent specs, sessions, status records, retained worktrees, and PR mappings under `.raddus-graph/`.
+- Run Codex CLI or Claude CLI sessions from the local Node.js server based on the selected model.
+- Select a GitHub repository and branch from the authenticated local `gh` user, or run with no repository.
+- Retain one worktree per graph session and publish file changes to one session branch and pull request.
+
+## Requirements
+
+- Node.js 20.19 or newer, or Node.js 22.12 or newer.
+- npm.
+- Codex CLI for models mapped to the Codex runner.
+- Claude CLI for models mapped to the Claude runner.
+- GitHub CLI (`gh`) authenticated with a GitHub account for repository and pull request workflows.
+
+If `gh` is unavailable or unauthenticated, Raddus Graph still runs and the play-card repository selector only offers `None`.
 
 ## Setup
 
 Install the package globally:
 
 ```shell
-npm i -g @raddus/canvas
+npm i -g @raddus/graph
 ```
 
-Start Raddus Canvas:
+Start Raddus Graph:
 
 ```shell
-raddus-canvas
+raddus-graph
 ```
 
 The server prints the local URL when it starts, for example:
 
 ```text
-Raddus Canvas listening at http://127.0.0.1:5174
+Raddus Graph listening at http://127.0.0.1:5174
 ```
 
 It also opens that URL in your default browser. To start the server without opening a browser:
 
 ```shell
-raddus-canvas --no-open
+raddus-graph --no-open
 ```
 
-You can also run it without a global install:
-
-```shell
-npx @raddus/canvas
-```
-
-When the app opens, enter a valid Anthropic API key. On macOS, the key is saved to Keychain. On other platforms, the key is kept in memory for the current server process.
+The old `raddus-canvas` binary remains as a compatibility alias for now.
 
 ## Local Development
 
@@ -72,54 +74,65 @@ Build the production bundle:
 npm run build
 ```
 
-## Security
+## Local Data
 
-Raddus Canvas is intended to be run locally. The server binds to `127.0.0.1` and rejects non-loopback API requests. Requests with an `Origin` header must also match the local server origin.
+By default, Raddus Graph stores local runtime data in `.raddus-graph/` under the directory where the server command is launched. Override this with:
 
-API key handling:
+```shell
+RADDUS_GRAPH_DIR=/path/to/.raddus-graph raddus-graph
+```
 
-- macOS: Anthropic API keys are stored in macOS Keychain, one item per local Anthropic profile.
-- Other platforms: the Anthropic API key is memory-only for now and is lost when the server exits.
-- The browser receives an HTTP-only local session cookie. It does not need to keep the Anthropic API key in browser storage.
-- Signing out clears the local session and deletes the active profile's stored macOS Keychain item.
+The store contains:
 
-Local app data:
+- `state.json`: graph design data, agent specs, result definitions, session metadata, node statuses, terminal outcomes, and PR mappings.
+- `sessions/<graph-session-id>/worktree`: the retained workspace for a graph session.
 
-- Projects, MCP server records, selected project, canvas viewport, and UI preferences are stored in a local JSON file.
-- Local records are partitioned by Anthropic API key profile because Anthropic agents, vaults, environments, and related resource IDs are scoped to the API key's workspace/account context.
-- On macOS, the default path is `~/Library/Application Support/Raddus Canvas/data.json`.
-- On Windows, the default path is `%APPDATA%/Raddus Canvas/data.json`.
-- On Linux, the default path is `$XDG_CONFIG_HOME/raddus-canvas/data.json`, or `~/.config/raddus-canvas/data.json` when `XDG_CONFIG_HOME` is not set.
-- You can override the data file location with `RADDUS_CANVAS_DATA_FILE`.
+## Runtime Model
 
-The app still runs code in your browser and uses npm dependencies, so treat it like any other local development tool that can access a user-provided API key at runtime. Only run versions you trust.
+Running a play node creates a graph session id. The server snapshots the current graph, provisions a retained session worktree, and executes one graph path at a time.
+
+Agent prompts are assembled from:
+
+- the upstream execution context that led to the current node
+- high-level graph session context
+- the original play-node prompt
+- the graph result catalog
+- the local status callback contract
+
+Agent sessions post progress and terminal outcome JSON to:
+
+```text
+POST /api/graph/sessions/:graphSessionId/nodes/:nodeId/status
+```
+
+Expression cards route only after terminal outcomes. `completed` routes by a valid emitted result ID. Invalid, missing, or absent terminal results route through reserved `unknown`. A recognized result with no matching branch routes through reserved `fallback`. `stopped` ends without routing.
+
+If a repository-backed session changes files, Raddus Graph creates one session branch and pull request after changes first need publishing. Later modifying agents in the same graph session push to the same branch and pull request.
 
 ## Architecture
 
-Raddus Canvas has two main parts:
+Raddus Graph has two main parts:
 
-- `bin/raddus-canvas.mjs`: the CLI entrypoint used by the published `raddus-canvas` command.
-- `server/`: local Node.js runtime modules that serve the app, proxy Anthropic API requests, manage the local session, store the Anthropic API key, and persist local app data.
+- `bin/raddus-graph.mjs`: the CLI entrypoint used by the published commands.
+- `server/`: local Node.js runtime modules that serve the app, manage graph persistence, launch CLI runners, discover GitHub repositories, and publish session pull requests.
 - `server.mjs`: a small compatibility launcher for running the server from the repository root.
 - `src/main.tsx`: the React mount entrypoint.
-- `src/App.tsx`: the frontend app controller and remaining feature views.
-- `src/auth/`, `src/domain/`, and `src/theme/`: extracted frontend feature, domain, and design-token helpers.
-- `src/generated/`: generated frontend support files consumed by the app.
+- `src/App.tsx`: the Raddus Graph frontend controller.
+- `src/api/RaddusGraphApi.ts`: the frontend API client for `/api/graph/*`.
+- `docs/adr/`: architecture decision records.
 
 At runtime:
 
 1. The user starts the local Node.js server.
-2. The server serves the frontend over localhost.
-3. The frontend signs in through the local server.
-4. The local server validates the Anthropic API key, maps it to a local profile using a non-secret fingerprint, and stores the key according to the current platform.
-5. Anthropic API calls go through `/api/anthropic/*`.
-6. Local project data and app settings go through `/api/local-store/*` and are scoped to the active local profile.
-
-Older browser-local project and MCP data is migrated into the active profile's server-backed local JSON store when the app loads.
+2. The server initializes `.raddus-graph/` and serves the frontend over localhost.
+3. The frontend loads graph state through `/api/graph/state`.
+4. The server lists GitHub repositories through `gh` when available.
+5. A play node creates a graph session.
+6. The server runs CLI agents sequentially, receives node status callbacks, routes expression cards, and persists outcomes.
 
 ## Publishing
 
-Use npm to publish a new version of `@raddus/canvas`:
+Use npm to publish a new version of `@raddus/graph`:
 
 ```shell
 npm run publish:patch

@@ -4,7 +4,7 @@ export function assertLocalRequest(req) {
   const hostHeader = String(req.headers.host ?? "");
   const hostName = hostHeader.split(":")[0]?.toLowerCase();
   if (!["127.0.0.1", "localhost", "[::1]", "::1"].includes(hostName)) {
-    throw new HttpError(403, "Raddus Canvas only accepts loopback requests.");
+    throw new HttpError(403, "Raddus Graph only accepts loopback requests.");
   }
   const origin = req.headers.origin;
   if (origin) {
@@ -15,7 +15,7 @@ export function assertLocalRequest(req) {
       throw new HttpError(403, "Invalid request origin.");
     }
     if (originHost !== hostHeader) {
-      throw new HttpError(403, "Raddus Canvas only accepts same-origin requests.");
+      throw new HttpError(403, "Raddus Graph only accepts same-origin requests.");
     }
   }
 }
