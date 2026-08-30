@@ -1,6 +1,7 @@
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { graphDataDir } from "./config.mjs";
+import { normalizeModelId } from "./modelCatalog.mjs";
 
 export const graphStateFile = join(graphDataDir, "state.json");
 export const graphSessionsDir = join(graphDataDir, "sessions");
@@ -27,11 +28,17 @@ export async function replaceGraphState(payload) {
   return updateGraphData((current) => {
     const body = asRecord(payload);
     const selectedProjectId = stringValue(body.selectedProjectId) || current.selectedProjectId;
+    const selectedGraph = isPlainRecord(body.graph) ? body.graph : null;
     const projects = Array.isArray(body.projects)
-      ? body.projects
+      ? body.projects.map((project) => {
+        const record = asRecord(project);
+        return selectedGraph && stringValue(record.id) === selectedProjectId
+          ? { ...record, graph: selectedGraph, updatedAt: new Date().toISOString() }
+          : project;
+      })
       : current.projects.map((project) => (
-        project.id === selectedProjectId && isPlainRecord(body.graph)
-          ? { ...project, graph: body.graph, updatedAt: new Date().toISOString() }
+        project.id === selectedProjectId && selectedGraph
+          ? { ...project, graph: selectedGraph, updatedAt: new Date().toISOString() }
           : project
       ));
     const incoming = normalizeGraphData({
@@ -76,26 +83,143 @@ export async function updateGraphSession(sessionId, update) {
   return data.sessions.find((session) => session.id === sessionId) ?? null;
 }
 
-export async function recordNodeStatus(sessionId, nodeId, payload, source = "callback") {
-  const data = await readGraphData();
-  const resultIds = new Set(data.results.map((result) => result.id));
-  const status = normalizeNodeStatus(payload, nodeId, resultIds, source);
-  const session = await updateGraphSession(sessionId, (current) => {
-    const currentStatuses = current.nodeStatuses[nodeId] ?? [];
-    const nextStatuses = [...currentStatuses, status];
-    const nodeStatuses = { ...current.nodeStatuses, [nodeId]: nextStatuses };
-    const nodeOutcomes = isTerminalState(status.state)
-      ? { ...current.nodeOutcomes, [nodeId]: terminalOutcomeFromStatus(status) }
-      : current.nodeOutcomes;
+export async function deleteGraphSession(sessionId) {
+  let removedSession = null;
+  const data = await updateGraphData((current) => {
+    removedSession = current.sessions.find((session) => session.id === sessionId) ?? null;
+    if (!removedSession) return current;
     return {
       ...current,
-      activeNodeId: isTerminalState(status.state) && current.activeNodeId === nodeId ? null : current.activeNodeId,
-      nodeStatuses,
-      nodeOutcomes,
+      sessions: current.sessions.filter((session) => session.id !== sessionId),
+    };
+  });
+  if (!removedSession) return null;
+  await rm(sessionRootFor(sessionId), { recursive: true, force: true });
+  return {
+    removedSession,
+    sessions: data.sessions,
+  };
+}
+
+export async function createAgentSession(sessionId, payload) {
+  const body = asRecord(payload);
+  const now = new Date().toISOString();
+  let createdAgentSession = null;
+  const session = await updateGraphSession(sessionId, (current) => {
+    const id = stringValue(body.id) || cryptoId("agent-session");
+    const nodeId = stringValue(body.nodeId);
+    const queuedStatus = normalizeStoredAgentSessionStatus({
+      id: cryptoId("status"),
+      graphSessionId: current.id,
+      agentSessionId: id,
+      nodeId,
+      state: "queued",
+      summary: stringValue(body.summary) || "Queued agent session.",
+      detail: "",
+      emittedResultId: null,
+      routedResultId: null,
+      routeReason: null,
+      source: "server",
+      stdout: "",
+      stderr: "",
+      createdAt: now,
+    }, current.id, id, nodeId);
+    createdAgentSession = normalizeAgentSession({
+      id,
+      graphSessionId: current.id,
+      nodeId,
+      agentId: nullableString(body.agentId),
+      sequence: nextAgentSessionSequence(current.agentSessions),
+      previousAgentSessionId: nullableString(body.previousAgentSessionId),
+      incomingExpressionNodeId: nullableString(body.incomingExpressionNodeId),
+      incomingEdgeIds: arrayOfStrings(body.incomingEdgeIds),
+      incomingResultId: nullableString(body.incomingResultId),
+      status: "queued",
+      prompt: textValue(body.prompt),
+      response: "",
+      stdout: "",
+      stderr: "",
+      statuses: queuedStatus ? [queuedStatus] : [],
+      terminalOutcome: null,
+      startedAt: now,
+      completedAt: null,
+    }, current.id);
+    return {
+      ...current,
+      activeAgentSessionIds: uniqueStrings([...current.activeAgentSessionIds, createdAgentSession.id]),
+      agentSessions: [...current.agentSessions, createdAgentSession],
+      updatedAt: now,
+    };
+  });
+  return { agentSession: createdAgentSession, session };
+}
+
+export async function setAgentSessionPrompt(sessionId, agentSessionId, prompt) {
+  const updatedAt = new Date().toISOString();
+  return updateAgentSession(sessionId, agentSessionId, (agentSession) => ({
+    ...agentSession,
+    prompt: textValue(prompt),
+  }), updatedAt);
+}
+
+export async function recordAgentSessionProcessOutput(sessionId, agentSessionId, payload) {
+  const body = asRecord(payload);
+  const updatedAt = new Date().toISOString();
+  return updateAgentSession(sessionId, agentSessionId, (agentSession) => {
+    const stdout = textValue(body.stdout);
+    const stderr = textValue(body.stderr);
+    return {
+      ...agentSession,
+      response: stdout || agentSession.response,
+      stdout: stdout || agentSession.stdout,
+      stderr: stderr || agentSession.stderr,
+    };
+  }, updatedAt);
+}
+
+export async function recordAgentSessionStatus(sessionId, agentSessionId, payload, source = "callback") {
+  let recordedStatus = null;
+  const session = await updateGraphSession(sessionId, (current) => {
+    const agentSession = current.agentSessions.find((candidate) => candidate.id === agentSessionId);
+    if (!agentSession) return current;
+    const resultIds = new Set((current.resultsSnapshot ?? []).map((result) => result.id));
+    const status = normalizeAgentSessionStatus(payload, current.id, agentSession, resultIds, source);
+    recordedStatus = status;
+    const terminalOutcome = isTerminalState(status.state) ? terminalOutcomeFromStatus(status) : agentSession.terminalOutcome;
+    const nextAgentSession = {
+      ...agentSession,
+      status: status.state,
+      response: status.stdout || agentSession.response,
+      stdout: status.stdout || agentSession.stdout,
+      stderr: status.stderr || agentSession.stderr,
+      statuses: [...agentSession.statuses, status],
+      terminalOutcome,
+      completedAt: isTerminalState(status.state) ? status.createdAt : agentSession.completedAt,
+    };
+    return {
+      ...current,
+      activeAgentSessionIds: isTerminalState(status.state)
+        ? current.activeAgentSessionIds.filter((id) => id !== agentSessionId)
+        : uniqueStrings([...current.activeAgentSessionIds, agentSessionId]),
+      agentSessions: current.agentSessions.map((candidate) => candidate.id === agentSessionId ? nextAgentSession : candidate),
       updatedAt: status.createdAt,
     };
   });
-  return { status, session };
+  return { status: recordedStatus, session };
+}
+
+async function updateAgentSession(sessionId, agentSessionId, update, updatedAt) {
+  let updatedAgentSession = null;
+  const session = await updateGraphSession(sessionId, (current) => ({
+    ...current,
+    agentSessions: current.agentSessions.map((agentSession) => {
+      if (agentSession.id !== agentSessionId) return agentSession;
+      updatedAgentSession = normalizeAgentSession(update(agentSession), current.id);
+      return updatedAgentSession;
+    }),
+    updatedAt,
+  }));
+  return { agentSession: updatedAgentSession, session };
 }
 
 export function defaultResultDefinitions() {
@@ -255,7 +379,7 @@ function normalizeAgents(value) {
     return [{
       id,
       name: stringValue(record.name) || "Untitled agent",
-      model: stringValue(record.model) || "gpt-5-codex",
+      model: normalizeModelId(record.model),
       systemPrompt: stringValue(record.systemPrompt ?? record.system_prompt),
       createdAt: stringValue(record.createdAt) || new Date().toISOString(),
       updatedAt: stringValue(record.updatedAt) || new Date().toISOString(),
@@ -325,18 +449,26 @@ function normalizeGraphEdge(value, nodeIds) {
   if (type !== "runs" && type !== "evaluates" && type !== "routes") return null;
   const resultId = normalizeResultId(record.resultId);
   const bend = normalizePoint(record.bend);
+  const waypoints = normalizePoints(record.waypoints);
+  const routingMode = edgeRoutingModeValue(record.routingMode);
   const sourceAnchor = cardAnchorValue(record.sourceAnchor);
   const targetAnchor = cardAnchorValue(record.targetAnchor);
+  const storedWaypoints = waypoints.length > 0 ? waypoints : bend ? [bend] : [];
   return {
     id: stringValue(record.id) || cryptoId("edge"),
     source,
     target,
     type,
     ...(type === "routes" && resultId ? { resultId } : {}),
-    ...(bend ? { bend } : {}),
+    ...(routingMode === "manual" || storedWaypoints.length > 0 ? { routingMode: "manual" } : {}),
+    ...(storedWaypoints.length > 0 ? { waypoints: storedWaypoints } : {}),
     ...(sourceAnchor ? { sourceAnchor } : {}),
     ...(targetAnchor ? { targetAnchor } : {}),
   };
+}
+
+function normalizePoints(value) {
+  return Array.isArray(value) ? value.map(normalizePoint).filter(Boolean) : [];
 }
 
 function normalizePoint(value) {
@@ -344,6 +476,10 @@ function normalizePoint(value) {
   const x = numberValue(record.x, Number.NaN);
   const y = numberValue(record.y, Number.NaN);
   return Number.isFinite(x) && Number.isFinite(y) ? { x, y } : null;
+}
+
+function edgeRoutingModeValue(value) {
+  return stringValue(value) === "manual" ? "manual" : "auto";
 }
 
 function cardAnchorValue(value) {
@@ -356,8 +492,7 @@ function normalizeGraphSession(value) {
   const id = stringValue(record.id) || cryptoId("graph-session");
   const now = new Date().toISOString();
   const status = sessionStatusValue(record.status);
-  const nodeStatuses = normalizeStatusMap(record.nodeStatuses);
-  const nodeOutcomes = normalizeOutcomeMap(record.nodeOutcomes);
+  const agentSessions = normalizeAgentSessions(record.agentSessions, id);
   return {
     id,
     status,
@@ -367,14 +502,13 @@ function normalizeGraphSession(value) {
     workspacePath: stringValue(record.workspacePath),
     branchName: nullableString(record.branchName),
     prUrl: nullableString(record.prUrl),
-    activeNodeId: nullableString(record.activeNodeId),
+    activeAgentSessionIds: status === "running" ? normalizeActiveAgentSessionIds(record.activeAgentSessionIds, agentSessions) : [],
     projectId: nullableString(record.projectId),
     projectName: nullableString(record.projectName),
     graphSnapshot: isPlainRecord(record.graphSnapshot) ? normalizeGraph(record.graphSnapshot) : null,
     agentsSnapshot: Array.isArray(record.agentsSnapshot) ? normalizeAgents(record.agentsSnapshot) : null,
     resultsSnapshot: Array.isArray(record.resultsSnapshot) ? normalizeResults(record.resultsSnapshot) : null,
-    nodeStatuses,
-    nodeOutcomes,
+    agentSessions,
     error: nullableString(record.error),
     createdAt: stringValue(record.createdAt) || now,
     updatedAt: stringValue(record.updatedAt) || now,
@@ -392,71 +526,121 @@ function normalizeSessionRepository(value) {
   };
 }
 
-function normalizeStatusMap(value) {
+function normalizeAgentSessions(value, graphSessionId) {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set();
+  return value.flatMap((agentSession, index) => {
+    const normalized = normalizeAgentSession(agentSession, graphSessionId, index);
+    if (!normalized || seen.has(normalized.id)) return [];
+    seen.add(normalized.id);
+    return [normalized];
+  });
+}
+
+function normalizeAgentSession(value, graphSessionId, fallbackSequence = 0) {
   const record = asRecord(value);
-  return Object.fromEntries(Object.entries(record).map(([nodeId, statuses]) => [
+  const id = stringValue(record.id) || cryptoId("agent-session");
+  const nodeId = stringValue(record.nodeId);
+  if (!nodeId) return null;
+  const statuses = Array.isArray(record.statuses)
+    ? record.statuses.map((status) => normalizeStoredAgentSessionStatus(status, graphSessionId, id, nodeId)).filter(Boolean)
+    : [];
+  const terminalStatus = [...statuses].reverse().find((status) => isTerminalState(status.state));
+  const terminalOutcome =
+    normalizeAgentSessionTerminalOutcome(record.terminalOutcome, graphSessionId, id, nodeId) ??
+    (terminalStatus ? terminalOutcomeFromStatus(terminalStatus) : null);
+  const status = nodeStateValue(record.status) ?? terminalOutcome?.state ?? statuses.at(-1)?.state ?? "queued";
+  const stdout = textValue(record.stdout);
+  const stderr = textValue(record.stderr);
+  return {
+    id,
+    graphSessionId,
     nodeId,
-    Array.isArray(statuses) ? statuses.map((status) => normalizeStoredNodeStatus(status, nodeId)).filter(Boolean) : [],
-  ]));
+    agentId: nullableString(record.agentId),
+    sequence: numberValue(record.sequence, fallbackSequence),
+    previousAgentSessionId: nullableString(record.previousAgentSessionId),
+    incomingExpressionNodeId: nullableString(record.incomingExpressionNodeId),
+    incomingEdgeIds: arrayOfStrings(record.incomingEdgeIds),
+    incomingResultId: nullableString(record.incomingResultId),
+    status,
+    prompt: textValue(record.prompt),
+    response: textValue(record.response) || stdout || terminalOutcome?.detail || terminalOutcome?.summary || "",
+    stdout,
+    stderr,
+    statuses,
+    terminalOutcome,
+    startedAt: stringValue(record.startedAt) || statuses[0]?.createdAt || new Date().toISOString(),
+    completedAt: nullableString(record.completedAt) ?? terminalOutcome?.createdAt ?? null,
+  };
 }
 
-function normalizeOutcomeMap(value) {
-  const record = asRecord(value);
-  return Object.fromEntries(Object.entries(record).flatMap(([nodeId, outcome]) => {
-    const normalized = normalizeTerminalOutcome(outcome, nodeId);
-    return normalized ? [[nodeId, normalized]] : [];
-  }));
+function normalizeActiveAgentSessionIds(value, agentSessions) {
+  const agentSessionsById = new Map(agentSessions.map((agentSession) => [agentSession.id, agentSession]));
+  const explicit = Array.isArray(value)
+    ? uniqueStrings(value.map(stringValue).filter((id) => {
+      const agentSession = agentSessionsById.get(id);
+      return agentSession && !isTerminalState(agentSession.status);
+    }))
+    : [];
+  if (explicit.length > 0) return explicit;
+  return agentSessions.filter((agentSession) => !isTerminalState(agentSession.status)).map((agentSession) => agentSession.id);
 }
 
-function normalizeStoredNodeStatus(value, nodeId) {
+function normalizeStoredAgentSessionStatus(value, graphSessionId, agentSessionId, nodeId) {
   const record = asRecord(value);
   const state = nodeStateValue(record.state);
   if (!state) return null;
   return {
     id: stringValue(record.id) || cryptoId("status"),
-    nodeId,
+    graphSessionId,
+    agentSessionId,
+    nodeId: stringValue(record.nodeId) || nodeId,
     state,
     summary: stringValue(record.summary),
-    detail: stringValue(record.detail),
+    detail: textValue(record.detail),
     emittedResultId: nullableString(record.emittedResultId),
     routedResultId: nullableString(record.routedResultId),
     routeReason: nullableString(record.routeReason),
     source: stringValue(record.source) || "server",
-    stdout: stringValue(record.stdout),
-    stderr: stringValue(record.stderr),
+    stdout: textValue(record.stdout),
+    stderr: textValue(record.stderr),
     createdAt: stringValue(record.createdAt) || new Date().toISOString(),
   };
 }
 
-function normalizeNodeStatus(value, nodeId, resultIds, source) {
+function normalizeAgentSessionStatus(value, graphSessionId, agentSession, resultIds, source) {
   const record = asRecord(value);
   const state = nodeStateValue(record.state) || "working";
   const emittedResultId = normalizeResultId(record.resultId ?? record.emittedResultId);
   const result = routeResultForStatus(state, emittedResultId, resultIds);
   return {
     id: cryptoId("status"),
-    nodeId,
+    graphSessionId,
+    agentSessionId: agentSession.id,
+    nodeId: agentSession.nodeId,
     state,
     summary: stringValue(record.summary),
-    detail: stringValue(record.detail),
+    detail: textValue(record.detail),
     emittedResultId: emittedResultId || null,
     routedResultId: result.routedResultId,
     routeReason: result.routeReason,
     source,
-    stdout: stringValue(record.stdout),
-    stderr: stringValue(record.stderr),
+    stdout: textValue(record.stdout),
+    stderr: textValue(record.stderr),
     createdAt: stringValue(record.createdAt) || new Date().toISOString(),
   };
 }
 
-function normalizeTerminalOutcome(value, nodeId) {
-  const status = normalizeStoredNodeStatus(value, nodeId);
+function normalizeAgentSessionTerminalOutcome(value, graphSessionId, agentSessionId, nodeId) {
+  const status = normalizeStoredAgentSessionStatus(value, graphSessionId, agentSessionId, nodeId);
   return status && isTerminalState(status.state) ? terminalOutcomeFromStatus(status) : null;
 }
 
 function terminalOutcomeFromStatus(status) {
   return {
     id: status.id,
+    graphSessionId: status.graphSessionId,
+    agentSessionId: status.agentSessionId,
     nodeId: status.nodeId,
     state: status.state,
     emittedResultId: status.emittedResultId,
@@ -486,33 +670,38 @@ function markRunningSessionsStopped(data, reason) {
     ...data,
     sessions: data.sessions.map((session) => {
       if (session.status !== "running") return session;
-      const nodeId = session.activeNodeId || "session";
-      const status = {
-        id: cryptoId("status"),
-        nodeId,
-        state: "stopped",
-        summary: "Marked stopped after server restart.",
-        detail: reason,
-        emittedResultId: null,
-        routedResultId: null,
-        routeReason: "stopped",
-        source: "server",
-        stdout: "",
-        stderr: "",
-        createdAt: now,
-      };
+      const activeIds = new Set(session.activeAgentSessionIds);
+      const agentSessions = session.agentSessions.map((agentSession) => {
+        if (!activeIds.has(agentSession.id) || isTerminalState(agentSession.status)) return agentSession;
+        const status = normalizeStoredAgentSessionStatus({
+          id: cryptoId("status"),
+          graphSessionId: session.id,
+          agentSessionId: agentSession.id,
+          nodeId: agentSession.nodeId,
+          state: "stopped",
+          summary: "Marked stopped after server restart.",
+          detail: reason,
+          emittedResultId: null,
+          routedResultId: null,
+          routeReason: "stopped",
+          source: "server",
+          stdout: "",
+          stderr: "",
+          createdAt: now,
+        }, session.id, agentSession.id, agentSession.nodeId);
+        return {
+          ...agentSession,
+          status: "stopped",
+          statuses: status ? [...agentSession.statuses, status] : agentSession.statuses,
+          terminalOutcome: status ? terminalOutcomeFromStatus(status) : agentSession.terminalOutcome,
+          completedAt: now,
+        };
+      });
       return {
         ...session,
         status: "stopped",
-        activeNodeId: null,
-        nodeStatuses: {
-          ...session.nodeStatuses,
-          [nodeId]: [...(session.nodeStatuses[nodeId] ?? []), status],
-        },
-        nodeOutcomes: {
-          ...session.nodeOutcomes,
-          [nodeId]: terminalOutcomeFromStatus(status),
-        },
+        activeAgentSessionIds: [],
+        agentSessions,
         updatedAt: now,
       };
     }),
@@ -552,8 +741,24 @@ function nullableString(value) {
   return text || null;
 }
 
+function textValue(value) {
+  return typeof value === "string" ? value : "";
+}
+
 function numberValue(value, fallback) {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function nextAgentSessionSequence(agentSessions) {
+  return agentSessions.reduce((highest, agentSession) => Math.max(highest, agentSession.sequence), 0) + 1;
+}
+
+function uniqueStrings(values) {
+  return [...new Set(values.filter(Boolean))];
+}
+
+function arrayOfStrings(value) {
+  return Array.isArray(value) ? uniqueStrings(value.map(stringValue)) : [];
 }
 
 function cryptoId(prefix) {

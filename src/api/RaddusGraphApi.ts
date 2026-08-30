@@ -2,8 +2,9 @@ export type RunnerId = "codex" | "claude";
 export type GraphNodeType = "play" | "agent" | "expression";
 export type GraphEdgeType = "runs" | "evaluates" | "routes";
 export type CardAnchor = "top" | "right" | "bottom" | "left";
+export type EdgeRoutingMode = "auto" | "manual";
 export type GraphSessionStatus = "running" | "completed" | "failed" | "stopped";
-export type NodeStatusState = "queued" | "started" | "working" | "blocked" | "completed" | "failed" | "stopped";
+export type AgentSessionStatusState = "queued" | "started" | "working" | "blocked" | "completed" | "failed" | "stopped";
 
 export interface ModelCatalogEntry {
   id: string;
@@ -44,6 +45,8 @@ export interface GraphEdge {
   target: string;
   type: GraphEdgeType;
   resultId?: string;
+  routingMode?: EdgeRoutingMode;
+  waypoints?: { x: number; y: number }[];
   bend?: { x: number; y: number } | null;
   sourceAnchor?: CardAnchor | null;
   targetAnchor?: CardAnchor | null;
@@ -62,10 +65,12 @@ export interface ProjectRecord {
   updatedAt: string;
 }
 
-export interface NodeStatus {
+export interface AgentSessionStatus {
   id: string;
+  graphSessionId: string;
+  agentSessionId: string;
   nodeId: string;
-  state: NodeStatusState;
+  state: AgentSessionStatusState;
   summary: string;
   detail: string;
   emittedResultId: string | null;
@@ -79,6 +84,8 @@ export interface NodeStatus {
 
 export interface TerminalOutcome {
   id: string;
+  graphSessionId: string;
+  agentSessionId: string;
   nodeId: string;
   state: "completed" | "failed" | "stopped";
   emittedResultId: string | null;
@@ -91,6 +98,27 @@ export interface TerminalOutcome {
   createdAt: string;
 }
 
+export interface AgentSession {
+  id: string;
+  graphSessionId: string;
+  nodeId: string;
+  agentId: string | null;
+  sequence: number;
+  previousAgentSessionId: string | null;
+  incomingExpressionNodeId: string | null;
+  incomingEdgeIds: string[];
+  incomingResultId: string | null;
+  status: AgentSessionStatusState;
+  prompt: string;
+  response: string;
+  stdout: string;
+  stderr: string;
+  statuses: AgentSessionStatus[];
+  terminalOutcome: TerminalOutcome | null;
+  startedAt: string;
+  completedAt: string | null;
+}
+
 export interface GraphSession {
   id: string;
   status: GraphSessionStatus;
@@ -100,11 +128,13 @@ export interface GraphSession {
   workspacePath: string;
   branchName: string | null;
   prUrl: string | null;
-  activeNodeId: string | null;
+  activeAgentSessionIds: string[];
   projectId: string | null;
   projectName: string | null;
-  nodeStatuses: Record<string, NodeStatus[]>;
-  nodeOutcomes: Record<string, TerminalOutcome>;
+  graphSnapshot: GraphDocument | null;
+  agentsSnapshot: AgentSpec[] | null;
+  resultsSnapshot: ResultDefinition[] | null;
+  agentSessions: AgentSession[];
   error: string | null;
   createdAt: string;
   updatedAt: string;
@@ -185,6 +215,10 @@ export class RaddusGraphApi {
 
   stopSession(sessionId: string): Promise<{ session: GraphSession }> {
     return requestJson<{ session: GraphSession }>(`/api/graph/sessions/${encodeURIComponent(sessionId)}/stop`, jsonInit("POST"));
+  }
+
+  deleteSession(sessionId: string): Promise<{ removedSessionId: string; sessions: GraphSession[] }> {
+    return requestJson<{ removedSessionId: string; sessions: GraphSession[] }>(`/api/graph/sessions/${encodeURIComponent(sessionId)}`, jsonInit("DELETE"));
   }
 }
 

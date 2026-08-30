@@ -20,6 +20,7 @@
     "ensure-deps": "[ -x node_modules/.bin/tsc ] && [ -x node_modules/.bin/vite ] || npm ci",
     "dev": "npm run ensure-deps && node bin/raddus-graph.mjs --dev",
     "build": "npm run ensure-deps && tsc --noEmit && vite build",
+    "test": "node --test test/*.test.mjs",
     "prepack": "npm run build",
     "publish:patch": "npm ci && npm version patch && npm publish --access public && git push --follow-tags",
     "publish:minor": "npm ci && npm version minor && npm publish --access public && git push --follow-tags",

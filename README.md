@@ -11,7 +11,7 @@ Raddus Graph is a local web app for designing and running CLI-backed agent graph
 - Create local agent specs from a model, name, and system prompt.
 - Build graph sessions from play nodes, agent nodes, and expression cards.
 - Define graph-scoped result IDs and route terminal outcomes through expression cards.
-- Persist graph data, agent specs, sessions, status records, retained worktrees, and PR mappings under `.raddus-graph/`.
+- Persist graph data, agent specs, graph sessions, agent sessions, status records, retained worktrees, and PR mappings under `.raddus-graph/`.
 - Run Codex CLI or Claude CLI sessions from the local Node.js server based on the selected model.
 - Select a GitHub repository and branch from the authenticated local `gh` user, or run with no repository.
 - Retain one worktree per graph session and publish file changes to one session branch and pull request.
@@ -84,28 +84,49 @@ RADDUS_GRAPH_DIR=/path/to/.raddus-graph raddus-graph
 
 The store contains:
 
-- `state.json`: graph design data, agent specs, result definitions, session metadata, node statuses, terminal outcomes, and PR mappings.
+- `state.json`: graph design data, agent specs, result definitions, graph session metadata, agent sessions, status timelines, terminal outcomes, and PR mappings.
 - `sessions/<graph-session-id>/worktree`: the retained workspace for a graph session.
 
 ## Runtime Model
 
-Running a play node creates a graph session id. The server snapshots the current graph, provisions a retained session worktree, and executes one graph path at a time.
+Running a play node creates a graph session id. Each agent node execution within that graph session creates its own agent session id. The server snapshots the current graph, provisions a retained session worktree, and executes one graph path at a time.
 
-Agent prompts are assembled from:
+Each agent session records the node and agent spec it ran, the full assembled prompt, stdout/stderr, status timeline, terminal outcome, and the route that led into it:
 
-- the upstream execution context that led to the current node
-- high-level graph session context
-- the original play-node prompt
-- the graph result catalog
+- previous agent session id
+- incoming expression card id
+- incoming edge ids
+- incoming result id
+
+Agent prompts are assembled as structured Markdown with:
+
+- repository and branch
+- behavior instructions
 - the local status callback contract
+- prior agent session output under `History`
+- the original play-node prompt as the final `User Context` section
 
-Agent sessions post progress and terminal outcome JSON to:
+Agent sessions append progress and terminal outcome JSON to the local status file named by `RADDUS_GRAPH_STATUS_FILE`. The file uses one compact JSON object per line and is deleted by the server before workspace changes are published.
+
+Agent sessions may also post live progress JSON to:
 
 ```text
-POST /api/graph/sessions/:graphSessionId/nodes/:nodeId/status
+POST /api/graph/sessions/:graphSessionId/agent-sessions/:agentSessionId/status
 ```
 
+The HTTP callback is optional because the agent sandbox may not be able to reach `127.0.0.1`.
+
+Graph sessions can be removed with:
+
+```text
+DELETE /api/graph/sessions/:graphSessionId
+```
+
+Removing a graph session stops active child processes first and deletes the retained session workspace.
+
 Expression cards route only after terminal outcomes. `completed` routes by a valid emitted result ID. Invalid, missing, or absent terminal results route through reserved `unknown`. A recognized result with no matching branch routes through reserved `fallback`. `stopped` ends without routing.
+
+The canvas can follow a graph session. In follow mode, the active agent node is highlighted, the previous node and incoming expression path are shown less strongly, and earlier visited nodes/routes keep subtle markers. Selecting a graph session from the Sessions window switches the canvas to that session's execution state.
 
 If a repository-backed session changes files, Raddus Graph creates one session branch and pull request after changes first need publishing. Later modifying agents in the same graph session push to the same branch and pull request.
 
