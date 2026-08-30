@@ -1,7 +1,7 @@
 import { graphDataDir } from "./config.mjs";
 import { listBranches, listRepositories } from "./github.mjs";
 import { readGraphData, replaceGraphState } from "./graphStore.mjs";
-import { appendCallbackStatus, createGraphSession, stopGraphSession } from "./graphRuntime.mjs";
+import { appendCallbackStatus, createGraphSession, deleteGraphSession, stopGraphSession } from "./graphRuntime.mjs";
 import { modelCatalog } from "./modelCatalog.mjs";
 import { HttpError } from "./errors.mjs";
 import { asPayload, readJsonBody, sendJson } from "./httpUtils.mjs";
@@ -53,6 +53,13 @@ export async function handleGraphApi(req, res, url) {
     return;
   }
 
+  if (resource === "sessions" && id && req.method === "DELETE" && segments.length === 2) {
+    const result = await deleteGraphSession(id);
+    if (!result) throw new HttpError(404, "Graph session not found.");
+    sendJson(res, 200, { removedSessionId: id, sessions: result.sessions });
+    return;
+  }
+
   if (resource === "sessions" && id && child === "stop" && req.method === "POST" && segments.length === 3) {
     const session = await stopGraphSession(id);
     if (!session) throw new HttpError(404, "Graph session not found.");
@@ -60,10 +67,10 @@ export async function handleGraphApi(req, res, url) {
     return;
   }
 
-  if (resource === "sessions" && id && child === "nodes" && childId && action === "status" && req.method === "POST" && segments.length === 5) {
+  if (resource === "sessions" && id && child === "agent-sessions" && childId && action === "status" && req.method === "POST" && segments.length === 5) {
     const body = asPayload(await readJsonBody(req));
     const result = await appendCallbackStatus(id, childId, body);
-    if (!result.session) throw new HttpError(404, "Graph session not found.");
+    if (!result.session || !result.status) throw new HttpError(404, "Agent session not found.");
     sendJson(res, 200, result);
     return;
   }

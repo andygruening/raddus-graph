@@ -20,6 +20,8 @@ import {
   X,
 } from "lucide-react";
 import {
+  type AgentSession,
+  type AgentSessionStatus,
   type AgentSpec,
   type BranchListResult,
   type CardAnchor,
@@ -30,33 +32,30 @@ import {
   type GraphSession,
   type GraphState,
   type ModelCatalogEntry,
-  type NodeStatus,
   type ProjectRecord,
   type RepositoryListResult,
   type RepositoryOption,
   type ResultDefinition,
   RaddusGraphApi,
 } from "./api/RaddusGraphApi";
+import {
+  cardAnchorForPoint,
+  connectionPreviewPath,
+  defaultBendForNodes,
+  edgeGeometry,
+  edgePath,
+  edgeWithManualWaypoint,
+  type Point,
+  projectNodeSizeForType,
+} from "./edgeRouting";
 
 type PaletteTab = "agents" | "expressions";
 type OverlayPanel = PaletteTab | null;
 type SaveStatus = "idle" | "saving" | "saved" | "error";
-type Point = { x: number; y: number };
 type CanvasViewport = { x: number; y: number; zoom: number };
 type ConnectionState = "idle" | "source" | "valid" | "invalid";
 type EdgeEndpoint = "source" | "target";
 type EdgeAnchorDrag = { edgeId: string; endpoint: EdgeEndpoint } | null;
-type EdgeGeometry = {
-  path: string;
-  points: Point[];
-  handle: Point;
-  label: Point;
-  arrow: Point & { angle: number };
-  sourcePoint: Point;
-  targetPoint: Point;
-  sourceAnchor: CardAnchor;
-  targetAnchor: CardAnchor;
-};
 type DialogState =
   | { type: "agent-create" }
   | { type: "agent-details"; agentId: string }
@@ -94,6 +93,23 @@ type PaletteDragPreview = {
   height: number;
   connection: PaletteDropConnection | null;
 };
+type GraphExecutionView = {
+  graphSessionId: string;
+  status: GraphSession["status"];
+  activeAgentSessionIds: Set<string>;
+  activeNodeIds: Set<string>;
+  previousAgentSessionIds: Set<string>;
+  previousNodeIds: Set<string>;
+  activeExpressionNodeIds: Set<string>;
+  activeRouteEdgeIds: Set<string>;
+  visitedNodeIds: Set<string>;
+  visitedExpressionNodeIds: Set<string>;
+  visitedRouteEdgeIds: Set<string>;
+  latestAgentSessionByNodeId: Map<string, AgentSession>;
+  executionBadgesByNodeId: Map<string, string>;
+  primaryActiveAgentSession: AgentSession | null;
+  primaryPreviousAgentSession: AgentSession | null;
+};
 
 const api = new RaddusGraphApi();
 const defaultCanvasViewport: CanvasViewport = { x: 0, y: 0, zoom: 1 };
@@ -111,6 +127,8 @@ export default function App() {
   const [loading, setLoading] = React.useState(true);
   const [saveStatus, setSaveStatus] = React.useState<SaveStatus>("idle");
   const [error, setError] = React.useState<string | null>(null);
+  const [followedSessionId, setFollowedSessionId] = React.useState<string | null>(null);
+  const [focusedAgentSessionId, setFocusedAgentSessionId] = React.useState<string | null>(null);
   const [runningPlayNodeId, setRunningPlayNodeId] = React.useState<string | null>(null);
   const [resultDraft, setResultDraft] = React.useState({ id: "", description: "" });
   const [camera, setCamera] = React.useState<CanvasViewport>(defaultCanvasViewport);
@@ -129,6 +147,8 @@ export default function App() {
   const cameraRef = React.useRef(camera);
   const cameraFrameRef = React.useRef<number | null>(null);
   const latestState = React.useRef<GraphState | null>(null);
+  const localEditVersionRef = React.useRef(0);
+  const saveRequestIdRef = React.useRef(0);
   const suppressNodeClickRef = React.useRef(false);
   const edgeDragMovedRef = React.useRef(false);
   const edgeAnchorDragChangedRef = React.useRef(false);
@@ -153,6 +173,15 @@ export default function App() {
     return () => window.clearInterval(timer);
   }, [state?.sessions]);
 
+  React.useEffect(() => {
+    if (!followedSessionId || !state) return;
+    const followedSession = state.sessions.find((session) => session.id === followedSessionId);
+    if (!followedSession || (followedSession.projectId && followedSession.projectId !== state.selectedProjectId)) {
+      setFollowedSessionId(null);
+      setFocusedAgentSessionId(null);
+    }
+  }, [followedSessionId, state]);
+
   async function loadInitial() {
     setLoading(true);
     setError(null);
@@ -164,6 +193,8 @@ export default function App() {
       ]);
       latestState.current = nextState;
       setState(nextState);
+      setFollowedSessionId(latestSessionForProject(nextState.sessions, nextState.selectedProjectId)?.id ?? null);
+      setFocusedAgentSessionId(null);
       setModels(modelPayload.models);
       setRepositoryResult(repositories);
     } catch (loadError) {
@@ -200,6 +231,9 @@ export default function App() {
   }
 
   async function persistState(nextState: GraphState) {
+    const saveRequestId = saveRequestIdRef.current + 1;
+    const localEditVersion = localEditVersionRef.current;
+    saveRequestIdRef.current = saveRequestId;
     setSaveStatus("saving");
     setError(null);
     try {
@@ -210,31 +244,63 @@ export default function App() {
         selectedProjectId: nextState.selectedProjectId,
         graph: nextState.graph,
       });
+      if (saveRequestId !== saveRequestIdRef.current || localEditVersion !== localEditVersionRef.current) return;
       setState((current) => {
         const next = current ? { ...saved, sessions: current.sessions } : saved;
         latestState.current = next;
         return next;
       });
       setSaveStatus("saved");
-      window.setTimeout(() => setSaveStatus("idle"), 1400);
+      window.setTimeout(() => {
+        if (saveRequestId === saveRequestIdRef.current) setSaveStatus("idle");
+      }, 1400);
     } catch (saveError) {
+      if (saveRequestId !== saveRequestIdRef.current || localEditVersion !== localEditVersionRef.current) return;
       setSaveStatus("error");
       setError(errorMessage(saveError));
     }
+  }
+
+  function markLocalEdit() {
+    localEditVersionRef.current += 1;
   }
 
   function mutateState(update: (current: GraphState) => GraphState, persist = true) {
     const current = latestState.current;
     if (!current) return;
     const next = update(current);
+    markLocalEdit();
     latestState.current = next;
     setState(next);
     if (persist) void persistState(next);
   }
 
-  function selectProject(projectId: string) {
+  function selectProject(projectId: string, options: { followLatestSession?: boolean } = {}) {
+    const current = latestState.current;
+    const selectedProjectId = current?.projects.find((project) => project.id === projectId)?.id ?? current?.projects[0]?.id ?? projectId;
     mutateState((current) => selectProjectInState(current, projectId));
+    if (options.followLatestSession !== false) {
+      setFollowedSessionId(current ? latestSessionForProject(current.sessions, selectedProjectId)?.id ?? null : null);
+      setFocusedAgentSessionId(null);
+    }
     setCamera(defaultCanvasViewport);
+  }
+
+  function followGraphSession(sessionId: string) {
+    const current = latestState.current;
+    const session = current?.sessions.find((candidate) => candidate.id === sessionId);
+    if (!session?.agentSessions.some((agentSession) => agentSession.id === focusedAgentSessionId)) {
+      setFocusedAgentSessionId(null);
+    }
+    setFollowedSessionId(sessionId);
+    if (session?.projectId && current?.selectedProjectId !== session.projectId && current?.projects.some((project) => project.id === session.projectId)) {
+      selectProject(session.projectId, { followLatestSession: false });
+    }
+  }
+
+  function stopFollowingSession() {
+    setFollowedSessionId(null);
+    setFocusedAgentSessionId(null);
   }
 
   function createProject(draft: ProjectDraft): ProjectRecord | null {
@@ -427,6 +493,16 @@ export default function App() {
     });
   }
 
+  function requestRemoveSession(sessionId: string) {
+    const session = latestState.current?.sessions.find((candidate) => candidate.id === sessionId);
+    requestConfirmation({
+      title: "Remove Session",
+      message: `Remove session ${sessionId}?${session?.status === "running" ? " The running agent process will be stopped." : ""} Its retained workspace will also be deleted.`,
+      confirmLabel: "Remove",
+      onConfirm: () => void removeSession(sessionId),
+    });
+  }
+
   function requestConfirmation(nextConfirmation: Exclude<ConfirmationState, null>) {
     setConfirmation(nextConfirmation);
   }
@@ -475,17 +551,16 @@ export default function App() {
     const current = latestState.current;
     if (!current) return;
     const next = updateNodeInState(current, nodeId, (node) => ({ ...node, x, y }));
+    markLocalEdit();
     latestState.current = next;
     setState(next);
   }
 
-  function moveEdgeBendLocally(edgeId: string, bend: Point) {
+  function moveEdgeWaypointLocally(edgeId: string, waypoint: Point) {
     const current = latestState.current;
     if (!current) return;
-    const next = updateEdgeInState(current, edgeId, (edge) => ({
-      ...edge,
-      bend: { x: Math.round(bend.x), y: Math.round(bend.y) },
-    }));
+    const next = updateEdgeInState(current, edgeId, (edge) => edgeWithManualWaypoint(edge, waypoint));
+    markLocalEdit();
     latestState.current = next;
     setState(next);
   }
@@ -495,10 +570,23 @@ export default function App() {
     if (!current) return;
     const next = updateEdgeInState(current, edgeId, (edge) => ({
       ...edge,
+      routingMode: "manual",
       ...(endpoint === "source" ? { sourceAnchor: anchor } : { targetAnchor: anchor }),
     }));
+    markLocalEdit();
     latestState.current = next;
     setState(next);
+  }
+
+  function resetEdgeRouting(edgeId: string) {
+    mutateState((current) => updateEdgeInState(current, edgeId, (edge) => ({
+      ...edge,
+      routingMode: "auto",
+      waypoints: [],
+      bend: null,
+      sourceAnchor: null,
+      targetAnchor: null,
+    })));
   }
 
   function removeEdge(edgeId: string) {
@@ -567,7 +655,8 @@ export default function App() {
       };
       latestState.current = next;
       setState(next);
-      setDialog({ type: "sessions" });
+      setFollowedSessionId(payload.session.id);
+      setFocusedAgentSessionId(null);
     } catch (runError) {
       setError(errorMessage(runError));
     } finally {
@@ -588,6 +677,32 @@ export default function App() {
       });
     } catch (stopError) {
       setError(errorMessage(stopError));
+    }
+  }
+
+  async function removeSession(sessionId: string) {
+    const currentState = latestState.current;
+    const removedFocusedAgentSession = currentState?.sessions
+      .find((session) => session.id === sessionId)
+      ?.agentSessions.some((agentSession) => agentSession.id === focusedAgentSessionId) ?? false;
+    try {
+      const payload = await api.deleteSession(sessionId);
+      setState((current) => {
+        const next = current ? {
+          ...current,
+          sessions: payload.sessions,
+        } : current;
+        latestState.current = next;
+        return next;
+      });
+      if (removedFocusedAgentSession) setFocusedAgentSessionId(null);
+      setFollowedSessionId((currentFollowedSessionId) => {
+        if (currentFollowedSessionId && payload.sessions.some((session) => session.id === currentFollowedSessionId)) return currentFollowedSessionId;
+        const projectId = currentState?.selectedProjectId ?? latestState.current?.selectedProjectId ?? null;
+        return latestSessionForProject(payload.sessions, projectId)?.id ?? null;
+      });
+    } catch (removeError) {
+      setError(errorMessage(removeError));
     }
   }
 
@@ -663,14 +778,14 @@ export default function App() {
     window.addEventListener("pointerup", onUp);
   }
 
-  function beginEdgeDrag(event: React.PointerEvent<SVGElement>, edgeId: string, handle: Point) {
+  function beginEdgeDrag(event: React.PointerEvent<SVGElement>, edgeId: string, handle: Point, mode: "handle" | "line" = "handle") {
     event.preventDefault();
     event.stopPropagation();
     const current = latestState.current;
     if (!current?.graph.edges.some((edge) => edge.id === edgeId)) return;
     const pointerStart = screenToWorld(event.clientX, event.clientY);
-    const offsetX = pointerStart.x - handle.x;
-    const offsetY = pointerStart.y - handle.y;
+    const offsetX = mode === "handle" ? pointerStart.x - handle.x : 0;
+    const offsetY = mode === "handle" ? pointerStart.y - handle.y : 0;
     const startX = event.clientX;
     const startY = event.clientY;
     edgeDragMovedRef.current = false;
@@ -683,7 +798,7 @@ export default function App() {
       if (moved) edgeDragMovedRef.current = true;
       if (!edgeDragMovedRef.current) return;
       const nextWorld = screenToWorld(moveEvent.clientX, moveEvent.clientY);
-      moveEdgeBendLocally(edgeId, { x: nextWorld.x - offsetX, y: nextWorld.y - offsetY });
+      moveEdgeWaypointLocally(edgeId, { x: nextWorld.x - offsetX, y: nextWorld.y - offsetY });
     }
 
     function onUp() {
@@ -932,6 +1047,7 @@ export default function App() {
   const repositories = repositoryResult?.repositories ?? [];
   const runningSessions = state?.sessions.filter((session) => session.status === "running").length ?? 0;
   const graph = state?.graph ?? { nodes: [], edges: [] };
+  const graphSessions = state?.sessions.filter((session) => session.projectId === state.selectedProjectId) ?? [];
   const activeExpressionResultId = state && dialog?.type === "expression"
     ? selectedRouteResultForExpression(state, dialog.nodeId)
     : state && dialog?.type === "expression-definition"
@@ -940,6 +1056,9 @@ export default function App() {
   const activeExpressionResult = activeExpressionResultId
     ? state?.results.find((result) => result.id === activeExpressionResultId) ?? null
     : null;
+  const followedSession = followedSessionId ? state?.sessions.find((session) => session.id === followedSessionId) ?? null : null;
+  const selectedGraphSession = followedSession && graphSessions.some((session) => session.id === followedSession.id) ? followedSession : null;
+  const executionView = selectedGraphSession ? graphExecutionViewForSession(selectedGraphSession) : null;
 
   return (
     <main className="app-shell projects-shell">
@@ -980,6 +1099,52 @@ export default function App() {
                   </div>
                 ) : null}
               </div>
+              {state ? (
+                <div className="session-selector-overlay" onPointerDown={(event) => event.stopPropagation()}>
+                  <div className="canvas-control-group graph-session-select-group">
+                    <Database size={15} aria-hidden="true" />
+                    <span>Session</span>
+                    <select
+                      className="graph-session-select"
+                      value={selectedGraphSession?.id ?? ""}
+                      onChange={(event) => {
+                        if (event.target.value) followGraphSession(event.target.value);
+                        else stopFollowingSession();
+                      }}
+                      aria-label="Graph session"
+                    >
+                      <option value="">{graphSessions.length ? "No session selected" : "No sessions"}</option>
+                    {graphSessions.map((session) => (
+                      <option value={session.id} key={session.id}>
+                        {graphSessionOptionLabel(session)}
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    className="icon-button graph-session-action-button"
+                    type="button"
+                    onClick={() => setDialog({ type: "sessions" })}
+                    title="Open session details"
+                    aria-label="Open session details"
+                    disabled={!selectedGraphSession}
+                  >
+                    <Info size={14} aria-hidden="true" />
+                  </button>
+                  <button
+                    className="icon-button graph-session-action-button danger"
+                    type="button"
+                    onClick={() => {
+                      if (selectedGraphSession) requestRemoveSession(selectedGraphSession.id);
+                    }}
+                      title="Remove selected session"
+                      aria-label="Remove selected session"
+                      disabled={!selectedGraphSession}
+                    >
+                      <Trash2 size={13} aria-hidden="true" />
+                    </button>
+                  </div>
+                </div>
+              ) : null}
               <div className="project-action-menu" onPointerDown={(event) => event.stopPropagation()}>
                 <button
                   className="project-menu-button"
@@ -1066,12 +1231,13 @@ export default function App() {
                     const selected = selectedEdgeId === edge.id;
                     const dragging = draggingEdgeId === edge.id || draggingEdgeAnchor?.edgeId === edge.id;
                     const removeHover = hoveredEdgeId === edge.id && hoveredEdgeControlId !== edge.id && !dragging;
+                    const executionClassName = edgeExecutionClass(edge.id, executionView);
                     return (
-                      <g className={`project-edge-group ${edge.type} ${selected ? "selected" : ""} ${dragging ? "dragging" : ""} ${removeHover ? "remove-hover" : ""}`} key={edge.id}>
+                      <g className={`project-edge-group ${edge.type} ${executionClassName} ${selected ? "selected" : ""} ${dragging ? "dragging" : ""} ${removeHover ? "remove-hover" : ""}`} key={edge.id}>
                         <path
                           className="project-edge-hit"
                           d={geometry.path}
-                          onPointerDown={(event) => beginEdgeDrag(event, edge.id, geometry.handle)}
+                          onPointerDown={(event) => beginEdgeDrag(event, edge.id, geometry.handle, "line")}
                           onPointerEnter={() => setHoveredEdgeId(edge.id)}
                           onPointerLeave={() => setHoveredEdgeId((current) => current === edge.id ? null : current)}
                           onClick={(event) => {
@@ -1079,7 +1245,14 @@ export default function App() {
                             if (!edgeDragMovedRef.current) requestRemoveEdge(edge.id);
                           }}
                         />
-                        <path className={`project-edge ${edge.type}`} d={geometry.path} pathLength={1} style={{ animationDelay: `${Math.min(edgeIndex * 18 + 70, 260)}ms` }} />
+                        <path
+                          className={`project-edge ${edge.type}`}
+                          d={geometry.path}
+                          style={{
+                            "--edge-path-length": `${Math.max(geometry.length, 1)}`,
+                            animationDelay: `${Math.min(edgeIndex * 18 + 70, 260)}ms`,
+                          } as React.CSSProperties}
+                        />
                         <path
                           className={`project-edge-arrow ${edge.type}`}
                           d="M -5 -5 L 5 0 L -5 5 Z"
@@ -1098,7 +1271,14 @@ export default function App() {
                           onPointerEnter={() => setHoveredEdgeControlId(edge.id)}
                           onPointerLeave={() => setHoveredEdgeControlId((current) => current === edge.id ? null : current)}
                           onPointerDown={(event) => beginEdgeDrag(event, edge.id, geometry.handle)}
-                        />
+                          onDoubleClick={(event) => {
+                            event.preventDefault();
+                            event.stopPropagation();
+                            resetEdgeRouting(edge.id);
+                          }}
+                        >
+                          <title>Drag to edit route. Double-click to reset.</title>
+                        </circle>
                         <circle
                           className={`project-edge-endpoint source ${edge.type}`}
                           cx={geometry.sourcePoint.x}
@@ -1141,6 +1321,7 @@ export default function App() {
                             : paletteDragPreview?.connection?.targetNodeId === node.id
                               ? "valid"
                               : "idle";
+                  const latestAgentSession = executionView?.latestAgentSessionByNodeId.get(node.id) ?? null;
                   return (
                     <ProjectNodeCard
                       key={node.id}
@@ -1150,11 +1331,18 @@ export default function App() {
                       dropTarget={nodeDropTargetId === node.id}
                       connectionState={connectionState}
                       running={runningPlayNodeId === node.id}
-                      latestStatus={latestNodeStatus(state, node.id)}
+                      latestStatus={latestAgentSession ? latestAgentSessionStatus(latestAgentSession) : null}
+                      executionClassName={nodeExecutionClass(node.id, executionView)}
+                      executionBadge={executionView?.executionBadgesByNodeId.get(node.id) ?? null}
                       onPointerDown={(event) => beginNodeDrag(event, node.id)}
                       onConnectorPointerDown={(event) => beginConnection(event, node.id)}
                       onRemove={() => requestDeleteNode(node.id)}
                       onOpen={() => {
+                        if (followedSession && latestAgentSession) {
+                          setFocusedAgentSessionId(latestAgentSession.id);
+                          setDialog({ type: "sessions" });
+                          return;
+                        }
                         if (node.type === "agent" && node.agentId) setDialog({ type: "agent-details", agentId: node.agentId });
                         if (node.type === "play") setDialog({ type: "play", nodeId: node.id });
                         if (node.type === "expression") setDialog({ type: "expression", nodeId: node.id });
@@ -1239,8 +1427,12 @@ export default function App() {
       {state && dialog?.type === "sessions" ? (
         <SessionsDialog
           sessions={state.sessions}
+          followedSessionId={followedSessionId}
+          focusedAgentSessionId={focusedAgentSessionId}
           onRefresh={() => void refreshSessions()}
+          onFollowSession={followGraphSession}
           onStop={requestStopSession}
+          onRemoveSession={requestRemoveSession}
           onClose={() => setDialog(null)}
         />
       ) : null}
@@ -1270,6 +1462,8 @@ function ProjectNodeCard({
   connectionState,
   running,
   latestStatus,
+  executionClassName,
+  executionBadge,
   onPointerDown,
   onConnectorPointerDown,
   onRemove,
@@ -1285,7 +1479,9 @@ function ProjectNodeCard({
   dropTarget: boolean;
   connectionState: ConnectionState;
   running: boolean;
-  latestStatus: NodeStatus | null;
+  latestStatus: AgentSessionStatus | null;
+  executionClassName: string;
+  executionBadge: string | null;
   onPointerDown: (event: React.PointerEvent<HTMLElement>) => void;
   onConnectorPointerDown: (event: React.PointerEvent) => void;
   onRemove: () => void;
@@ -1298,10 +1494,15 @@ function ProjectNodeCard({
   const agent = node.type === "agent" ? state.agents.find((record) => record.id === node.agentId) : undefined;
   const expressionResultId = node.type === "expression" ? selectedRouteResultForExpression(state, node.id) : "";
   const statusTitle = latestStatus ? `${latestStatus.state}: ${latestStatus.summary || latestStatus.routeReason || "status"}` : "";
+  const playRepositoryLabel = node.type === "play"
+    ? node.repository
+      ? `${node.repository} · ${node.branch || "default branch"}`
+      : "No repository"
+    : "";
 
   return (
     <article
-      className={`project-node ${node.type} ${dragging ? "dragging" : ""} ${dropTarget ? "drop-target" : ""} ${running ? "running" : ""} connect-${connectionState}`}
+      className={`project-node ${node.type} ${executionClassName} ${dragging ? "dragging" : ""} ${dropTarget ? "drop-target" : ""} ${running ? "running" : ""} connect-${connectionState}`}
       style={{ left: node.x, top: node.y, animationDelay: `${enterDelayMs}ms` }}
       onPointerDown={onPointerDown}
       onClick={(event) => {
@@ -1311,6 +1512,7 @@ function ProjectNodeCard({
       }}
       data-project-node-id={node.id}
     >
+      {executionBadge ? <span className="execution-badge">{executionBadge}</span> : null}
       {node.type === "agent" ? (
         <>
           <div className="project-node-head">
@@ -1336,25 +1538,30 @@ function ProjectNodeCard({
           </div>
           {node.type === "play" ? (
             <div className="project-play-body">
-              <input
-                className="project-play-prompt"
-                value={node.prompt ?? ""}
-                onChange={(event) => onPlayPromptChange(event.target.value)}
-                placeholder="First prompt"
-                onPointerDown={(event) => event.stopPropagation()}
-              />
-              <button
-                className="project-play-button"
-                type="button"
-                title="Start graph session"
-                onClick={(event) => {
-                  event.stopPropagation();
-                  onRunPlay();
-                }}
-                disabled={running}
-              >
-                {running ? <Loader2 className="spin" size={20} aria-hidden="true" /> : <Play size={22} aria-hidden="true" />}
-              </button>
+              <div className="project-play-controls">
+                <input
+                  className="project-play-prompt"
+                  value={node.prompt ?? ""}
+                  onChange={(event) => onPlayPromptChange(event.target.value)}
+                  placeholder="First prompt"
+                  onPointerDown={(event) => event.stopPropagation()}
+                />
+                <button
+                  className="project-play-button"
+                  type="button"
+                  title="Start graph session"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    onRunPlay();
+                  }}
+                  disabled={running}
+                >
+                  {running ? <Loader2 className="spin" size={18} aria-hidden="true" /> : <Play size={19} aria-hidden="true" />}
+                </button>
+              </div>
+              <div className="project-play-repository" title={playRepositoryLabel}>
+                {playRepositoryLabel}
+              </div>
             </div>
           ) : (
             <div className="expression-node-body">
@@ -1637,14 +1844,14 @@ function AgentDialog({
   const editing = Boolean(agent);
   const [draft, setDraft] = React.useState<AgentDraft>(() => ({
     name: agent?.name ?? "",
-    model: agent?.model ?? models[0]?.id ?? "gpt-5-codex",
+    model: agent?.model ?? models[0]?.id ?? "gpt-5.5",
     systemPrompt: agent?.systemPrompt ?? "",
   }));
 
   React.useEffect(() => {
     setDraft({
       name: agent?.name ?? "",
-      model: agent?.model ?? models[0]?.id ?? "gpt-5-codex",
+      model: agent?.model ?? models[0]?.id ?? "gpt-5.5",
       systemPrompt: agent?.systemPrompt ?? "",
     });
   }, [agent, models]);
@@ -1899,15 +2106,49 @@ function ResultCreateDialog({
 
 function SessionsDialog({
   sessions,
+  followedSessionId,
+  focusedAgentSessionId,
   onRefresh,
+  onFollowSession,
   onStop,
+  onRemoveSession,
   onClose,
 }: {
   sessions: GraphSession[];
+  followedSessionId: string | null;
+  focusedAgentSessionId: string | null;
   onRefresh: () => void;
+  onFollowSession: (sessionId: string) => void;
   onStop: (sessionId: string) => void;
+  onRemoveSession: (sessionId: string) => void;
   onClose: () => void;
 }) {
+  const focusedSessionId = focusedAgentSessionId
+    ? sessions.find((session) => session.agentSessions.some((agentSession) => agentSession.id === focusedAgentSessionId))?.id ?? null
+    : null;
+  const [selectedSessionId, setSelectedSessionId] = React.useState<string | null>(focusedSessionId ?? followedSessionId ?? sessions[0]?.id ?? null);
+
+  React.useEffect(() => {
+    if (sessions.length === 0) {
+      setSelectedSessionId(null);
+      return;
+    }
+    const preferredSessionId = focusedSessionId ??
+      (followedSessionId && sessions.some((session) => session.id === followedSessionId)
+      ? followedSessionId
+      : sessions[0].id);
+    if (focusedSessionId && selectedSessionId !== focusedSessionId) {
+      setSelectedSessionId(focusedSessionId);
+      return;
+    }
+    if (!selectedSessionId || !sessions.some((session) => session.id === selectedSessionId)) {
+      setSelectedSessionId(preferredSessionId);
+    }
+  }, [focusedSessionId, followedSessionId, selectedSessionId, sessions]);
+
+  const selectedSession = sessions.find((session) => session.id === selectedSessionId) ?? sessions[0] ?? null;
+  const selectedAgentSessions = selectedSession ? orderedAgentSessions(selectedSession) : [];
+
   return (
     <Modal title="Sessions" onClose={onClose} className="sessions-modal">
       <div className="play-sessions-panel">
@@ -1923,55 +2164,194 @@ function SessionsDialog({
             <strong>No graph sessions</strong>
           </div>
         ) : null}
-        <div className="session-list">
-          {sessions.map((session) => {
-            const latestStatuses = Object.values(session.nodeStatuses).flat().sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, 6);
-            return (
-              <article className="session-card" key={session.id}>
-                <header>
+        {sessions.length > 0 ? (
+          <div className="sessions-browser">
+            <div className="session-list" role="list" aria-label="Graph sessions">
+              {sessions.map((session) => {
+                const isSelected = selectedSession?.id === session.id;
+                const lastAgentSession = orderedAgentSessions(session).at(-1);
+                const latestStatus = lastAgentSession ? latestAgentSessionStatus(lastAgentSession) : null;
+                return (
+                  <article
+                    className={`session-card session-selector ${isSelected ? "selected" : ""}`}
+                    key={session.id}
+                  >
+                    <button
+                      className="session-card-select-button"
+                      type="button"
+                      onClick={() => {
+                        setSelectedSessionId(session.id);
+                        onFollowSession(session.id);
+                      }}
+                    >
+                      <span className="session-card-header">
+                        <span>
+                          <strong>{session.id}</strong>
+                          <span className={`status-pill ${session.status}`}>{session.status}</span>
+                        </span>
+                      </span>
+                      <span className="session-meta">
+                        <span>{session.projectName ?? "Project"}</span>
+                        <span>{formatDateTime(session.createdAt)}</span>
+                        <span>{session.agentSessions.length} agent sessions</span>
+                      </span>
+                      <span className="session-card-prompt">{session.prompt}</span>
+                      {latestStatus ? (
+                        <span className="session-card-footer">
+                          <span className={`status-pill ${latestStatus.state}`}>{latestStatus.state}</span>
+                          <span>{latestStatus.summary || latestStatus.routeReason || "status"}</span>
+                        </span>
+                      ) : null}
+                    </button>
+                    <button
+                      className="icon-button compact-icon danger session-remove-button"
+                      type="button"
+                      onClick={() => onRemoveSession(session.id)}
+                      title="Remove session"
+                      aria-label={`Remove session ${session.id}`}
+                    >
+                      <Trash2 size={13} aria-hidden="true" />
+                    </button>
+                  </article>
+                );
+              })}
+            </div>
+            {selectedSession ? (
+              <section className="session-transcript" aria-label="Selected graph session transcript">
+                <header className="session-transcript-header">
                   <div>
-                    <strong>{session.id}</strong>
-                    <span className={`status-pill ${session.status}`}>{session.status}</span>
+                    <strong>{selectedSession.id}</strong>
+                    <span className={`status-pill ${selectedSession.status}`}>{selectedSession.status}</span>
                   </div>
                   <div className="session-actions">
-                    {session.prUrl ? (
-                      <a className="secondary-button compact-button" href={session.prUrl} target="_blank" rel="noreferrer">
+                    {selectedSession.prUrl ? (
+                      <a className="secondary-button compact-button" href={selectedSession.prUrl} target="_blank" rel="noreferrer">
                         <GitPullRequest size={15} aria-hidden="true" />
                         PR
                       </a>
                     ) : null}
-                    {session.status === "running" ? (
-                      <button className="secondary-button compact-button" type="button" onClick={() => onStop(session.id)}>
+                    {selectedSession.status === "running" ? (
+                      <button className="secondary-button compact-button" type="button" onClick={() => onStop(selectedSession.id)}>
                         <Square size={15} aria-hidden="true" />
                         Stop
                       </button>
                     ) : null}
+                    <button className="danger-button compact-button" type="button" onClick={() => onRemoveSession(selectedSession.id)}>
+                      <Trash2 size={15} aria-hidden="true" />
+                      Remove
+                    </button>
                   </div>
                 </header>
-                <div className="session-meta">
-                  <span>{session.projectName ?? "Project"}</span>
-                  <span>{formatDateTime(session.createdAt)}</span>
-                  <span>{session.repository ? `${session.repository.nameWithOwner}@${session.repository.branch}` : "None"}</span>
-                  <span>{session.workspacePath}</span>
+                <div className="session-meta transcript-meta">
+                  <span>{selectedSession.projectName ?? "Project"}</span>
+                  <span>{formatDateTime(selectedSession.createdAt)}</span>
+                  <span>{selectedSession.repository ? `${selectedSession.repository.nameWithOwner}@${selectedSession.repository.branch}` : "None"}</span>
+                  <span>{selectedSession.workspacePath}</span>
                 </div>
-                <p>{session.prompt}</p>
-                {session.error ? <div className="notice error">{session.error}</div> : null}
-                <div className="status-list">
-                  {latestStatuses.map((status) => (
-                    <div key={status.id}>
-                      <span className={`status-pill ${status.state}`}>{status.state}</span>
-                      <strong>{status.nodeId}</strong>
-                      <span>{status.summary || status.routeReason || "status"}</span>
-                      {status.routedResultId ? <code>{status.routedResultId}</code> : null}
+                {selectedSession.error ? <div className="notice error">{selectedSession.error}</div> : null}
+                <div className="transcript-list">
+                  <article className="transcript-turn play-turn">
+                    <div className="transcript-turn-head">
+                      <span className="turn-icon">
+                        <Play size={15} aria-hidden="true" />
+                      </span>
+                      <div>
+                        <strong>Play prompt</strong>
+                        <span>{formatDateTime(selectedSession.createdAt)}</span>
+                      </div>
                     </div>
+                    <p>{selectedSession.prompt}</p>
+                  </article>
+                  {selectedAgentSessions.length === 0 ? (
+                    <div className="empty-state transcript-empty">
+                      <CircleDot size={24} aria-hidden="true" />
+                      <strong>No agent sessions</strong>
+                    </div>
+                  ) : null}
+                  {selectedAgentSessions.map((agentSession) => (
+                    <AgentSessionTurn
+                      key={agentSession.id}
+                      graphSession={selectedSession}
+                      agentSession={agentSession}
+                      focused={focusedAgentSessionId === agentSession.id}
+                    />
                   ))}
                 </div>
-              </article>
-            );
-          })}
-        </div>
+              </section>
+            ) : null}
+          </div>
+        ) : null}
       </div>
     </Modal>
+  );
+}
+
+function AgentSessionTurn({
+  graphSession,
+  agentSession,
+  focused,
+}: {
+  graphSession: GraphSession;
+  agentSession: AgentSession;
+  focused: boolean;
+}) {
+  const outcome = agentSession.terminalOutcome;
+  const response = agentSession.response || agentSession.stdout || outcome?.detail || outcome?.summary || "";
+  return (
+    <article className={`transcript-turn agent-turn ${focused ? "focused" : ""}`}>
+      <div className="transcript-turn-head">
+        <span className="turn-icon">
+          <Bot size={15} aria-hidden="true" />
+        </span>
+        <div>
+          <strong>{agentSessionAgentName(graphSession, agentSession)}</strong>
+          <span>{agentSession.id} · Node {shortId(agentSession.nodeId)}</span>
+        </div>
+        <span className={`status-pill ${agentSession.status}`}>{agentSession.status}</span>
+      </div>
+      {agentSession.previousAgentSessionId || agentSession.incomingExpressionNodeId || agentSession.incomingResultId ? (
+        <div className="transcript-route">
+          {agentSession.previousAgentSessionId ? <span>After {shortId(agentSession.previousAgentSessionId)}</span> : null}
+          {agentSession.incomingExpressionNodeId ? <span>Via {shortId(agentSession.incomingExpressionNodeId)}</span> : null}
+          {agentSession.incomingResultId ? <code>{agentSession.incomingResultId}</code> : null}
+        </div>
+      ) : null}
+      {outcome ? (
+        <div className="transcript-result">
+          <span className={`status-pill ${outcome.state}`}>{outcome.state}</span>
+          {outcome.routedResultId ? <code>{outcome.routedResultId}</code> : null}
+          <span>{outcome.summary || outcome.routeReason || "Terminal outcome"}</span>
+        </div>
+      ) : null}
+      {response ? <pre className="transcript-response">{response}</pre> : null}
+      {agentSession.prompt ? (
+        <details className="transcript-details">
+          <summary>Prompt</summary>
+          <pre>{agentSession.prompt}</pre>
+        </details>
+      ) : null}
+      {agentSession.statuses.length > 0 ? (
+        <details className="transcript-details">
+          <summary>Status timeline</summary>
+          <div className="status-list transcript-status-list">
+            {agentSession.statuses.map((status) => (
+              <div key={status.id}>
+                <span className={`status-pill ${status.state}`}>{status.state}</span>
+                <strong>{formatDateTime(status.createdAt)}</strong>
+                <span>{status.summary || status.routeReason || "status"}</span>
+                {status.routedResultId ? <code>{status.routedResultId}</code> : null}
+              </div>
+            ))}
+          </div>
+        </details>
+      ) : null}
+      {agentSession.stderr ? (
+        <details className="transcript-details">
+          <summary>Stderr</summary>
+          <pre>{agentSession.stderr}</pre>
+        </details>
+      ) : null}
+    </article>
   );
 }
 
@@ -2211,18 +2591,18 @@ function upsertGraphEdge(edges: GraphEdge[], nodes: GraphNode[], edge: Omit<Grap
     }
     return true;
   });
-  return [...filtered, { id: newId("edge"), ...edgeWithInitialBend(nodes, filtered, edge) }];
+  return [...filtered, { id: newId("edge"), ...edgeWithInitialRoute(nodes, filtered, edge) }];
 }
 
-function edgeWithInitialBend(nodes: GraphNode[], edges: GraphEdge[], edge: Omit<GraphEdge, "id">): Omit<GraphEdge, "id"> {
-  if (edge.bend) return edge;
+function edgeWithInitialRoute(nodes: GraphNode[], edges: GraphEdge[], edge: Omit<GraphEdge, "id">): Omit<GraphEdge, "id"> {
+  if (edge.waypoints?.length || edge.bend) return edge;
   const source = nodes.find((node) => node.id === edge.source);
   const target = nodes.find((node) => node.id === edge.target);
   if (!source || !target) return edge;
   const relatedEdgeCount = edges.filter((candidate) => sameUnorderedEndpoints(candidate, edge)).length;
   if (relatedEdgeCount === 0) return edge;
-  const bend = separatedEdgeBend(source, target, relatedEdgeCount);
-  return { ...edge, bend };
+  const waypoint = separatedEdgeWaypoint(source, target, relatedEdgeCount);
+  return { ...edge, routingMode: "manual", waypoints: [waypoint], bend: null };
 }
 
 function sameUnorderedEndpoints(left: Pick<GraphEdge, "source" | "target">, right: Pick<GraphEdge, "source" | "target">): boolean {
@@ -2232,7 +2612,7 @@ function sameUnorderedEndpoints(left: Pick<GraphEdge, "source" | "target">, righ
   );
 }
 
-function separatedEdgeBend(source: GraphNode, target: GraphNode, relatedEdgeCount: number): Point {
+function separatedEdgeWaypoint(source: GraphNode, target: GraphNode, relatedEdgeCount: number): Point {
   const sourceCenter = projectNodeCenter(source);
   const targetCenter = projectNodeCenter(target);
   const baseBend = defaultBendForNodes(source, target);
@@ -2279,171 +2659,6 @@ function defaultExpressionResultId(state: Pick<GraphState, "results">): string {
   return state.results.find((result) => !result.reserved)?.id ?? state.results[0]?.id ?? "unknown";
 }
 
-function edgeGeometry(edge: Pick<GraphEdge, "bend" | "sourceAnchor" | "targetAnchor">, source: GraphNode, target: GraphNode): EdgeGeometry {
-  const sourceAnchor = edge.sourceAnchor ?? cardAnchorForPoint(source, edge.bend ?? projectNodeCenter(target));
-  const targetAnchor = edge.targetAnchor ?? cardAnchorForPoint(target, edge.bend ?? projectNodeCenter(source));
-  const sourcePoint = projectNodeAnchorPoint(source, sourceAnchor);
-  const targetPoint = projectNodeAnchorPoint(target, targetAnchor);
-  const sourceStub = offsetAnchorPoint(sourcePoint, sourceAnchor, 34);
-  const targetStub = offsetAnchorPoint(targetPoint, targetAnchor, 34);
-  const bend = edge.bend ?? defaultEdgeBend(sourceStub, targetStub);
-  const routePoints = orthogonalRoutePoints(sourceStub, targetStub, bend);
-  const points = compactEdgePoints([sourcePoint, ...routePoints, targetPoint]);
-  const arrow = pointOnPolyline(points, 0.5);
-  return {
-    path: edgePathFromPoints(points),
-    points,
-    handle: bend,
-    label: arrow,
-    arrow,
-    sourcePoint,
-    targetPoint,
-    sourceAnchor,
-    targetAnchor,
-  };
-}
-
-function edgePath(source: GraphNode, target: GraphNode, bend?: Point | null): string {
-  return edgeGeometry({ bend }, source, target).path;
-}
-
-function defaultBendForNodes(source: GraphNode, target: GraphNode): Point {
-  const sourceAnchor = cardAnchorForPoint(source, projectNodeCenter(target));
-  const targetAnchor = cardAnchorForPoint(target, projectNodeCenter(source));
-  const sourcePoint = projectNodeAnchorPoint(source, sourceAnchor);
-  const targetPoint = projectNodeAnchorPoint(target, targetAnchor);
-  return defaultEdgeBend(
-    offsetAnchorPoint(sourcePoint, sourceAnchor, 34),
-    offsetAnchorPoint(targetPoint, targetAnchor, 34),
-  );
-}
-
-function connectionPreviewPath(source: GraphNode, target: Point): string {
-  const sourceAnchor = cardAnchorForPoint(source, target);
-  const sourcePoint = projectNodeAnchorPoint(source, sourceAnchor);
-  const sourceStub = offsetAnchorPoint(sourcePoint, sourceAnchor, 34);
-  const bend = defaultEdgeBend(sourceStub, target);
-  return edgePathFromPoints(compactEdgePoints([sourcePoint, ...orthogonalRoutePoints(sourceStub, target, bend)]));
-}
-
-function orthogonalRoutePoints(start: Point, end: Point, bend: Point): Point[] {
-  const horizontalFirst = Math.abs(end.x - start.x) >= Math.abs(end.y - start.y);
-  return compactEdgePoints(horizontalFirst ? [
-    start,
-    { x: bend.x, y: start.y },
-    bend,
-    { x: end.x, y: bend.y },
-    end,
-  ] : [
-    start,
-    { x: start.x, y: bend.y },
-    bend,
-    { x: bend.x, y: end.y },
-    end,
-  ]);
-}
-
-function defaultEdgeBend(source: Point, target: Point): Point {
-  return {
-    x: (source.x + target.x) / 2,
-    y: (source.y + target.y) / 2,
-  };
-}
-
-function projectNodeAnchorPoint(node: GraphNode, anchor: CardAnchor): Point {
-  const size = projectNodeSizeForType(node.type);
-  if (anchor === "top") return { x: node.x + size.width / 2, y: node.y };
-  if (anchor === "right") return { x: node.x + size.width, y: node.y + size.height / 2 };
-  if (anchor === "bottom") return { x: node.x + size.width / 2, y: node.y + size.height };
-  return { x: node.x, y: node.y + size.height / 2 };
-}
-
-function offsetAnchorPoint(point: Point, anchor: CardAnchor, distance: number): Point {
-  const direction = anchorDirection(anchor);
-  return {
-    x: point.x + direction.x * distance,
-    y: point.y + direction.y * distance,
-  };
-}
-
-function cardAnchorForPoint(node: GraphNode, point: Point): CardAnchor {
-  const center = projectNodeCenter(node);
-  const dx = point.x - center.x;
-  const dy = point.y - center.y;
-  if (Math.abs(dx) > Math.abs(dy)) return dx >= 0 ? "right" : "left";
-  return dy >= 0 ? "bottom" : "top";
-}
-
-function anchorDirection(anchor: CardAnchor): Point {
-  if (anchor === "top") return { x: 0, y: -1 };
-  if (anchor === "right") return { x: 1, y: 0 };
-  if (anchor === "bottom") return { x: 0, y: 1 };
-  return { x: -1, y: 0 };
-}
-
-function compactEdgePoints(points: Point[]): Point[] {
-  const deduped = points.reduce<Point[]>((result, point) => {
-    const previous = result.at(-1);
-    if (!previous || Math.abs(previous.x - point.x) > 0.01 || Math.abs(previous.y - point.y) > 0.01) {
-      result.push(point);
-    }
-    return result;
-  }, []);
-  if (deduped.length <= 2) return deduped;
-  return deduped.filter((point, index, list) => {
-    if (index === 0 || index === list.length - 1) return true;
-    const previous = list[index - 1];
-    const next = list[index + 1];
-    const horizontal = Math.abs(previous.y - point.y) <= 0.01 && Math.abs(point.y - next.y) <= 0.01;
-    const vertical = Math.abs(previous.x - point.x) <= 0.01 && Math.abs(point.x - next.x) <= 0.01;
-    return !horizontal && !vertical;
-  });
-}
-
-function edgePathFromPoints(points: Point[]): string {
-  return points.map((point, index) => `${index === 0 ? "M" : "L"} ${svgNumber(point.x)} ${svgNumber(point.y)}`).join(" ");
-}
-
-function pointOnPolyline(points: Point[], ratio: number): Point & { angle: number } {
-  const segments = points.slice(1).map((point, index) => {
-    const previous = points[index];
-    const dx = point.x - previous.x;
-    const dy = point.y - previous.y;
-    return { previous, point, dx, dy, length: Math.hypot(dx, dy) };
-  }).filter((segment) => segment.length > 0.01);
-  const totalLength = segments.reduce((sum, segment) => sum + segment.length, 0);
-  if (!segments.length || totalLength <= 0) {
-    const first = points[0] ?? { x: 0, y: 0 };
-    return { x: first.x, y: first.y, angle: 0 };
-  }
-
-  const targetLength = totalLength * ratio;
-  let traveled = 0;
-  for (const segment of segments) {
-    if (traveled + segment.length >= targetLength) {
-      const progress = (targetLength - traveled) / segment.length;
-      return {
-        x: segment.previous.x + segment.dx * progress,
-        y: segment.previous.y + segment.dy * progress,
-        angle: Math.atan2(segment.dy, segment.dx) * 180 / Math.PI,
-      };
-    }
-    traveled += segment.length;
-  }
-
-  const last = segments.at(-1);
-  return {
-    x: last?.point.x ?? 0,
-    y: last?.point.y ?? 0,
-    angle: last ? Math.atan2(last.dy, last.dx) * 180 / Math.PI : 0,
-  };
-}
-
-function svgNumber(value: number): string {
-  const rounded = Math.round(value * 100) / 100;
-  return Object.is(rounded, -0) ? "0" : String(rounded);
-}
-
 function projectNodeCenter(node: GraphNode): { x: number; y: number } {
   const size = projectNodeSizeForType(node.type);
   return { x: node.x + size.width / 2, y: node.y + size.height / 2 };
@@ -2462,12 +2677,6 @@ function projectNodeBoundaryPoint(node: GraphNode, toward: { x: number; y: numbe
     x: center.x + dx * scale,
     y: center.y + dy * scale,
   };
-}
-
-function projectNodeSizeForType(type: GraphNodeType): { width: number; height: number } {
-  if (type === "play") return { width: 260, height: 132 };
-  if (type === "agent") return { width: 180, height: 88 };
-  return { width: 220, height: 88 };
 }
 
 function projectNodeRect(node: GraphNode): { x: number; y: number; width: number; height: number } {
@@ -2558,10 +2767,145 @@ function nodeLabel(node: GraphNode, state: GraphState) {
   return agent?.name ?? `Agent ${shortId(node.id)}`;
 }
 
-function latestNodeStatus(state: GraphState, nodeId: string): NodeStatus | null {
-  return state.sessions
-    .flatMap((session) => session.nodeStatuses[nodeId] ?? [])
-    .sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0] ?? null;
+function orderedAgentSessions(session: GraphSession) {
+  return [...session.agentSessions].sort((a, b) => a.sequence - b.sequence || a.startedAt.localeCompare(b.startedAt));
+}
+
+function latestAgentSessionStatus(agentSession: AgentSession): AgentSessionStatus | null {
+  return [...agentSession.statuses].sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0] ?? null;
+}
+
+function agentSessionAgentName(session: GraphSession, agentSession: AgentSession) {
+  const agent = session.agentsSnapshot?.find((candidate) => candidate.id === agentSession.agentId);
+  if (agent) return agent.name;
+  const node = session.graphSnapshot?.nodes.find((candidate) => candidate.id === agentSession.nodeId);
+  return node?.type === "agent" ? `Agent ${shortId(node.id)}` : `Agent ${shortId(agentSession.nodeId)}`;
+}
+
+function latestSessionForProject(sessions: GraphSession[], projectId: string | null | undefined) {
+  return sessions
+    .map((session, index) => ({ session, index }))
+    .filter(({ session }) => session.projectId === projectId)
+    .sort((left, right) => {
+      const dateComparison = right.session.createdAt.localeCompare(left.session.createdAt);
+      return dateComparison || left.index - right.index;
+    })[0]?.session ?? null;
+}
+
+function graphSessionOptionLabel(session: GraphSession) {
+  return `${session.status} · ${formatDateTime(session.createdAt)}`;
+}
+
+function graphExecutionViewForSession(session: GraphSession): GraphExecutionView {
+  const orderedSessions = orderedAgentSessions(session);
+  const sessionById = new Map(orderedSessions.map((agentSession) => [agentSession.id, agentSession]));
+  const activeAgentSessions = orderedSessions.filter((agentSession) =>
+    session.activeAgentSessionIds.includes(agentSession.id) && !isTerminalAgentSession(agentSession)
+  );
+  const latestAgentSessionByNodeId = new Map<string, AgentSession>();
+  const executionBadgesByNodeId = new Map<string, string>();
+  const sessionsByNodeId = new Map<string, AgentSession[]>();
+  const activeAgentSessionIds = new Set(activeAgentSessions.map((agentSession) => agentSession.id));
+  const activeNodeIds = new Set(activeAgentSessions.map((agentSession) => agentSession.nodeId));
+  const previousAgentSessionIds = new Set<string>();
+  const previousNodeIds = new Set<string>();
+  const activeExpressionNodeIds = new Set<string>();
+  const activeRouteEdgeIds = new Set<string>();
+  const visitedNodeIds = new Set<string>();
+  const visitedExpressionNodeIds = new Set<string>();
+  const visitedRouteEdgeIds = new Set<string>();
+
+  for (const agentSession of orderedSessions) {
+    latestAgentSessionByNodeId.set(agentSession.nodeId, agentSession);
+    visitedNodeIds.add(agentSession.nodeId);
+    if (agentSession.incomingExpressionNodeId) visitedExpressionNodeIds.add(agentSession.incomingExpressionNodeId);
+    for (const edgeId of agentSession.incomingEdgeIds) visitedRouteEdgeIds.add(edgeId);
+    const sessionsForNode = sessionsByNodeId.get(agentSession.nodeId) ?? [];
+    sessionsForNode.push(agentSession);
+    sessionsByNodeId.set(agentSession.nodeId, sessionsForNode);
+  }
+
+  for (const [nodeId, sessionsForNode] of sessionsByNodeId) {
+    executionBadgesByNodeId.set(nodeId, sessionsForNode.length > 1 ? `${sessionsForNode.length}x` : String(sessionsForNode[0].sequence));
+  }
+
+  for (const agentSession of activeAgentSessions) {
+    if (agentSession.previousAgentSessionId) previousAgentSessionIds.add(agentSession.previousAgentSessionId);
+    if (agentSession.incomingExpressionNodeId) activeExpressionNodeIds.add(agentSession.incomingExpressionNodeId);
+    for (const edgeId of agentSession.incomingEdgeIds) activeRouteEdgeIds.add(edgeId);
+  }
+
+  for (const agentSessionId of previousAgentSessionIds) {
+    const previousAgentSession = sessionById.get(agentSessionId);
+    if (previousAgentSession) previousNodeIds.add(previousAgentSession.nodeId);
+  }
+
+  const primaryActiveAgentSession = activeAgentSessions[0] ?? null;
+  let primaryPreviousAgentSession = primaryActiveAgentSession?.previousAgentSessionId
+    ? sessionById.get(primaryActiveAgentSession.previousAgentSessionId) ?? null
+    : null;
+  if (!primaryPreviousAgentSession && primaryActiveAgentSession) {
+    const activeIndex = orderedSessions.findIndex((agentSession) => agentSession.id === primaryActiveAgentSession.id);
+    primaryPreviousAgentSession = orderedSessions.slice(0, activeIndex).reverse().find(isTerminalAgentSession) ?? null;
+    if (primaryPreviousAgentSession) previousNodeIds.add(primaryPreviousAgentSession.nodeId);
+  }
+  if (!primaryActiveAgentSession && orderedSessions.length > 0) {
+    primaryPreviousAgentSession = orderedSessions.at(-1) ?? null;
+    if (primaryPreviousAgentSession) previousNodeIds.add(primaryPreviousAgentSession.nodeId);
+  }
+
+  return {
+    graphSessionId: session.id,
+    status: session.status,
+    activeAgentSessionIds,
+    activeNodeIds,
+    previousAgentSessionIds,
+    previousNodeIds,
+    activeExpressionNodeIds,
+    activeRouteEdgeIds,
+    visitedNodeIds,
+    visitedExpressionNodeIds,
+    visitedRouteEdgeIds,
+    latestAgentSessionByNodeId,
+    executionBadgesByNodeId,
+    primaryActiveAgentSession,
+    primaryPreviousAgentSession,
+  };
+}
+
+function nodeExecutionClass(nodeId: string, executionView: GraphExecutionView | null): string {
+  if (!executionView) return "";
+  const classes = [];
+  if (executionView.visitedNodeIds.has(nodeId) || executionView.visitedExpressionNodeIds.has(nodeId)) classes.push("execution-visited");
+  if (executionView.previousNodeIds.has(nodeId)) classes.push("execution-previous");
+  if (executionView.activeExpressionNodeIds.has(nodeId)) classes.push("execution-expression");
+  if (executionView.activeNodeIds.has(nodeId)) classes.push("execution-active");
+  const latestAgentSession = executionView.latestAgentSessionByNodeId.get(nodeId);
+  if (latestAgentSession?.terminalOutcome?.state === "failed") classes.push("execution-failed");
+  if (latestAgentSession?.terminalOutcome?.state === "stopped") classes.push("execution-stopped");
+  return classes.join(" ");
+}
+
+function edgeExecutionClass(edgeId: string, executionView: GraphExecutionView | null): string {
+  if (!executionView) return "";
+  if (executionView.activeRouteEdgeIds.has(edgeId)) return "execution-active-route";
+  if (executionView.visitedRouteEdgeIds.has(edgeId)) return "execution-visited-route";
+  return "";
+}
+
+function isTerminalAgentSession(agentSession: AgentSession): boolean {
+  return agentSession.status === "completed" || agentSession.status === "failed" || agentSession.status === "stopped";
+}
+
+function formatElapsedTime(startValue: string, endValue?: string) {
+  const start = new Date(startValue).getTime();
+  const end = endValue ? new Date(endValue).getTime() : Date.now();
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return "0s";
+  const seconds = Math.max(0, Math.floor((end - start) / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
 }
 
 function normalizeResultId(value: string) {
