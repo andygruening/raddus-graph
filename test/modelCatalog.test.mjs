@@ -4,6 +4,8 @@ import {
   defaultCodexModelId,
   modelCatalog,
   modelIsSupported,
+  normalizeModelReasoningEffort,
+  reasoningEffortsForModel,
   normalizeModelId,
   runnerForModel,
 } from "../server/modelCatalog.mjs";
@@ -20,4 +22,13 @@ test("unsupported legacy Codex model IDs are not offered or retained", () => {
   assert.equal(modelIsSupported("gpt-5"), false);
   assert.equal(normalizeModelId("gpt-5-codex"), defaultCodexModelId);
   assert.equal(normalizeModelId("gpt-5"), defaultCodexModelId);
+});
+
+test("Codex models expose supported reasoning efforts", () => {
+  const efforts = reasoningEffortsForModel(defaultCodexModelId);
+  assert.ok(efforts.length > 0);
+  assert.ok(efforts.some((effort) => effort.id === "high"));
+  assert.equal(normalizeModelReasoningEffort(defaultCodexModelId, "high"), "high");
+  assert.equal(normalizeModelReasoningEffort(defaultCodexModelId, "unsupported"), null);
+  assert.equal(normalizeModelReasoningEffort("claude-sonnet-4-6", "high"), null);
 });

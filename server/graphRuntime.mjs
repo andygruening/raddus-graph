@@ -529,17 +529,23 @@ function statusFilePathForAgentSession(workspacePath, agentSessionId) {
 
 export function cliArgsForRunner(runner, agent, workspacePath, prompt) {
   if (runner === "codex") {
+    const args = [
+      "exec",
+      "--model",
+      agent.model,
+    ];
+    if (agent.modelReasoningEffort) {
+      args.push("-c", `model_reasoning_effort="${agent.modelReasoningEffort}"`);
+    }
+    args.push(
+      "--cd",
+      workspacePath,
+      "--approve-for-me",
+      "--skip-git-repo-check",
+      "-",
+    );
     return {
-      args: [
-        "exec",
-        "--model",
-        agent.model,
-        "--cd",
-        workspacePath,
-        "--approve-for-me",
-        "--skip-git-repo-check",
-        "-",
-      ],
+      args,
       input: prompt,
     };
   }

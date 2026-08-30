@@ -10,12 +10,21 @@ export interface ModelCatalogEntry {
   id: string;
   label: string;
   runner: RunnerId;
+  reasoningEfforts?: ReasoningEffortOption[];
+  defaultReasoningEffort?: string | null;
+}
+
+export interface ReasoningEffortOption {
+  id: string;
+  label: string;
+  description: string;
 }
 
 export interface AgentSpec {
   id: string;
   name: string;
   model: string;
+  modelReasoningEffort: string | null;
   systemPrompt: string;
   createdAt: string;
   updatedAt: string;

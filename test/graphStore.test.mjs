@@ -56,3 +56,38 @@ test("saving state applies the top-level graph to the selected project", async (
     delete process.env.RADDUS_GRAPH_DIR;
   }
 });
+
+test("saving agents preserves supported Codex reasoning effort", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "raddus-graph-store-"));
+  process.env.RADDUS_GRAPH_DIR = dataDir;
+  try {
+    const store = await import(`../server/graphStore.mjs?graph-store-test=${Date.now()}`);
+    await store.initializeGraphStore();
+
+    const saved = await store.replaceGraphState({
+      agents: [
+        {
+          id: "agent-codex",
+          name: "Codex Agent",
+          model: "gpt-5.5",
+          modelReasoningEffort: "high",
+          systemPrompt: "",
+        },
+        {
+          id: "agent-claude",
+          name: "Claude Agent",
+          model: "claude-sonnet-4-6",
+          modelReasoningEffort: "high",
+          systemPrompt: "",
+        },
+      ],
+      results: [],
+    });
+
+    assert.equal(saved.agents.find((agent) => agent.id === "agent-codex")?.modelReasoningEffort, "high");
+    assert.equal(saved.agents.find((agent) => agent.id === "agent-claude")?.modelReasoningEffort, null);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+    delete process.env.RADDUS_GRAPH_DIR;
+  }
+});
