@@ -4,14 +4,31 @@ import { join } from "node:path";
 
 export const fallbackCodexModelId = "gpt-5.5";
 
+const defaultCodexReasoningEffortOptions = [
+  { id: "low", label: "Low", description: "Fast responses with lighter reasoning" },
+  { id: "medium", label: "Medium", description: "Balances speed and reasoning depth for everyday tasks" },
+  { id: "high", label: "High", description: "Greater reasoning depth for complex problems" },
+  { id: "xhigh", label: "Extra high", description: "Extra high reasoning depth for complex problems" },
+];
+
+const codexReasoningEffortLabels = new Map([
+  ["minimal", "Minimal"],
+  ["low", "Low"],
+  ["medium", "Medium"],
+  ["high", "High"],
+  ["xhigh", "Extra high"],
+  ["max", "Max"],
+  ["ultra", "Ultra"],
+]);
+
 const fallbackCodexModels = [
-  { id: "gpt-5.5", label: "GPT-5.5", runner: "codex" },
-  { id: "gpt-5.6-sol", label: "GPT-5.6-Sol", runner: "codex" },
-  { id: "gpt-5.6-terra", label: "GPT-5.6-Terra", runner: "codex" },
-  { id: "gpt-5.6-luna", label: "GPT-5.6-Luna", runner: "codex" },
-  { id: "gpt-5.4", label: "GPT-5.4", runner: "codex" },
-  { id: "gpt-5.4-mini", label: "GPT-5.4-Mini", runner: "codex" },
-  { id: "gpt-5.3-codex-spark", label: "GPT-5.3-Codex-Spark", runner: "codex" },
+  codexModelEntry("gpt-5.5", "GPT-5.5"),
+  codexModelEntry("gpt-5.6-sol", "GPT-5.6-Sol"),
+  codexModelEntry("gpt-5.6-terra", "GPT-5.6-Terra"),
+  codexModelEntry("gpt-5.6-luna", "GPT-5.6-Luna"),
+  codexModelEntry("gpt-5.4", "GPT-5.4"),
+  codexModelEntry("gpt-5.4-mini", "GPT-5.4-Mini"),
+  codexModelEntry("gpt-5.3-codex-spark", "GPT-5.3-Codex-Spark"),
 ];
 
 const unsupportedCodexModelIds = new Set(["gpt-5-codex", "gpt-5"]);
@@ -42,6 +59,18 @@ export function modelIsSupported(model) {
 export function normalizeModelId(model) {
   const normalized = typeof model === "string" ? model.trim() : "";
   return modelIsSupported(normalized) ? normalized : defaultCodexModelId;
+}
+
+export function normalizeModelReasoningEffort(model, effort) {
+  const normalized = typeof effort === "string" ? effort.trim() : "";
+  if (!normalized || runnerForModel(model) !== "codex") return null;
+  const supported = reasoningEffortsForModel(model).map((option) => option.id);
+  return supported.includes(normalized) ? normalized : null;
+}
+
+export function reasoningEffortsForModel(model) {
+  const entry = modelCatalog.find((candidate) => candidate.id === model);
+  return entry?.runner === "codex" && Array.isArray(entry.reasoningEfforts) ? entry.reasoningEfforts : [];
 }
 
 function orderedCodexModels() {
@@ -78,15 +107,47 @@ function codexModelsFromLocalCache() {
     if (!Array.isArray(cache.models)) return [];
     return cache.models.flatMap((model) => {
       if (model?.visibility !== "list" || typeof model.slug !== "string" || unsupportedCodexModelIds.has(model.slug)) return [];
-      return [{
-        id: model.slug,
-        label: typeof model.display_name === "string" && model.display_name.trim() ? model.display_name.trim() : model.slug,
-        runner: "codex",
-      }];
+      return [codexModelEntry(
+        model.slug,
+        typeof model.display_name === "string" && model.display_name.trim() ? model.display_name.trim() : model.slug,
+        model.supported_reasoning_levels,
+        model.default_reasoning_level,
+      )];
     });
   } catch {
     return [];
   }
+}
+
+function codexModelEntry(id, label, supportedReasoningLevels = defaultCodexReasoningEffortOptions, defaultReasoningEffort = "medium") {
+  const reasoningEfforts = normalizeReasoningEffortOptions(supportedReasoningLevels);
+  return {
+    id,
+    label,
+    runner: "codex",
+    reasoningEfforts,
+    defaultReasoningEffort: normalizeReasoningEffort(defaultReasoningEffort, reasoningEfforts) ?? null,
+  };
+}
+
+function normalizeReasoningEffortOptions(value) {
+  const seen = new Set();
+  const source = Array.isArray(value) && value.length > 0 ? value : defaultCodexReasoningEffortOptions;
+  return source.flatMap((option) => {
+    const id = typeof option === "string" ? option.trim() : option?.effort?.trim() || option?.id?.trim() || "";
+    if (!id || seen.has(id)) return [];
+    seen.add(id);
+    return [{
+      id,
+      label: typeof option?.label === "string" && option.label.trim() ? option.label.trim() : codexReasoningEffortLabels.get(id) ?? id,
+      description: typeof option?.description === "string" ? option.description.trim() : "",
+    }];
+  });
+}
+
+function normalizeReasoningEffort(effort, options) {
+  const normalized = typeof effort === "string" ? effort.trim() : "";
+  return normalized && options.some((option) => option.id === normalized) ? normalized : null;
 }
 
 function localCodexDefaultModelId() {

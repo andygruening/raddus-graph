@@ -75,7 +75,7 @@ npm run build
 
 ## Local Data
 
-By default, Raddus Graph stores local runtime data in `.raddus-graph/` under the directory where the server command is launched. Override this with:
+By default, Raddus Graph stores local runtime data in `~/.raddus-graph/`. Override this with:
 
 ```shell
 RADDUS_GRAPH_DIR=/path/to/.raddus-graph raddus-graph

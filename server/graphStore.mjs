@@ -1,7 +1,7 @@
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { graphDataDir } from "./config.mjs";
-import { normalizeModelId } from "./modelCatalog.mjs";
+import { normalizeModelId, normalizeModelReasoningEffort } from "./modelCatalog.mjs";
 
 export const graphStateFile = join(graphDataDir, "state.json");
 export const graphSessionsDir = join(graphDataDir, "sessions");
@@ -376,10 +376,15 @@ function normalizeAgents(value) {
     const id = stringValue(record.id) || cryptoId("agent");
     if (seen.has(id)) return [];
     seen.add(id);
+    const model = normalizeModelId(record.model);
     return [{
       id,
       name: stringValue(record.name) || "Untitled agent",
-      model: normalizeModelId(record.model),
+      model,
+      modelReasoningEffort: normalizeModelReasoningEffort(
+        model,
+        record.modelReasoningEffort ?? record.model_reasoning_effort ?? record.reasoningEffort ?? record.reasoning_effort,
+      ),
       systemPrompt: stringValue(record.systemPrompt ?? record.system_prompt),
       createdAt: stringValue(record.createdAt) || new Date().toISOString(),
       updatedAt: stringValue(record.updatedAt) || new Date().toISOString(),

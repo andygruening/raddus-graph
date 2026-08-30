@@ -1,3 +1,4 @@
+import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -12,5 +13,5 @@ export const removedCanvasRoutes = new Set(["api-keys", "chat", "integrations", 
 
 function resolveGraphDataDir() {
   if (process.env.RADDUS_GRAPH_DIR) return resolve(process.env.RADDUS_GRAPH_DIR);
-  return resolve(process.cwd(), ".raddus-graph");
+  return resolve(homedir(), ".raddus-graph");
 }

@@ -18,6 +18,24 @@ test("codex runner args use the current noninteractive approval flag", () => {
   assert.equal(args[args.length - 1], "-");
 });
 
+test("codex runner args include explicit reasoning effort when selected", () => {
+  const { args } = cliArgsForRunner(
+    "codex",
+    { model: "gpt-5.6-sol", modelReasoningEffort: "xhigh" },
+    "/tmp/raddus-workspace",
+    "Run the graph.",
+  );
+
+  assert.deepEqual(args.slice(0, 6), [
+    "exec",
+    "--model",
+    "gpt-5.6-sol",
+    "-c",
+    'model_reasoning_effort="xhigh"',
+    "--cd",
+  ]);
+});
+
 test("status file parser accepts newline-delimited JSON callbacks", () => {
   const { payloads, errors } = statusPayloadsFromText([
     '{"state":"working","summary":"Started implementation."}',

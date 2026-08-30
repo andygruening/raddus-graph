@@ -33,6 +33,7 @@ import {
   type GraphState,
   type ModelCatalogEntry,
   type ProjectRecord,
+  type ReasoningEffortOption,
   type RepositoryListResult,
   type RepositoryOption,
   type ResultDefinition,
@@ -73,7 +74,7 @@ type ConfirmationState = {
   confirmLabel: string;
   onConfirm: () => void;
 } | null;
-type AgentDraft = Pick<AgentSpec, "name" | "model" | "systemPrompt">;
+type AgentDraft = Pick<AgentSpec, "name" | "model" | "modelReasoningEffort" | "systemPrompt">;
 type ProjectDraft = Pick<ProjectRecord, "name">;
 type PaletteItem =
   | { type: "agent"; agentId: string }
@@ -138,7 +139,6 @@ export default function App() {
   const [selectedEdgeId, setSelectedEdgeId] = React.useState<string | null>(null);
   const [hoveredEdgeId, setHoveredEdgeId] = React.useState<string | null>(null);
   const [hoveredEdgeControlId, setHoveredEdgeControlId] = React.useState<string | null>(null);
-  const [nodeDropTargetId, setNodeDropTargetId] = React.useState<string | null>(null);
   const [connectingFromId, setConnectingFromId] = React.useState<string | null>(null);
   const [draggingPaletteItemKey, setDraggingPaletteItemKey] = React.useState<string | null>(null);
   const [paletteDragPreview, setPaletteDragPreview] = React.useState<PaletteDragPreview | null>(null);
@@ -337,6 +337,7 @@ export default function App() {
       id: newId("agent"),
       name,
       model,
+      modelReasoningEffort: normalizeDraftModelReasoningEffort(model, draft.modelReasoningEffort, models),
       systemPrompt: draft.systemPrompt.trim(),
       createdAt: now,
       updatedAt: now,
@@ -351,9 +352,21 @@ export default function App() {
   function updateAgent(agentId: string, patch: Partial<AgentSpec>) {
     mutateState((current) => ({
       ...current,
-      agents: current.agents.map((agent) => (
-        agent.id === agentId ? { ...agent, ...patch, updatedAt: new Date().toISOString() } : agent
-      )),
+      agents: current.agents.map((agent) => {
+        if (agent.id !== agentId) return agent;
+        const model = (patch.model ?? agent.model).trim();
+        return {
+          ...agent,
+          ...patch,
+          model,
+          modelReasoningEffort: normalizeDraftModelReasoningEffort(
+            model,
+            "modelReasoningEffort" in patch ? patch.modelReasoningEffort : agent.modelReasoningEffort,
+            models,
+          ),
+          updatedAt: new Date().toISOString(),
+        };
+      }),
     }));
   }
 
@@ -609,16 +622,6 @@ export default function App() {
     });
   }
 
-  function connectDroppedNodes(draggedId: string, targetId: string) {
-    mutateState((current) => {
-      const dragged = current.graph.nodes.find((node) => node.id === draggedId);
-      const target = current.graph.nodes.find((node) => node.id === targetId);
-      const edge = dragged && target ? edgeForDrop(current, dragged, target) : null;
-      if (!edge) return current;
-      return withGraphEdge(current, edge);
-    });
-  }
-
   async function runPlayNode(node: GraphNode) {
     const current = latestState.current;
     if (!current || node.type !== "play") return;
@@ -737,7 +740,11 @@ export default function App() {
   }
 
   function beginNodeDrag(event: React.PointerEvent<HTMLElement>, nodeId: string) {
-    if (eventTargetClosest(event.target, "button, input, select, textarea, .project-connector, .node-editor-control")) return;
+    if (eventTargetClosest(event.target, "button, input, select, textarea, .node-editor-control")) return;
+    if (event.shiftKey) {
+      beginConnection(event, nodeId);
+      return;
+    }
     const current = latestState.current;
     const node = current?.graph.nodes.find((item) => item.id === nodeId);
     if (!node) return;
@@ -749,7 +756,6 @@ export default function App() {
     suppressNodeClickRef.current = false;
     setSelectedEdgeId(null);
     setDraggingNodeId(nodeId);
-    setNodeDropTargetId(null);
     event.currentTarget.setPointerCapture(event.pointerId);
 
     function onMove(moveEvent: PointerEvent) {
@@ -757,19 +763,12 @@ export default function App() {
       if (moved) suppressNodeClickRef.current = true;
       const nextWorld = screenToWorld(moveEvent.clientX, moveEvent.clientY);
       moveNodeLocally(nodeId, Math.round(nextWorld.x - offsetX), Math.round(nextWorld.y - offsetY));
-      setNodeDropTargetId(moved ? nodeIdAtPoint(moveEvent.clientX, moveEvent.clientY) : null);
     }
 
-    function onUp(upEvent: PointerEvent) {
-      const targetNodeId = suppressNodeClickRef.current ? nodeIdAtPoint(upEvent.clientX, upEvent.clientY) : null;
+    function onUp() {
       setDraggingNodeId(null);
-      setNodeDropTargetId(null);
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
-      if (targetNodeId && targetNodeId !== nodeId) {
-        connectDroppedNodes(nodeId, targetNodeId);
-        return;
-      }
       const latest = latestState.current;
       if (latest) void persistState(latest);
     }
@@ -857,6 +856,7 @@ export default function App() {
   function beginConnection(event: React.PointerEvent, nodeId: string) {
     event.preventDefault();
     event.stopPropagation();
+    suppressNodeClickRef.current = true;
     setSelectedEdgeId(null);
     setConnectingFromId(nodeId);
     updateConnectionPreview(event.clientX, event.clientY);
@@ -1066,7 +1066,7 @@ export default function App() {
         <div className="workspace">
           <section className="projects-view">
             <div
-              className={`project-canvas ${connectingFromId ? "connecting" : ""} ${draggingPaletteItemKey ? "palette-dragging" : ""} ${paletteDragPreview ? "palette-drop-ready" : ""} ${draggingNodeId ? "node-dragging" : ""} ${draggingEdgeId || draggingEdgeAnchor ? "edge-dragging" : ""}`}
+              className={`project-canvas ${connectingFromId ? "connecting" : ""} ${draggingPaletteItemKey ? "palette-dragging" : ""} ${paletteDragPreview ? "palette-drop-ready" : ""} ${draggingEdgeId || draggingEdgeAnchor ? "edge-dragging" : ""}`}
               ref={canvasRef}
               onPointerDown={handleCanvasPointerDown}
               onWheel={handleCanvasWheel}
@@ -1308,19 +1308,14 @@ export default function App() {
 
                 {state?.graph.nodes.map((node, nodeIndex) => {
                   const connectingFrom = connectingFromId ? state.graph.nodes.find((item) => item.id === connectingFromId) : undefined;
-                  const draggingNode = draggingNodeId ? state.graph.nodes.find((item) => item.id === draggingNodeId) : undefined;
                   const connectionState =
                     connectingFrom && connectingFrom.id === node.id
                       ? "source"
                       : connectingFrom
                         ? edgeForConnection(state, connectingFrom, node) ? "valid" : "invalid"
-                        : draggingNode && draggingNode.id === node.id
-                          ? "source"
-                          : draggingNode
-                            ? edgeForDrop(state, draggingNode, node) ? "valid" : "invalid"
-                            : paletteDragPreview?.connection?.targetNodeId === node.id
-                              ? "valid"
-                              : "idle";
+                        : paletteDragPreview?.connection?.targetNodeId === node.id
+                          ? "valid"
+                          : "idle";
                   const latestAgentSession = executionView?.latestAgentSessionByNodeId.get(node.id) ?? null;
                   return (
                     <ProjectNodeCard
@@ -1328,14 +1323,11 @@ export default function App() {
                       node={node}
                       state={state}
                       dragging={draggingNodeId === node.id}
-                      dropTarget={nodeDropTargetId === node.id}
                       connectionState={connectionState}
                       running={runningPlayNodeId === node.id}
-                      latestStatus={latestAgentSession ? latestAgentSessionStatus(latestAgentSession) : null}
                       executionClassName={nodeExecutionClass(node.id, executionView)}
                       executionBadge={executionView?.executionBadgesByNodeId.get(node.id) ?? null}
                       onPointerDown={(event) => beginNodeDrag(event, node.id)}
-                      onConnectorPointerDown={(event) => beginConnection(event, node.id)}
                       onRemove={() => requestDeleteNode(node.id)}
                       onOpen={() => {
                         if (followedSession && latestAgentSession) {
@@ -1458,14 +1450,11 @@ function ProjectNodeCard({
   node,
   state,
   dragging,
-  dropTarget,
   connectionState,
   running,
-  latestStatus,
   executionClassName,
   executionBadge,
   onPointerDown,
-  onConnectorPointerDown,
   onRemove,
   onOpen,
   onPlayPromptChange,
@@ -1476,14 +1465,11 @@ function ProjectNodeCard({
   node: GraphNode;
   state: GraphState;
   dragging: boolean;
-  dropTarget: boolean;
   connectionState: ConnectionState;
   running: boolean;
-  latestStatus: AgentSessionStatus | null;
   executionClassName: string;
   executionBadge: string | null;
   onPointerDown: (event: React.PointerEvent<HTMLElement>) => void;
-  onConnectorPointerDown: (event: React.PointerEvent) => void;
   onRemove: () => void;
   onOpen: () => void;
   onPlayPromptChange: (prompt: string) => void;
@@ -1493,7 +1479,6 @@ function ProjectNodeCard({
 }) {
   const agent = node.type === "agent" ? state.agents.find((record) => record.id === node.agentId) : undefined;
   const expressionResultId = node.type === "expression" ? selectedRouteResultForExpression(state, node.id) : "";
-  const statusTitle = latestStatus ? `${latestStatus.state}: ${latestStatus.summary || latestStatus.routeReason || "status"}` : "";
   const playRepositoryLabel = node.type === "play"
     ? node.repository
       ? `${node.repository} · ${node.branch || "default branch"}`
@@ -1502,11 +1487,11 @@ function ProjectNodeCard({
 
   return (
     <article
-      className={`project-node ${node.type} ${executionClassName} ${dragging ? "dragging" : ""} ${dropTarget ? "drop-target" : ""} ${running ? "running" : ""} connect-${connectionState}`}
+      className={`project-node ${node.type} ${executionClassName} ${dragging ? "dragging" : ""} ${running ? "running" : ""} connect-${connectionState}`}
       style={{ left: node.x, top: node.y, animationDelay: `${enterDelayMs}ms` }}
       onPointerDown={onPointerDown}
       onClick={(event) => {
-        if (eventTargetClosest(event.target, "button, input, select, textarea, .project-connector, .node-editor-control")) return;
+        if (eventTargetClosest(event.target, "button, input, select, textarea, .node-editor-control")) return;
         if (shouldSuppressClick()) return;
         onOpen();
       }}
@@ -1515,59 +1500,62 @@ function ProjectNodeCard({
       {executionBadge ? <span className="execution-badge">{executionBadge}</span> : null}
       {node.type === "agent" ? (
         <>
+          <button className="icon-button compact-icon project-card-remove" type="button" onClick={onRemove} title="Remove card" aria-label="Remove card">
+            <X size={12} aria-hidden="true" />
+          </button>
+          <div className="project-node-identity">
+            <span className="project-node-identity-main">
+              <Bot size={16} aria-hidden="true" />
+              <strong>{agent?.name ?? "Unassigned agent"}</strong>
+            </span>
+          </div>
+        </>
+      ) : node.type === "play" ? (
+        <>
           <div className="project-node-head">
-            <span>Agent</span>
-            <button className="project-connector" type="button" onPointerDown={onConnectorPointerDown} title="Drag to connect" aria-label="Drag to connect" />
+            <span>Play</span>
             <button className="icon-button compact-icon project-card-remove" type="button" onClick={onRemove} title="Remove card" aria-label="Remove card">
               <X size={12} aria-hidden="true" />
             </button>
           </div>
-          <div className="agent-node-name">
-            <strong>{agent?.name ?? "Unassigned agent"}</strong>
-            {latestStatus ? <span className={`node-status-light ${latestStatus.state}`} title={statusTitle} aria-label={statusTitle} /> : null}
+          <div className="project-play-body">
+            <div className="project-play-controls">
+              <input
+                className="project-play-prompt"
+                value={node.prompt ?? ""}
+                onChange={(event) => onPlayPromptChange(event.target.value)}
+                placeholder="First prompt"
+                onPointerDown={(event) => event.stopPropagation()}
+              />
+              <button
+                className="project-play-button"
+                type="button"
+                title="Start graph session"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  onRunPlay();
+                }}
+                disabled={running}
+              >
+                {running ? <Loader2 className="spin" size={18} aria-hidden="true" /> : <Play size={19} aria-hidden="true" />}
+              </button>
+            </div>
+            <div className="project-play-repository" title={playRepositoryLabel}>
+              {playRepositoryLabel}
+            </div>
           </div>
         </>
       ) : (
         <>
-          <div className="project-node-head">
-            <span>{node.type === "play" ? "Play" : "Expression"}</span>
-            <button className="project-connector" type="button" onPointerDown={onConnectorPointerDown} title="Drag to connect" aria-label="Drag to connect" />
-            <button className="icon-button compact-icon project-card-remove" type="button" onClick={onRemove} title="Remove card" aria-label="Remove card">
-              <X size={12} aria-hidden="true" />
-            </button>
+          <button className="icon-button compact-icon project-card-remove" type="button" onClick={onRemove} title="Remove card" aria-label="Remove card">
+            <X size={12} aria-hidden="true" />
+          </button>
+          <div className="project-node-identity">
+            <span className="project-node-identity-main">
+              <Braces size={16} aria-hidden="true" />
+              <strong>{expressionResultId}</strong>
+            </span>
           </div>
-          {node.type === "play" ? (
-            <div className="project-play-body">
-              <div className="project-play-controls">
-                <input
-                  className="project-play-prompt"
-                  value={node.prompt ?? ""}
-                  onChange={(event) => onPlayPromptChange(event.target.value)}
-                  placeholder="First prompt"
-                  onPointerDown={(event) => event.stopPropagation()}
-                />
-                <button
-                  className="project-play-button"
-                  type="button"
-                  title="Start graph session"
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    onRunPlay();
-                  }}
-                  disabled={running}
-                >
-                  {running ? <Loader2 className="spin" size={18} aria-hidden="true" /> : <Play size={19} aria-hidden="true" />}
-                </button>
-              </div>
-              <div className="project-play-repository" title={playRepositoryLabel}>
-                {playRepositoryLabel}
-              </div>
-            </div>
-          ) : (
-            <div className="expression-node-body">
-              <strong className="expression-result-id">{expressionResultId}</strong>
-            </div>
-          )}
         </>
       )}
     </article>
@@ -1698,7 +1686,7 @@ function PaletteAgentButton({
       <Bot size={16} aria-hidden="true" />
       <span>
         <strong>{agent.name}</strong>
-        <small>{agent.model}</small>
+        <small>{agentModelSummary(agent)}</small>
       </span>
       <button
         className="icon-button compact-icon palette-remove-button"
@@ -1845,6 +1833,7 @@ function AgentDialog({
   const [draft, setDraft] = React.useState<AgentDraft>(() => ({
     name: agent?.name ?? "",
     model: agent?.model ?? models[0]?.id ?? "gpt-5.5",
+    modelReasoningEffort: agent?.modelReasoningEffort ?? null,
     systemPrompt: agent?.systemPrompt ?? "",
   }));
 
@@ -1852,11 +1841,27 @@ function AgentDialog({
     setDraft({
       name: agent?.name ?? "",
       model: agent?.model ?? models[0]?.id ?? "gpt-5.5",
+      modelReasoningEffort: agent?.modelReasoningEffort ?? null,
       systemPrompt: agent?.systemPrompt ?? "",
     });
   }, [agent, models]);
 
   if (editing && !agent) return null;
+
+  const selectedModel = modelEntryForId(models, draft.model);
+  const reasoningEfforts = selectedModel?.runner === "codex" ? selectedModel.reasoningEfforts ?? [] : [];
+  const selectedReasoningEffort = reasoningEfforts.some((option) => option.id === draft.modelReasoningEffort) ? draft.modelReasoningEffort ?? "" : "";
+
+  function setModel(modelId: string) {
+    const nextModel = modelEntryForId(models, modelId);
+    setDraft({
+      ...draft,
+      model: modelId,
+      modelReasoningEffort: nextModel?.runner === "codex"
+        ? normalizeDraftModelReasoningEffort(modelId, draft.modelReasoningEffort, models)
+        : null,
+    });
+  }
 
   return (
     <Modal title={editing ? "Agent details" : "Create agent"} onClose={onClose}>
@@ -1874,7 +1879,7 @@ function AgentDialog({
           </label>
           <label>
             <span>Model</span>
-            <select value={draft.model} onChange={(event) => setDraft({ ...draft, model: event.target.value })} required>
+            <select value={draft.model} onChange={(event) => setModel(event.target.value)} required>
               {models.map((model) => (
                 <option key={model.id} value={model.id}>
                   {model.label} ({model.runner})
@@ -1882,6 +1887,19 @@ function AgentDialog({
               ))}
             </select>
           </label>
+          {reasoningEfforts.length > 0 ? (
+            <label>
+              <span>Reasoning</span>
+              <select value={selectedReasoningEffort} onChange={(event) => setDraft({ ...draft, modelReasoningEffort: event.target.value || null })}>
+                <option value="">Default</option>
+                {reasoningEfforts.map((option) => (
+                  <option key={option.id} value={option.id}>
+                    {reasoningEffortOptionLabel(option)}
+                  </option>
+                ))}
+              </select>
+            </label>
+          ) : null}
           <label>
             <span>System prompt</span>
             <textarea rows={9} value={draft.systemPrompt} onChange={(event) => setDraft({ ...draft, systemPrompt: event.target.value })} />
@@ -2531,14 +2549,6 @@ function paletteAvailableNeighborPosition(state: GraphState, x: number, preferre
   return { x, y: Math.round(preferredY + slotStep * (slotOffsets.length + 1)) };
 }
 
-function edgeForDrop(
-  state: GraphState,
-  dragged: GraphNode,
-  target: GraphNode,
-): Omit<GraphEdge, "id"> | null {
-  return edgeForConnection(state, dragged, target) ?? edgeForConnection(state, target, dragged);
-}
-
 function edgeForConnection(
   state: GraphState,
   source: GraphNode,
@@ -2758,6 +2768,46 @@ function defaultProjectGraph(): GraphDocument {
 
 function eventTargetClosest(target: EventTarget | null, selector: string): Element | null {
   return target instanceof Element ? target.closest(selector) : null;
+}
+
+function modelEntryForId(models: ModelCatalogEntry[], modelId: string): ModelCatalogEntry | null {
+  return models.find((model) => model.id === modelId) ?? null;
+}
+
+function normalizeDraftModelReasoningEffort(modelId: string, effort: string | null | undefined, models: ModelCatalogEntry[]): string | null {
+  const normalized = typeof effort === "string" ? effort.trim() : "";
+  const model = modelEntryForId(models, modelId);
+  if (!normalized || model?.runner !== "codex") return null;
+  return model.reasoningEfforts?.some((option) => option.id === normalized) ? normalized : null;
+}
+
+function reasoningEffortOptionLabel(option: ReasoningEffortOption) {
+  return option.description ? `${option.label} - ${option.description}` : option.label;
+}
+
+function reasoningEffortName(effort: string) {
+  switch (effort) {
+    case "minimal":
+      return "Minimal";
+    case "low":
+      return "Low";
+    case "medium":
+      return "Medium";
+    case "high":
+      return "High";
+    case "xhigh":
+      return "Extra high";
+    case "max":
+      return "Max";
+    case "ultra":
+      return "Ultra";
+    default:
+      return effort;
+  }
+}
+
+function agentModelSummary(agent: AgentSpec) {
+  return agent.modelReasoningEffort ? `${agent.model} · ${reasoningEffortName(agent.modelReasoningEffort)}` : agent.model;
 }
 
 function nodeLabel(node: GraphNode, state: GraphState) {

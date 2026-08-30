@@ -544,12 +544,12 @@ a:focus-visible {
 }
 
 .project-edge-group.execution-visited-route {
-  --edge-color: var(--success-fg);
-  opacity: 0.72;
+  --edge-color: var(--edge-blue);
+  opacity: 0.8;
 }
 
 .project-edge-group.execution-active-route {
-  --edge-color: var(--success-fg);
+  --edge-color: var(--edge-blue);
   opacity: 1;
 }
 
@@ -568,7 +568,7 @@ a:focus-visible {
 
 .project-edge-group.execution-visited-route .project-edge {
   stroke-width: 2.35;
-  filter: drop-shadow(0 0 5px color-mix(in srgb, var(--success-fg) 22%, transparent));
+  filter: drop-shadow(0 0 5px color-mix(in srgb, var(--edge-color) 24%, transparent));
 }
 
 .project-edge-arrow {
@@ -580,7 +580,7 @@ a:focus-visible {
 
 .project-edge-group.execution-visited-route .project-edge-arrow {
   opacity: 1;
-  filter: drop-shadow(0 0 5px color-mix(in srgb, var(--success-fg) 26%, transparent));
+  filter: drop-shadow(0 0 5px color-mix(in srgb, var(--edge-color) 28%, transparent));
 }
 
 .project-edge-preview {
@@ -633,13 +633,13 @@ a:focus-visible {
   stroke-width: 3.2;
   stroke-dasharray: 18 14;
   stroke-dashoffset: 0;
-  filter: drop-shadow(0 0 9px color-mix(in srgb, var(--success-fg) 48%, transparent));
+  filter: drop-shadow(0 0 9px color-mix(in srgb, var(--edge-color) 48%, transparent));
   animation: executionRouteFlow 1.25s linear infinite;
 }
 
 .project-edge-group.execution-active-route .project-edge-arrow {
   opacity: 1;
-  filter: drop-shadow(0 0 8px color-mix(in srgb, var(--success-fg) 48%, transparent));
+  filter: drop-shadow(0 0 8px color-mix(in srgb, var(--edge-color) 48%, transparent));
 }
 
 .project-edge-group.dragging .project-edge-hit {
@@ -704,7 +704,7 @@ a:focus-visible {
 
 .project-edge-group.execution-visited-route .project-edge-label,
 .project-edge-group.execution-active-route .project-edge-label {
-  fill: var(--success-fg);
+  fill: var(--edge-color);
 }
 
 .project-node {
@@ -733,24 +733,22 @@ a:focus-visible {
 }
 
 .project-node.execution-visited {
-  border-color: color-mix(in srgb, var(--success-fg) 26%, var(--border-subtle));
+  border-color: color-mix(in srgb, var(--node-accent, var(--success-fg)) 48%, var(--border-subtle));
 }
 
 .project-node.execution-previous,
 .project-node.execution-expression {
   z-index: 2;
-  border-color: color-mix(in srgb, var(--success-fg) 58%, var(--border-subtle));
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--success-fg) 12%, transparent), var(--popover-shadow);
-}
-
-.project-node.execution-expression {
-  background: color-mix(in srgb, var(--success-soft) 36%, var(--surface-bg));
+  border-color: var(--node-accent, var(--success-fg));
+  border-width: 2px;
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--node-accent, var(--success-fg)) 12%, transparent), var(--popover-shadow);
 }
 
 .project-node.execution-active {
   z-index: 3;
-  border-color: var(--success-fg);
-  box-shadow: 0 0 0 4px color-mix(in srgb, var(--success-fg) 18%, transparent), 0 0 24px color-mix(in srgb, var(--success-fg) 34%, transparent), var(--modal-shadow);
+  border-color: var(--node-accent, var(--success-fg));
+  border-width: 2px;
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--node-accent, var(--success-fg)) 18%, transparent), 0 0 24px color-mix(in srgb, var(--node-accent, var(--success-fg)) 34%, transparent), var(--modal-shadow);
   animation: executionNodePulse 2s ease-in-out infinite;
 }
 
@@ -769,6 +767,7 @@ a:focus-visible {
 }
 
 .execution-badge {
+  --badge-accent: var(--node-accent, #5f9dea);
   position: absolute;
   top: -10px;
   right: -10px;
@@ -777,14 +776,14 @@ a:focus-visible {
   display: inline-grid;
   place-items: center;
   padding: 0 6px;
-  border: 1px solid color-mix(in srgb, var(--success-fg) 44%, var(--surface-bg));
+  border: 1px solid color-mix(in srgb, var(--badge-accent) 52%, var(--surface-bg));
   border-radius: 999px;
   background: var(--surface-bg);
-  color: var(--success-fg);
+  color: var(--badge-accent);
   font-size: 11px;
   font-weight: 900;
   line-height: 1;
-  box-shadow: 0 7px 18px rgba(18, 71, 140, 0.16);
+  box-shadow: 0 7px 18px color-mix(in srgb, var(--badge-accent) 20%, transparent);
   pointer-events: none;
 }
 
@@ -803,11 +802,6 @@ a:focus-visible {
     border-color var(--motion-hover),
     box-shadow var(--motion-hover),
     transform var(--motion-hover);
-}
-
-.project-node.drop-target {
-  border-color: var(--success-fg);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--success-fg) 18%, transparent), var(--popover-shadow);
 }
 
 .project-node.palette-node-preview {
@@ -863,20 +857,25 @@ a:focus-visible {
 }
 
 .project-node.agent {
-  width: 180px;
-  min-height: 88px;
+  --node-accent: var(--brand);
+  border-color: var(--node-accent);
+  width: 168px;
+  height: 72px;
+  min-height: 72px;
   align-content: center;
-  gap: 8px;
-  padding: 12px;
+  gap: 0;
+  padding: 10px;
 }
 
 .project-node.expression {
-  width: 220px;
-  height: 88px;
-  min-height: 88px;
+  --node-accent: #7c3aed;
+  border-color: var(--node-accent);
+  width: 168px;
+  height: 72px;
+  min-height: 72px;
   align-content: center;
-  gap: 8px;
-  padding: 12px;
+  gap: 0;
+  padding: 10px;
   overflow: hidden;
 }
 
@@ -885,112 +884,79 @@ a:focus-visible {
   align-items: center;
   justify-content: space-between;
   gap: 10px;
+  padding-right: 24px;
   color: var(--secondary-text);
   font-size: 12px;
   font-weight: 800;
   text-transform: uppercase;
 }
 
-.agent-node-name {
+.project-node-identity {
+  width: 100%;
+  height: 100%;
   min-width: 0;
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  position: relative;
+  display: flex;
   align-items: center;
+  justify-content: center;
+}
+
+.project-node-identity-main {
+  max-width: 100%;
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   gap: 8px;
 }
 
-.agent-node-name strong {
+.project-node-identity-main > svg {
+  flex: 0 0 auto;
+  color: var(--node-accent, var(--secondary-text));
+}
+
+.project-node-identity strong {
+  display: block;
+  flex: 0 1 auto;
   min-width: 0;
+  max-width: calc(100% - 24px);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   font-size: 15px;
 }
 
-.node-status-light {
-  width: 10px;
-  height: 10px;
-  border-radius: 999px;
-  background: var(--secondary-text);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--secondary-text) 12%, transparent);
-}
-
-.node-status-light.started,
-.node-status-light.working,
-.node-status-light.queued {
-  background: var(--info-fg);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--info-fg) 14%, transparent);
-  animation: edgeStatusPulse 1.55s ease-in-out infinite;
-}
-
-.node-status-light.completed {
-  background: var(--success-fg);
-}
-
-.node-status-light.failed,
-.node-status-light.blocked {
-  background: var(--danger-fg);
-}
-
-.node-status-light.stopped {
-  background: var(--secondary-text);
-}
-
 .project-card-remove {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 2;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
   background: color-mix(in srgb, var(--surface-bg) 88%, transparent);
-}
-
-.project-connector {
-  width: 14px;
-  height: 14px;
-  margin-left: auto;
-  padding: 0;
-  border: 2px solid var(--brand-border);
-  border-radius: 999px;
-  background: var(--surface-bg);
-  box-shadow: 0 0 0 3px var(--brand-surface);
-  cursor: crosshair;
   transition:
-    background var(--motion-hover),
-    border-color var(--motion-hover),
-    box-shadow var(--motion-hover),
-    transform var(--motion-hover);
+    opacity var(--motion-hover),
+    visibility var(--motion-hover),
+    transform var(--motion-hover),
+    background var(--motion-hover);
+  transform: scale(0.94);
 }
 
-.project-connector:hover,
-.project-connector:focus-visible {
-  border-color: var(--brand-hover);
-  background: var(--brand-surface);
-  transform: scale(1.08);
+.project-node:hover .project-card-remove,
+.project-node:focus-within .project-card-remove {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+  transform: scale(1);
 }
 
-.project-canvas.connecting .project-node.connect-valid .project-connector {
-  border-color: var(--success-fg);
-  background: var(--success-soft);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--success-fg) 18%, transparent);
-  animation: connectorValidPulse 1.25s ease-in-out infinite;
-}
-
-.project-canvas.palette-dragging .project-node.connect-valid:not(.palette-node-preview),
-.project-canvas.node-dragging .project-node.connect-valid:not(.palette-node-preview) {
+.project-canvas.palette-dragging .project-node.connect-valid:not(.palette-node-preview) {
   border-color: color-mix(in srgb, var(--success-fg) 38%, var(--border-subtle));
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--success-fg) 10%, transparent), var(--popover-shadow);
 }
 
-.project-canvas.connecting .project-node.connect-invalid .project-connector {
-  border-color: var(--danger-fg);
-  background: var(--danger-soft);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--danger-fg) 16%, transparent);
-}
-
-.project-canvas.connecting .project-node.connect-source .project-connector {
-  border-color: var(--brand-hover);
-  background: var(--brand-surface);
-  animation: connectorSourcePulse 1.25s ease-in-out infinite;
-}
-
-.project-canvas.connecting .project-node,
-.project-canvas.node-dragging .project-node {
+.project-canvas.connecting .project-node {
   outline: 1px dashed var(--border-subtle);
   outline-offset: 3px;
 }
@@ -1000,8 +966,7 @@ a:focus-visible {
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--success-fg) 10%, transparent), var(--popover-shadow);
 }
 
-.project-canvas.connecting .project-node.connect-invalid:not(.connect-source),
-.project-canvas.node-dragging .project-node.connect-invalid:not(.connect-source) {
+.project-canvas.connecting .project-node.connect-invalid:not(.connect-source) {
   opacity: 0.58;
 }
 
@@ -1059,28 +1024,6 @@ a:focus-visible {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.expression-node-body {
-  min-width: 0;
-  display: grid;
-  gap: 0;
-  color: var(--primary-text);
-  overflow: hidden;
-}
-
-.expression-node-body strong,
-.expression-result-id {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 15px;
-}
-
-.expression-result-id {
-  color: var(--primary-text);
-  font-family: var(--font-mono);
 }
 
 .project-card-palette {
@@ -1972,18 +1915,6 @@ textarea:focus {
   }
 }
 
-@keyframes edgeStatusPulse {
-  0%,
-  100% {
-    stroke-width: 3;
-    filter: drop-shadow(0 0 0 color-mix(in srgb, var(--info-fg) 0%, transparent));
-  }
-  50% {
-    stroke-width: 5;
-    filter: drop-shadow(0 0 8px color-mix(in srgb, var(--info-fg) 42%, transparent));
-  }
-}
-
 @keyframes executionRouteFlow {
   to {
     stroke-dashoffset: -32;
@@ -1993,36 +1924,16 @@ textarea:focus {
 @keyframes executionNodePulse {
   0%,
   100% {
-    box-shadow: 0 0 0 4px color-mix(in srgb, var(--success-fg) 16%, transparent), 0 0 18px color-mix(in srgb, var(--success-fg) 24%, transparent), var(--modal-shadow);
+    box-shadow: 0 0 0 4px color-mix(in srgb, var(--node-accent, var(--success-fg)) 16%, transparent), 0 0 18px color-mix(in srgb, var(--node-accent, var(--success-fg)) 24%, transparent), var(--modal-shadow);
   }
   50% {
-    box-shadow: 0 0 0 7px color-mix(in srgb, var(--success-fg) 22%, transparent), 0 0 32px color-mix(in srgb, var(--success-fg) 42%, transparent), var(--modal-shadow);
+    box-shadow: 0 0 0 7px color-mix(in srgb, var(--node-accent, var(--success-fg)) 22%, transparent), 0 0 32px color-mix(in srgb, var(--node-accent, var(--success-fg)) 42%, transparent), var(--modal-shadow);
   }
 }
 
 @keyframes connectionPreviewFlow {
   to {
     stroke-dashoffset: -13;
-  }
-}
-
-@keyframes connectorSourcePulse {
-  0%,
-  100% {
-    box-shadow: 0 0 0 3px var(--brand-surface);
-  }
-  50% {
-    box-shadow: 0 0 0 5px color-mix(in srgb, var(--brand) 18%, transparent);
-  }
-}
-
-@keyframes connectorValidPulse {
-  0%,
-  100% {
-    box-shadow: 0 0 0 3px color-mix(in srgb, var(--success-fg) 18%, transparent);
-  }
-  50% {
-    box-shadow: 0 0 0 5px color-mix(in srgb, var(--success-fg) 24%, transparent);
   }
 }
 
