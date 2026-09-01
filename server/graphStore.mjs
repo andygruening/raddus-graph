@@ -5,7 +5,9 @@ import { normalizeModelId, normalizeModelReasoningEffort } from "./modelCatalog.
 
 export const graphStateFile = join(graphDataDir, "state.json");
 export const graphSessionsDir = join(graphDataDir, "sessions");
-export const reservedResultIds = new Set(["unknown", "fallback"]);
+export const reservedResultIds = new Set(["completed", "failed", "ask-for-approval", "default"]);
+export const legacyResultIds = new Set(["unknown", "fallback"]);
+export const nonCompletionResultIds = new Set(["default", "failed"]);
 
 let writeQueue = Promise.resolve();
 
@@ -29,16 +31,37 @@ export async function replaceGraphState(payload) {
     const body = asRecord(payload);
     const selectedProjectId = stringValue(body.selectedProjectId) || current.selectedProjectId;
     const selectedGraph = isPlainRecord(body.graph) ? body.graph : null;
+    const selectedAgents = Array.isArray(body.agents) ? body.agents : null;
+    const selectedResults = Array.isArray(body.results) ? body.results : null;
+    const now = new Date().toISOString();
     const projects = Array.isArray(body.projects)
       ? body.projects.map((project) => {
         const record = asRecord(project);
-        return selectedGraph && stringValue(record.id) === selectedProjectId
-          ? { ...record, graph: selectedGraph, updatedAt: new Date().toISOString() }
-          : project;
+        const id = stringValue(record.id);
+        const currentProject = current.projects.find((candidate) => candidate.id === id) ?? null;
+        const selected = id === selectedProjectId;
+        const graph = selected && selectedGraph ? selectedGraph : isPlainRecord(record.graph) ? record.graph : currentProject?.graph;
+        const agents = selected && selectedAgents ? selectedAgents : Array.isArray(record.agents) ? record.agents : currentProject?.agents;
+        const results = selected && selectedResults ? selectedResults : Array.isArray(record.results) ? record.results : currentProject?.results;
+        const changedSelectedProject = selected && (selectedGraph || selectedAgents || selectedResults);
+        return {
+          ...(currentProject ?? {}),
+          ...record,
+          ...(graph ? { graph } : {}),
+          ...(agents ? { agents } : {}),
+          ...(results ? { results } : {}),
+          updatedAt: changedSelectedProject ? now : stringValue(record.updatedAt) || currentProject?.updatedAt || now,
+        };
       })
       : current.projects.map((project) => (
-        project.id === selectedProjectId && selectedGraph
-          ? { ...project, graph: selectedGraph, updatedAt: new Date().toISOString() }
+        project.id === selectedProjectId && (selectedGraph || selectedAgents || selectedResults)
+          ? {
+            ...project,
+            ...(selectedGraph ? { graph: selectedGraph } : {}),
+            ...(selectedAgents ? { agents: selectedAgents } : {}),
+            ...(selectedResults ? { results: selectedResults } : {}),
+            updatedAt: now,
+          }
           : project
       ));
     const incoming = normalizeGraphData({
@@ -182,7 +205,7 @@ export async function recordAgentSessionStatus(sessionId, agentSessionId, payloa
   const session = await updateGraphSession(sessionId, (current) => {
     const agentSession = current.agentSessions.find((candidate) => candidate.id === agentSessionId);
     if (!agentSession) return current;
-    const resultIds = new Set((current.resultsSnapshot ?? []).map((result) => result.id));
+    const resultIds = new Set((current.resultsSnapshot ?? defaultResultDefinitions()).map((result) => result.id));
     const status = normalizeAgentSessionStatus(payload, current.id, agentSession, resultIds, source);
     recordedStatus = status;
     const terminalOutcome = isTerminalState(status.state) ? terminalOutcomeFromStatus(status) : agentSession.terminalOutcome;
@@ -225,13 +248,23 @@ async function updateAgentSession(sessionId, agentSessionId, update, updatedAt) 
 export function defaultResultDefinitions() {
   return [
     {
-      id: "unknown",
-      description: "System fallback when an agent omits a terminal outcome, exits without one, or emits an unrecognized result.",
+      id: "completed",
+      description: "System route for a successful terminal outcome when no more-specific result is emitted.",
       reserved: true,
     },
     {
-      id: "fallback",
-      description: "System routing fallback when an expression card has no explicit branch for a recognized result.",
+      id: "failed",
+      description: "System route for a failed terminal outcome.",
+      reserved: true,
+    },
+    {
+      id: "ask-for-approval",
+      description: "System route for pausing at a review card to ask for approval.",
+      reserved: true,
+    },
+    {
+      id: "default",
+      description: "System default route for unrecognized results or outcomes without a more-specific branch.",
       reserved: true,
     },
   ];
@@ -243,6 +276,11 @@ export function isTerminalState(state) {
 
 export function normalizeResultId(value) {
   return typeof value === "string" ? value.trim().toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "") : "";
+}
+
+function normalizeStoredResultId(value) {
+  const id = normalizeResultId(value);
+  return legacyResultIds.has(id) ? "default" : id;
 }
 
 export function worktreePathForSession(sessionId) {
@@ -263,16 +301,20 @@ async function writeGraphData(data) {
 function defaultGraphData() {
   const now = new Date().toISOString();
   const graph = defaultGraphDocument();
+  const agents = [];
+  const results = defaultResultDefinitions();
   const project = defaultProjectRecord({
     id: "project-default",
     name: "Default Project",
     graph,
+    agents,
+    results,
     now,
   });
   return {
     version: 1,
-    agents: [],
-    results: defaultResultDefinitions(),
+    agents: project.agents,
+    results: project.results,
     projects: [project],
     selectedProjectId: project.id,
     graph,
@@ -283,13 +325,18 @@ function defaultGraphData() {
 
 function normalizeGraphData(value) {
   const record = asRecord(value);
-  const projects = normalizeProjects(record.projects, record.graph);
+  const legacyAgents = normalizeAgents(record.agents);
+  const legacyResults = normalizeResults(record.results);
+  const projects = normalizeProjects(record.projects, record.graph, {
+    agents: legacyAgents,
+    results: legacyResults,
+  });
   const selectedProjectId = selectedProjectIdValue(record.selectedProjectId, projects);
   const selectedProject = projects.find((project) => project.id === selectedProjectId) ?? projects[0];
   return {
     version: 1,
-    agents: normalizeAgents(record.agents),
-    results: normalizeResults(record.results),
+    agents: selectedProject.agents,
+    results: selectedProject.results,
     projects,
     selectedProjectId: selectedProject.id,
     graph: selectedProject.graph,
@@ -315,39 +362,47 @@ function defaultGraphDocument() {
   };
 }
 
-function defaultProjectRecord({ id, name, graph, now }) {
+function defaultProjectRecord({ id, name, graph, agents = [], results = defaultResultDefinitions(), now }) {
   return {
     id,
     name,
     graph,
+    agents,
+    results,
     lastPlaySelection: null,
     createdAt: now,
     updatedAt: now,
   };
 }
 
-function normalizeProjects(value, legacyGraph) {
+function normalizeProjects(value, legacyGraph, legacyCollections = {}) {
   const now = new Date().toISOString();
+  const legacyAgents = Array.isArray(legacyCollections.agents) ? legacyCollections.agents : [];
+  const legacyResults = Array.isArray(legacyCollections.results) ? legacyCollections.results : defaultResultDefinitions();
   const seen = new Set();
-  const projects = Array.isArray(value)
+  const entries = Array.isArray(value)
     ? value.flatMap((project) => {
       const record = asRecord(project);
       const id = stringValue(record.id) || cryptoId("project");
       if (seen.has(id)) return [];
       seen.add(id);
       const graph = normalizeGraph(record.graph);
-      return [defaultProjectRecord({
-        id,
-        name: stringValue(record.name) || "Untitled Project",
-        graph,
-        now,
-      })];
+      return [{
+        record,
+        project: defaultProjectRecord({
+          id,
+          name: stringValue(record.name) || "Untitled Project",
+          graph,
+          agents: Array.isArray(record.agents) ? normalizeAgents(record.agents) : legacyAgents,
+          results: Array.isArray(record.results) ? normalizeResults(record.results) : legacyResults,
+          now,
+        }),
+      }];
     })
     : [];
 
-  if (projects.length > 0) {
-    return projects.map((project, index) => {
-      const record = asRecord(value[index]);
+  if (entries.length > 0) {
+    return entries.map(({ project, record }) => {
       return {
         ...project,
         lastPlaySelection: normalizePlayLaunchSelection(record.lastPlaySelection, project.graph),
@@ -361,6 +416,8 @@ function normalizeProjects(value, legacyGraph) {
     id: "project-default",
     name: "Default Project",
     graph: normalizeGraph(legacyGraph),
+    agents: legacyAgents,
+    results: legacyResults,
     now,
   })];
 }
@@ -415,7 +472,7 @@ function normalizeResults(value) {
     ? value.flatMap((result) => {
       const record = asRecord(result);
       const id = normalizeResultId(record.id);
-      if (!id || reservedResultIds.has(id) || seen.has(id)) return [];
+      if (!id || legacyResultIds.has(id) || reservedResultIds.has(id) || seen.has(id)) return [];
       seen.add(id);
       return [{
         id,
@@ -456,7 +513,7 @@ function normalizeGraphNode(value) {
       agentId: nullableString(record.agentId),
     } : {}),
     ...(type === "expression" ? {
-      resultId: normalizeResultId(record.resultId) || "unknown",
+      resultId: normalizeStoredResultId(record.resultId) || "default",
     } : {}),
   };
 }
@@ -468,7 +525,7 @@ function normalizeGraphEdge(value, nodeIds) {
   if (!source || !target || !nodeIds.has(source) || !nodeIds.has(target)) return null;
   const type = stringValue(record.type);
   if (type !== "runs" && type !== "evaluates" && type !== "routes") return null;
-  const resultId = normalizeResultId(record.resultId);
+  const resultId = normalizeStoredResultId(record.resultId);
   const bend = normalizePoint(record.bend);
   const waypoints = normalizePoints(record.waypoints);
   const routingMode = edgeRoutingModeValue(record.routingMode);
@@ -699,11 +756,11 @@ function terminalOutcomeFromStatus(status) {
 
 function routeResultForStatus(state, emittedResultId, resultIds) {
   if (state === "stopped") return { routedResultId: null, routeReason: "stopped" };
-  if (state === "failed") return { routedResultId: "unknown", routeReason: "failed" };
+  if (state === "failed") return { routedResultId: "failed", routeReason: "failed" };
   if (state !== "completed") return { routedResultId: null, routeReason: null };
-  if (!emittedResultId) return { routedResultId: "unknown", routeReason: "missing_terminal_result" };
-  if (reservedResultIds.has(emittedResultId)) return { routedResultId: "unknown", routeReason: "reserved_result_emitted" };
-  if (!resultIds.has(emittedResultId)) return { routedResultId: "unknown", routeReason: "unrecognized_result" };
+  if (!emittedResultId) return { routedResultId: "completed", routeReason: "default_completed" };
+  if (legacyResultIds.has(emittedResultId) || nonCompletionResultIds.has(emittedResultId)) return { routedResultId: "default", routeReason: "invalid_completion_result" };
+  if (!resultIds.has(emittedResultId)) return { routedResultId: "default", routeReason: "unrecognized_result" };
   return { routedResultId: emittedResultId, routeReason: "matched_result" };
 }
 

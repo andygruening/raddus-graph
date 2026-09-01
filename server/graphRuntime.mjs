@@ -5,10 +5,10 @@ import {
   addGraphSession,
   createAgentSession,
   deleteGraphSession as deleteStoredGraphSession,
+  nonCompletionResultIds,
   readGraphData,
   recordAgentSessionProcessOutput,
   recordAgentSessionStatus,
-  reservedResultIds,
   sessionRootFor,
   setAgentSessionPrompt,
   updateGraphSession,
@@ -32,6 +32,8 @@ export async function createGraphSession(body) {
   const projectId = nullableString(payload.projectId) ?? state.selectedProjectId;
   const project = state.projects?.find((candidate) => candidate.id === projectId) ?? state.projects?.[0] ?? null;
   const graph = project?.graph ?? state.graph;
+  const agents = project?.agents ?? state.agents;
+  const results = project?.results ?? state.results;
   const playNode = graph.nodes.find((node) => node.id === playNodeId && node.type === "play");
   if (!playNode) throw new Error("Select a play node before running the graph.");
   if (!prompt) throw new Error("Enter a play prompt before running the graph.");
@@ -73,8 +75,8 @@ export async function createGraphSession(body) {
     projectId: project?.id ?? null,
     projectName: project?.name ?? null,
     graphSnapshot: graph,
-    agentsSnapshot: state.agents,
-    resultsSnapshot: state.results,
+    agentsSnapshot: agents,
+    resultsSnapshot: results,
     agentSessions: [],
     pendingReview: null,
     error: null,
@@ -280,7 +282,7 @@ export async function appendCallbackStatus(sessionId, agentSessionId, payload) {
   return recordAgentSessionStatus(sessionId, agentSessionId, payload, "callback");
 }
 
-async function runAgentNode({ session, graph, agents, results, node, upstreamAgentSessionIds, arrival }) {
+async function runAgentNode({ session, graph, agents, results, node, upstreamAgentSessionIds, arrival, userPrompt }) {
   const created = await createAgentSession(session.id, {
     nodeId: node.id,
     agentId: node.agentId,
@@ -443,12 +445,12 @@ export function availableResultsForAgent({ graph, results, node }) {
         const routeTarget = graphNodes.find((candidate) => (
           candidate.id === edge.target && (candidate.type === "agent" || candidate.type === "review")
         ));
-        return edge.resultId && routeTarget && !reservedResultIds.has(edge.resultId) ? [edge.resultId] : [];
+        return edge.resultId && routeTarget && !nonCompletionResultIds.has(edge.resultId) ? [edge.resultId] : [];
       }),
   );
 
   return resultDefinitions
-    .filter((result) => reachableResultIds.has(result.id) && !reservedResultIds.has(result.id))
+    .filter((result) => reachableResultIds.has(result.id) && !nonCompletionResultIds.has(result.id))
     .map((result) => ({
       id: result.id,
       description: result.description,
@@ -487,7 +489,7 @@ function behaviorSection(agent) {
 }
 
 function updatesSection(availableResults) {
-  const completedResultId = availableResults[0]?.id ?? "replace-with-result-id";
+  const completedResultId = availableResults[0]?.id ?? "completed";
   return [
     "Append progress and terminal results as one compact JSON object per line to `$RADDUS_GRAPH_STATUS_FILE`.",
     "Do not write Markdown, comments, or pretty-printed JSON to that file.",
@@ -503,14 +505,15 @@ function updatesSection(availableResults) {
     "",
     "Before your CLI session finishes, append exactly one terminal result with `state` set to `completed` or `failed`.",
     "If that terminal result is meant to pause for user review, put the exact question you want answered in `detail`.",
-    "When `state` is `completed`, use one of these result IDs:",
+    "When `state` is `failed`, omit `resultId`; the graph routes through `failed`.",
+    "When `state` is `completed`, use one of these result IDs when a connected route should run:",
     resultListSection(availableResults),
   ].join("\n");
 }
 
 function resultListSection(availableResults) {
   if (availableResults.length === 0) {
-    return "- No connected custom completed result IDs are defined for this agent. If you complete successfully, omit `resultId`; the graph will route through `unknown`.";
+    return "- No connected completed result IDs are defined for this agent. Use `completed` or omit `resultId`; the graph will route through `completed`.";
   }
   return availableResults.map((result) => `- \`${result.id}\`: ${result.description || "No description."}`).join("\n");
 }
@@ -536,7 +539,7 @@ function historySection({ session, graph, agents, upstreamAgentSessionIds }) {
 }
 
 function historyResultLabel(outcome, fallbackStatus) {
-  if (!outcome) return fallbackStatus || "unknown";
+  if (!outcome) return fallbackStatus || "unavailable";
   const resultId = outcome.emittedResultId || outcome.routedResultId;
   return resultId ? `${outcome.state} / ${resultId}` : outcome.state;
 }
@@ -696,8 +699,8 @@ export function nextGraphRouteFromOutcome({ graph, currentAgentNode, outcome }) 
   if (expressionEntries.length === 0) return null;
 
   const matchingRoute = routeForResult(graph, expressionEntries, routedResultId);
-  const fallbackRoute = routedResultId !== "unknown" ? routeForResult(graph, expressionEntries, "fallback") : null;
-  return matchingRoute ?? fallbackRoute;
+  const defaultRoute = routedResultId !== "default" ? routeForResult(graph, expressionEntries, "default") : null;
+  return matchingRoute ?? defaultRoute;
 }
 
 function routeForResult(graph, expressionEntries, resultId) {
