@@ -57,6 +57,49 @@ test("saving state applies the top-level graph to the selected project", async (
   }
 });
 
+test("saving project state preserves the last play selection", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "raddus-graph-store-"));
+  process.env.RADDUS_GRAPH_DIR = dataDir;
+  try {
+    const store = await import(`../server/graphStore.mjs?graph-store-test=${Date.now()}`);
+    await store.initializeGraphStore();
+
+    const graph = {
+      nodes: [
+        { id: "play-a", type: "play", x: 0, y: 0, prompt: "First", repository: null, branch: null },
+        { id: "play-b", type: "play", x: 240, y: 0, prompt: "Second", repository: "owner/repo", branch: "main" },
+      ],
+      edges: [],
+    };
+    const lastPlaySelection = {
+      playNodeId: "play-b",
+      prompt: "Ship this change",
+      repository: "owner/repo",
+      branch: "feature/play-launch",
+    };
+
+    const saved = await store.replaceGraphState({
+      selectedProjectId: "project-1",
+      projects: [{
+        id: "project-1",
+        name: "Project",
+        graph,
+        lastPlaySelection,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      }],
+      graph,
+      agents: [],
+      results: [],
+    });
+
+    assert.deepEqual(saved.projects[0].lastPlaySelection, lastPlaySelection);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+    delete process.env.RADDUS_GRAPH_DIR;
+  }
+});
+
 test("saving agents preserves supported Codex reasoning effort", async () => {
   const dataDir = await mkdtemp(join(tmpdir(), "raddus-graph-store-"));
   process.env.RADDUS_GRAPH_DIR = dataDir;

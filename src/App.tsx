@@ -3,11 +3,14 @@ import { createPortal } from "react-dom";
 import {
   Bot,
   Braces,
+  CheckCircle2,
+  ChevronDown,
+  ChevronUp,
   CircleDot,
-  Database,
   GitPullRequest,
   Info,
   Layers,
+  List,
   Loader2,
   Menu,
   Play,
@@ -15,11 +18,14 @@ import {
   RefreshCw,
   RotateCcw,
   Save,
+  Settings as SettingsIcon,
   Square,
   Trash2,
+  TriangleAlert,
   X,
 } from "lucide-react";
 import {
+  type AgentCliStatusResult,
   type AgentSession,
   type AgentSessionStatus,
   type AgentSpec,
@@ -28,10 +34,10 @@ import {
   type GraphEdge,
   type GraphDocument,
   type GraphNode,
-  type GraphNodeType,
   type GraphSession,
   type GraphState,
   type ModelCatalogEntry,
+  type PlayLaunchSelection,
   type ProjectRecord,
   type ReasoningEffortOption,
   type RepositoryListResult,
@@ -52,6 +58,7 @@ import {
 
 type PaletteTab = "agents" | "expressions";
 type OverlayPanel = PaletteTab | null;
+type SettingsTab = "projects" | "agents";
 type SaveStatus = "idle" | "saving" | "saved" | "error";
 type CanvasViewport = { x: number; y: number; zoom: number };
 type ConnectionState = "idle" | "source" | "valid" | "invalid";
@@ -61,10 +68,12 @@ type DialogState =
   | { type: "agent-create" }
   | { type: "agent-details"; agentId: string }
   | { type: "play"; nodeId: string }
+  | { type: "graph-play" }
   | { type: "expression"; nodeId: string }
   | { type: "expression-definition"; resultId: string }
   | { type: "result-create" }
   | { type: "sessions" }
+  | { type: "settings" }
   | { type: "help" }
   | { type: "project-create" }
   | null;
@@ -115,6 +124,7 @@ type GraphExecutionView = {
 const api = new RaddusGraphApi();
 const defaultCanvasViewport: CanvasViewport = { x: 0, y: 0, zoom: 1 };
 const reservedResultIds = new Set(["unknown", "fallback"]);
+const paletteCollapsedStorageKey = "raddus-graph:card-palette-collapsed";
 
 export default function App() {
   const [state, setState] = React.useState<GraphState | null>(null);
@@ -314,6 +324,7 @@ export default function App() {
       id: newId("project"),
       name,
       graph: defaultProjectGraph(),
+      lastPlaySelection: null,
       createdAt: now,
       updatedAt: now,
     };
@@ -323,6 +334,20 @@ export default function App() {
     }, project.id));
     setCamera(defaultCanvasViewport);
     return project;
+  }
+
+  function updateProjectName(projectId: string, name: string) {
+    const trimmedName = name.trim();
+    if (!trimmedName) {
+      setError("Project name is required.");
+      return;
+    }
+    mutateState((current) => ({
+      ...current,
+      projects: current.projects.map((project) => (
+        project.id === projectId ? { ...project, name: trimmedName, updatedAt: new Date().toISOString() } : project
+      )),
+    }));
   }
 
   function createAgent(draft: AgentDraft): AgentSpec | null {
@@ -480,6 +505,7 @@ export default function App() {
   function requestDeleteNode(nodeId: string) {
     const current = latestState.current;
     const node = current?.graph.nodes.find((candidate) => candidate.id === nodeId);
+    if (node?.type === "play") return;
     requestConfirmation({
       title: "Remove Card",
       message: `Remove ${node && current ? nodeLabel(node, current) : "this card"} from the canvas? Connected lines will also be removed.`,
@@ -520,33 +546,8 @@ export default function App() {
     setConfirmation(nextConfirmation);
   }
 
-  function addNodeAt(
-    type: GraphNodeType,
-    x: number,
-    y: number,
-    options: { agentId?: string | null; resultId?: string } = {},
-  ) {
-    mutateState((current) => {
-      const node: GraphNode = {
-        id: newId(type),
-        type,
-        x,
-        y,
-        ...(type === "play" ? { prompt: "", repository: null, branch: null } : {}),
-        ...(type === "agent" ? { agentId: options.agentId ?? current.agents[0]?.id ?? null } : {}),
-        ...(type === "expression" ? { resultId: options.resultId ?? defaultExpressionResultId(current) } : {}),
-      };
-      return withActiveGraph(current, { ...current.graph, nodes: [...current.graph.nodes, node] });
-    });
-  }
-
-  function addNodeAtCanvasCenter(type: GraphNodeType) {
-    const center = canvasCenterToWorld() ?? { x: 180, y: 140 };
-    const size = projectNodeSizeForType(type);
-    addNodeAt(type, Math.round(center.x - size.width / 2), Math.round(center.y - size.height / 2));
-  }
-
   function deleteNode(nodeId: string) {
+    if (latestState.current?.graph.nodes.some((node) => node.id === nodeId && node.type === "play")) return;
     mutateState((current) => (
       withActiveGraph(current, {
         nodes: current.graph.nodes.filter((node) => node.id !== nodeId),
@@ -558,6 +559,20 @@ export default function App() {
 
   function updateNode(nodeId: string, patch: Partial<GraphNode>) {
     mutateState((current) => updateNodeInState(current, nodeId, (node) => ({ ...node, ...patch })));
+  }
+
+  function updatePlayNode(nodeId: string, patch: Partial<GraphNode>) {
+    mutateState((current) => {
+      const node = current.graph.nodes.find((candidate) => candidate.id === nodeId && candidate.type === "play");
+      if (!node) return current;
+      const repository = "repository" in patch ? patch.repository ?? null : node.repository ?? null;
+      return withPlayLaunchSelection(current, {
+        playNodeId: nodeId,
+        prompt: "prompt" in patch ? patch.prompt ?? "" : node.prompt ?? "",
+        repository,
+        branch: repository ? ("branch" in patch ? patch.branch ?? null : node.branch ?? null) : null,
+      });
+    });
   }
 
   function moveNodeLocally(nodeId: string, x: number, y: number) {
@@ -622,35 +637,61 @@ export default function App() {
     });
   }
 
-  async function runPlayNode(node: GraphNode) {
+  async function runPlayLaunch(selection: PlayLaunchSelection) {
+    const current = latestState.current;
+    const node = current?.graph.nodes.find((candidate) => candidate.id === selection.playNodeId && candidate.type === "play");
+    if (!node) {
+      setError("Select a play prompt before running.");
+      setDialog({ type: "graph-play" });
+      return;
+    }
+    await runPlayNode(node, selection);
+  }
+
+  async function runPlayNode(node: GraphNode, launchSelection?: PlayLaunchSelection) {
     const current = latestState.current;
     if (!current || node.type !== "play") return;
     const freshNode = current.graph.nodes.find((candidate) => candidate.id === node.id && candidate.type === "play") ?? node;
-    const prompt = (freshNode.prompt ?? "").trim();
+    const nextSelection: PlayLaunchSelection = {
+      playNodeId: freshNode.id,
+      prompt: launchSelection?.prompt ?? freshNode.prompt ?? "",
+      repository: launchSelection ? launchSelection.repository : freshNode.repository ?? null,
+      branch: launchSelection ? launchSelection.branch : freshNode.branch ?? null,
+    };
+    const prompt = nextSelection.prompt.trim();
     if (!prompt) {
       setError("Enter a play prompt before running.");
-      setDialog({ type: "play", nodeId: node.id });
+      setDialog(launchSelection ? { type: "graph-play" } : { type: "play", nodeId: node.id });
       return;
     }
     setRunningPlayNodeId(node.id);
     setError(null);
     try {
-      const saved = await api.saveState({
-        agents: current.agents,
-        results: current.results,
-        projects: current.projects,
-        selectedProjectId: current.selectedProjectId,
-        graph: current.graph,
+      const launchState = withPlayLaunchSelection(current, {
+        ...nextSelection,
+        prompt,
+        repository: nextSelection.repository || null,
+        branch: nextSelection.repository ? nextSelection.branch : null,
       });
-      const repository = freshNode.repository || null;
+      markLocalEdit();
+      latestState.current = launchState;
+      setState(launchState);
+      const saved = await api.saveState({
+        agents: launchState.agents,
+        results: launchState.results,
+        projects: launchState.projects,
+        selectedProjectId: launchState.selectedProjectId,
+        graph: launchState.graph,
+      });
+      const repository = nextSelection.repository || null;
       const repositoryOption = repositoryResult?.repositories.find((candidate) => candidate.nameWithOwner === repository);
       const payload = await api.createSession({
         playNodeId: freshNode.id,
-        projectId: current.selectedProjectId,
+        projectId: launchState.selectedProjectId,
         prompt,
         repository,
         repositoryUrl: repositoryOption?.url,
-        branch: repository ? freshNode.branch || repositoryOption?.defaultBranch || "main" : null,
+        branch: repository ? nextSelection.branch || repositoryOption?.defaultBranch || "main" : null,
       });
       const next = {
         ...saved,
@@ -730,13 +771,6 @@ export default function App() {
       x: (clientX - rect.left - viewCamera.x) / viewCamera.zoom,
       y: (clientY - rect.top - viewCamera.y) / viewCamera.zoom,
     };
-  }
-
-  function canvasCenterToWorld(): { x: number; y: number } | undefined {
-    const canvas = canvasRef.current;
-    if (!canvas) return undefined;
-    const rect = canvas.getBoundingClientRect();
-    return screenToWorld(rect.left + rect.width / 2, rect.top + rect.height / 2);
   }
 
   function beginNodeDrag(event: React.PointerEvent<HTMLElement>, nodeId: string) {
@@ -1045,8 +1079,9 @@ export default function App() {
   }
 
   const repositories = repositoryResult?.repositories ?? [];
-  const runningSessions = state?.sessions.filter((session) => session.status === "running").length ?? 0;
-  const graph = state?.graph ?? { nodes: [], edges: [] };
+  const graph: GraphDocument = state?.graph ?? { nodes: [], edges: [] };
+  const selectedProject = state ? selectedProjectForState(state) : null;
+  const playNodes = graph.nodes.filter(isPlayNode);
   const graphSessions = state?.sessions.filter((session) => session.projectId === state.selectedProjectId) ?? [];
   const activeExpressionResultId = state && dialog?.type === "expression"
     ? selectedRouteResultForExpression(state, dialog.nodeId)
@@ -1092,59 +1127,35 @@ export default function App() {
                     <Plus size={16} aria-hidden="true" />
                   </button>
                 </div>
-                {saveStatus !== "idle" ? (
+                {state ? (
+                  <div className="canvas-control-group project-session-actions-group" aria-label="Session actions">
+                    <button
+                      className="icon-button"
+                      type="button"
+                      onClick={() => setDialog({ type: "sessions" })}
+                      title="Open sessions"
+                      aria-label="Open sessions"
+                    >
+                      <List size={17} aria-hidden="true" />
+                    </button>
+                    <button
+                      className="icon-button project-start-action-button"
+                      type="button"
+                      onClick={() => setDialog({ type: "graph-play" })}
+                      title="Start graph"
+                      aria-label="Start graph"
+                    >
+                      {runningPlayNodeId ? <Loader2 className="spin" size={16} aria-hidden="true" /> : <Play size={17} aria-hidden="true" />}
+                    </button>
+                  </div>
+                ) : null}
+                {saveStatus === "saving" || saveStatus === "error" ? (
                   <div className={`canvas-control-group save-status ${saveStatus}`}>
                     {saveStatus === "saving" ? <Loader2 className="spin" size={16} aria-hidden="true" /> : <Save size={16} aria-hidden="true" />}
                     <span>{saveStatus}</span>
                   </div>
                 ) : null}
               </div>
-              {state ? (
-                <div className="session-selector-overlay" onPointerDown={(event) => event.stopPropagation()}>
-                  <div className="canvas-control-group graph-session-select-group">
-                    <Database size={15} aria-hidden="true" />
-                    <span>Session</span>
-                    <select
-                      className="graph-session-select"
-                      value={selectedGraphSession?.id ?? ""}
-                      onChange={(event) => {
-                        if (event.target.value) followGraphSession(event.target.value);
-                        else stopFollowingSession();
-                      }}
-                      aria-label="Graph session"
-                    >
-                      <option value="">{graphSessions.length ? "No session selected" : "No sessions"}</option>
-                    {graphSessions.map((session) => (
-                      <option value={session.id} key={session.id}>
-                        {graphSessionOptionLabel(session)}
-                      </option>
-                    ))}
-                  </select>
-                  <button
-                    className="icon-button graph-session-action-button"
-                    type="button"
-                    onClick={() => setDialog({ type: "sessions" })}
-                    title="Open session details"
-                    aria-label="Open session details"
-                    disabled={!selectedGraphSession}
-                  >
-                    <Info size={14} aria-hidden="true" />
-                  </button>
-                  <button
-                    className="icon-button graph-session-action-button danger"
-                    type="button"
-                    onClick={() => {
-                      if (selectedGraphSession) requestRemoveSession(selectedGraphSession.id);
-                    }}
-                      title="Remove selected session"
-                      aria-label="Remove selected session"
-                      disabled={!selectedGraphSession}
-                    >
-                      <Trash2 size={13} aria-hidden="true" />
-                    </button>
-                  </div>
-                </div>
-              ) : null}
               <div className="project-action-menu" onPointerDown={(event) => event.stopPropagation()}>
                 <button
                   className="project-menu-button"
@@ -1163,34 +1174,23 @@ export default function App() {
                       className="project-action-button"
                       type="button"
                       onClick={() => {
-                        addNodeAtCanvasCenter("play");
-                        setActionMenuOpen(false);
-                      }}
-                    >
-                      <Play size={17} aria-hidden="true" />
-                      <span>Add play card</span>
-                    </button>
-                    <button
-                      className="project-action-button"
-                      type="button"
-                      onClick={() => {
-                        setDialog({ type: "sessions" });
-                        setActionMenuOpen(false);
-                      }}
-                    >
-                      {runningSessions ? <Loader2 className="spin" size={17} aria-hidden="true" /> : <Database size={17} aria-hidden="true" />}
-                      <span>Sessions</span>
-                    </button>
-                    <button
-                      className="project-action-button"
-                      type="button"
-                      onClick={() => {
                         setDialog({ type: "help" });
                         setActionMenuOpen(false);
                       }}
                     >
                       <Info size={17} aria-hidden="true" />
                       <span>Canvas controls</span>
+                    </button>
+                    <button
+                      className="project-action-button"
+                      type="button"
+                      onClick={() => {
+                        setDialog({ type: "settings" });
+                        setActionMenuOpen(false);
+                      }}
+                    >
+                      <SettingsIcon size={17} aria-hidden="true" />
+                      <span>Settings</span>
                     </button>
                   </div>
                 ) : null}
@@ -1339,8 +1339,6 @@ export default function App() {
                         if (node.type === "play") setDialog({ type: "play", nodeId: node.id });
                         if (node.type === "expression") setDialog({ type: "expression", nodeId: node.id });
                       }}
-                      onPlayPromptChange={(prompt) => updateNode(node.id, { prompt })}
-                      onRunPlay={() => void runPlayNode(node)}
                       shouldSuppressClick={suppressesNodeClick}
                       enterDelayMs={Math.min(nodeIndex * 24, 180)}
                     />
@@ -1392,9 +1390,22 @@ export default function App() {
           branchesByRepo={branchesByRepo}
           running={runningPlayNodeId === dialog.nodeId}
           onClose={() => setDialog(null)}
-          onUpdate={(patch) => updateNode(dialog.nodeId, patch)}
+          onUpdate={(patch) => updatePlayNode(dialog.nodeId, patch)}
           onLoadBranches={(repo) => void loadBranches(repo)}
           onRun={(node) => void runPlayNode(node)}
+        />
+      ) : null}
+      {state && dialog?.type === "graph-play" ? (
+        <GraphPlayDialog
+          project={selectedProject}
+          playNodes={playNodes}
+          repositories={repositories}
+          repositoryResult={repositoryResult}
+          branchesByRepo={branchesByRepo}
+          runningPlayNodeId={runningPlayNodeId}
+          onClose={() => setDialog(null)}
+          onLoadBranches={(repo) => void loadBranches(repo)}
+          onRun={(selection) => void runPlayLaunch(selection)}
         />
       ) : null}
       {state && activeExpressionResultId && (dialog?.type === "expression" || dialog?.type === "expression-definition") ? (
@@ -1428,6 +1439,15 @@ export default function App() {
           onClose={() => setDialog(null)}
         />
       ) : null}
+      {state && dialog?.type === "settings" ? (
+        <SettingsDialog
+          projects={state.projects}
+          selectedProjectId={state.selectedProjectId}
+          onSelectProject={selectProject}
+          onRenameProject={updateProjectName}
+          onClose={() => setDialog(null)}
+        />
+      ) : null}
       {dialog?.type === "help" ? <CanvasHelpDialog onClose={() => setDialog(null)} /> : null}
       {confirmation ? (
         <ConfirmationDialog
@@ -1457,8 +1477,6 @@ function ProjectNodeCard({
   onPointerDown,
   onRemove,
   onOpen,
-  onPlayPromptChange,
-  onRunPlay,
   shouldSuppressClick,
   enterDelayMs,
 }: {
@@ -1472,18 +1490,11 @@ function ProjectNodeCard({
   onPointerDown: (event: React.PointerEvent<HTMLElement>) => void;
   onRemove: () => void;
   onOpen: () => void;
-  onPlayPromptChange: (prompt: string) => void;
-  onRunPlay: () => void;
   shouldSuppressClick: () => boolean;
   enterDelayMs: number;
 }) {
   const agent = node.type === "agent" ? state.agents.find((record) => record.id === node.agentId) : undefined;
   const expressionResultId = node.type === "expression" ? selectedRouteResultForExpression(state, node.id) : "";
-  const playRepositoryLabel = node.type === "play"
-    ? node.repository
-      ? `${node.repository} · ${node.branch || "default branch"}`
-      : "No repository"
-    : "";
 
   return (
     <article
@@ -1512,37 +1523,11 @@ function ProjectNodeCard({
         </>
       ) : node.type === "play" ? (
         <>
-          <div className="project-node-head">
-            <span>Play</span>
-            <button className="icon-button compact-icon project-card-remove" type="button" onClick={onRemove} title="Remove card" aria-label="Remove card">
-              <X size={12} aria-hidden="true" />
-            </button>
-          </div>
-          <div className="project-play-body">
-            <div className="project-play-controls">
-              <input
-                className="project-play-prompt"
-                value={node.prompt ?? ""}
-                onChange={(event) => onPlayPromptChange(event.target.value)}
-                placeholder="First prompt"
-                onPointerDown={(event) => event.stopPropagation()}
-              />
-              <button
-                className="project-play-button"
-                type="button"
-                title="Start graph session"
-                onClick={(event) => {
-                  event.stopPropagation();
-                  onRunPlay();
-                }}
-                disabled={running}
-              >
-                {running ? <Loader2 className="spin" size={18} aria-hidden="true" /> : <Play size={19} aria-hidden="true" />}
-              </button>
-            </div>
-            <div className="project-play-repository" title={playRepositoryLabel}>
-              {playRepositoryLabel}
-            </div>
+          <div className="project-node-identity">
+            <span className="project-node-identity-main">
+              {running ? <Loader2 className="spin" size={16} aria-hidden="true" /> : <Play size={16} aria-hidden="true" />}
+              <strong>Start</strong>
+            </span>
           </div>
         </>
       ) : (
@@ -1590,8 +1575,14 @@ function CardPalette({
   onRemoveExpression: (resultId: string) => void;
 }) {
   const addButtonTitle = activeTab === "agents" ? "Create agent" : "Create expression";
+  const [collapsed, setCollapsed] = React.useState(readPaletteCollapsedState);
+
+  React.useEffect(() => {
+    writePaletteCollapsedState(collapsed);
+  }, [collapsed]);
+
   return (
-    <aside className="project-card-palette" aria-label="Card palette" onPointerDown={(event) => event.stopPropagation()} onWheel={(event) => event.stopPropagation()}>
+    <aside className={`project-card-palette ${collapsed ? "collapsed" : ""}`} aria-label="Card palette" onPointerDown={(event) => event.stopPropagation()} onWheel={(event) => event.stopPropagation()}>
       <div className="palette-header">
         <div className="palette-tabs" role="tablist" aria-label="Cards">
           <button
@@ -1619,36 +1610,50 @@ function CardPalette({
           <Plus size={13} aria-hidden="true" />
         </button>
       </div>
-      <div className="palette-list">
-        {activeTab === "agents" ? (
-          <>
-            {agents.length === 0 ? <div className="palette-empty">No agents available</div> : null}
-            {agents.map((agent) => (
-              <PaletteAgentButton
-                agent={agent}
-                draggingItemKey={draggingItemKey}
-                onBeginDrag={onBeginDrag}
-                onOpen={() => onOpenAgent(agent)}
-                onRemove={() => onRemoveAgent(agent.id)}
-                key={agent.id}
-              />
-            ))}
-          </>
-        ) : (
-          <>
-            {results.length === 0 ? <div className="palette-empty">No expressions available</div> : null}
-            {results.map((result) => (
-              <PaletteExpressionButton
-                result={result}
-                draggingItemKey={draggingItemKey}
-                onBeginDrag={onBeginDrag}
-                onOpen={() => onOpenExpression(result)}
-                onRemove={result.reserved ? undefined : () => onRemoveExpression(result.id)}
-                key={result.id}
-              />
-            ))}
-          </>
-        )}
+      {!collapsed ? (
+        <div className="palette-list">
+          {activeTab === "agents" ? (
+            <>
+              {agents.length === 0 ? <div className="palette-empty">No agents available</div> : null}
+              {agents.map((agent) => (
+                <PaletteAgentButton
+                  agent={agent}
+                  draggingItemKey={draggingItemKey}
+                  onBeginDrag={onBeginDrag}
+                  onOpen={() => onOpenAgent(agent)}
+                  onRemove={() => onRemoveAgent(agent.id)}
+                  key={agent.id}
+                />
+              ))}
+            </>
+          ) : (
+            <>
+              {results.length === 0 ? <div className="palette-empty">No expressions available</div> : null}
+              {results.map((result) => (
+                <PaletteExpressionButton
+                  result={result}
+                  draggingItemKey={draggingItemKey}
+                  onBeginDrag={onBeginDrag}
+                  onOpen={() => onOpenExpression(result)}
+                  onRemove={result.reserved ? undefined : () => onRemoveExpression(result.id)}
+                  key={result.id}
+                />
+              ))}
+            </>
+          )}
+        </div>
+      ) : null}
+      <div className="palette-collapse-bar">
+        <button
+          className="palette-collapse-button"
+          type="button"
+          onClick={() => setCollapsed((current) => !current)}
+          title={collapsed ? "Expand cards" : "Collapse cards"}
+          aria-label={collapsed ? "Expand cards" : "Collapse cards"}
+          aria-expanded={!collapsed}
+        >
+          {collapsed ? <ChevronDown size={16} aria-hidden="true" /> : <ChevronUp size={16} aria-hidden="true" />}
+        </button>
       </div>
     </aside>
   );
@@ -1816,6 +1821,150 @@ function ProjectCreateDialog({
   );
 }
 
+function SettingsDialog({
+  projects,
+  selectedProjectId,
+  onSelectProject,
+  onRenameProject,
+  onClose,
+}: {
+  projects: ProjectRecord[];
+  selectedProjectId: string;
+  onSelectProject: (projectId: string) => void;
+  onRenameProject: (projectId: string, name: string) => void;
+  onClose: () => void;
+}) {
+  const [activeTab, setActiveTab] = React.useState<SettingsTab>("projects");
+  const selectedProject = projects.find((project) => project.id === selectedProjectId) ?? projects[0] ?? null;
+  const [projectNameDraft, setProjectNameDraft] = React.useState(selectedProject?.name ?? "");
+  const [cliStatus, setCliStatus] = React.useState<AgentCliStatusResult | null>(null);
+  const [cliStatusLoading, setCliStatusLoading] = React.useState(false);
+  const [cliStatusError, setCliStatusError] = React.useState<string | null>(null);
+
+  React.useEffect(() => {
+    setProjectNameDraft(selectedProject?.name ?? "");
+  }, [selectedProject?.id, selectedProject?.name]);
+
+  React.useEffect(() => {
+    void refreshCliStatus();
+  }, []);
+
+  async function refreshCliStatus() {
+    setCliStatusLoading(true);
+    setCliStatusError(null);
+    try {
+      setCliStatus(await api.getCliStatus());
+    } catch (statusError) {
+      setCliStatusError(errorMessage(statusError));
+    } finally {
+      setCliStatusLoading(false);
+    }
+  }
+
+  function commitProjectName() {
+    if (!selectedProject) return;
+    const nextName = projectNameDraft.trim();
+    if (!nextName) {
+      setProjectNameDraft(selectedProject.name);
+      return;
+    }
+    if (nextName !== selectedProject.name) onRenameProject(selectedProject.id, nextName);
+  }
+
+  return (
+    <Modal title="Settings" onClose={onClose} className="settings-modal">
+      <div className="settings-panel">
+        <nav className="settings-tab-list" role="tablist" aria-label="Settings">
+          <button
+            className={activeTab === "projects" ? "active" : ""}
+            type="button"
+            role="tab"
+            aria-selected={activeTab === "projects"}
+            onClick={() => setActiveTab("projects")}
+          >
+            Projects
+          </button>
+          <button
+            className={activeTab === "agents" ? "active" : ""}
+            type="button"
+            role="tab"
+            aria-selected={activeTab === "agents"}
+            onClick={() => setActiveTab("agents")}
+          >
+            Agents
+          </button>
+        </nav>
+        <section className="settings-content">
+          {activeTab === "projects" ? (
+            <div className="settings-project-form">
+              <label>
+                <span>Project</span>
+                <select value={selectedProject?.id ?? ""} onChange={(event) => onSelectProject(event.target.value)}>
+                  {projects.map((project) => (
+                    <option key={project.id} value={project.id}>
+                      {project.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                <span>Name</span>
+                <input
+                  value={projectNameDraft}
+                  onChange={(event) => setProjectNameDraft(event.target.value)}
+                  onBlur={commitProjectName}
+                  onKeyDown={(event) => {
+                    if (event.key !== "Enter") return;
+                    event.preventDefault();
+                    commitProjectName();
+                    event.currentTarget.blur();
+                  }}
+                  disabled={!selectedProject}
+                />
+              </label>
+            </div>
+          ) : (
+            <div className="agent-cli-status-list" aria-label="Agent CLI status">
+              {cliStatusError ? <div className="notice compact error">{cliStatusError}</div> : null}
+              <AgentCliStatusRow
+                label="Codex"
+                loading={cliStatusLoading && !cliStatus}
+                available={cliStatus?.agents.find((agent) => agent.id === "codex")?.available ?? false}
+              />
+              <AgentCliStatusRow
+                label="Claude"
+                loading={cliStatusLoading && !cliStatus}
+                available={cliStatus?.agents.find((agent) => agent.id === "claude")?.available ?? false}
+              />
+            </div>
+          )}
+        </section>
+      </div>
+    </Modal>
+  );
+}
+
+function AgentCliStatusRow({ label, loading, available }: { label: string; loading: boolean; available: boolean }) {
+  const statusLabel = loading ? "Checking" : available ? "Installed" : "Not Installed";
+  return (
+    <div className={`agent-cli-status-row ${loading ? "checking" : available ? "available" : "warning"}`}>
+      <span>{label}</span>
+      <span className="agent-cli-status-state" title={statusLabel} aria-label={`${label} ${statusLabel}`}>
+        <span>{statusLabel}</span>
+        <span className="agent-cli-status-icon" aria-hidden="true">
+          {loading ? (
+            <Loader2 className="spin" size={18} />
+          ) : available ? (
+            <CheckCircle2 size={18} />
+          ) : (
+            <TriangleAlert size={18} />
+          )}
+        </span>
+      </span>
+    </div>
+  );
+}
+
 function AgentDialog({
   agent,
   models,
@@ -1949,10 +2098,10 @@ function PlayDialog({
 }) {
   if (!node || node.type !== "play") return null;
   const repoBranches = node.repository ? branchesByRepo[node.repository]?.branches ?? [] : [];
-  const branchOptions = repoBranches.length ? repoBranches : [node.branch].filter(Boolean) as string[];
+  const branchOptions = repoBranches.length ? repoBranches : ([node.branch].filter(Boolean) as string[]);
 
   return (
-    <Modal title="Play" onClose={onClose}>
+    <Modal title="Start" onClose={onClose}>
       <form
         className="form-grid"
         onSubmit={(event) => {
@@ -1960,13 +2109,13 @@ function PlayDialog({
           onRun(node);
         }}
       >
-        <FormSection title="Prompt">
+        <div className="form-section">
           <label>
-            <span>User prompt</span>
-            <textarea rows={8} value={node.prompt ?? ""} onChange={(event) => onUpdate({ prompt: event.target.value })} />
+            <span>Prompt</span>
+            <input value={node.prompt ?? ""} onChange={(event) => onUpdate({ prompt: event.target.value })} autoFocus />
           </label>
-        </FormSection>
-        <FormSection title="Repository">
+        </div>
+        <div className="form-section">
           <div className="form-grid two">
             <label>
               <span>Repository</span>
@@ -2000,7 +2149,7 @@ function PlayDialog({
             </label>
           </div>
           {repositoryResult && !repositoryResult.authenticated ? <div className="notice compact">GitHub is unavailable, so only None is available.</div> : null}
-        </FormSection>
+        </div>
         <div className="dialog-actions">
           <button className="secondary-button" type="button" onClick={onClose}>
             <X size={16} aria-hidden="true" />
@@ -2008,7 +2157,121 @@ function PlayDialog({
           </button>
           <button className="primary-button" type="submit" disabled={running}>
             {running ? <Loader2 className="spin" size={16} aria-hidden="true" /> : <Play size={16} aria-hidden="true" />}
-            Run
+            Start
+          </button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
+function GraphPlayDialog({
+  project,
+  playNodes,
+  repositories,
+  repositoryResult,
+  branchesByRepo,
+  runningPlayNodeId,
+  onClose,
+  onLoadBranches,
+  onRun,
+}: {
+  project: ProjectRecord | null;
+  playNodes: GraphNode[];
+  repositories: RepositoryOption[];
+  repositoryResult: RepositoryListResult | null;
+  branchesByRepo: Record<string, BranchListResult>;
+  runningPlayNodeId: string | null;
+  onClose: () => void;
+  onLoadBranches: (repo: string) => void;
+  onRun: (selection: PlayLaunchSelection) => void;
+}) {
+  const [draft, setDraft] = React.useState<PlayLaunchSelection | null>(() => playLaunchSelectionForProject(project, playNodes));
+  const repoBranches = draft?.repository ? branchesByRepo[draft.repository]?.branches ?? [] : [];
+  const branchOptions = repoBranches.length ? repoBranches : ([draft?.branch].filter(Boolean) as string[]);
+  const running = Boolean(runningPlayNodeId);
+
+  function setRepository(repositoryName: string) {
+    if (!draft) return;
+    const repository = repositoryName || null;
+    const selectedRepository = repositories.find((candidate) => candidate.nameWithOwner === repository);
+    setDraft({
+      ...draft,
+      repository,
+      branch: repository ? selectedRepository?.defaultBranch ?? null : null,
+    });
+    if (repository) onLoadBranches(repository);
+  }
+
+  if (!draft || playNodes.length === 0) {
+    return (
+      <Modal title="Start" onClose={onClose}>
+        <div className="confirmation-dialog">
+          <div className="empty-state">
+            <CircleDot size={24} aria-hidden="true" />
+            <strong>No start cards</strong>
+          </div>
+          <div className="dialog-actions">
+            <button className="secondary-button" type="button" onClick={onClose}>
+              <X size={16} aria-hidden="true" />
+              Close
+            </button>
+          </div>
+        </div>
+      </Modal>
+    );
+  }
+
+  return (
+    <Modal title="Start" onClose={onClose}>
+      <form
+        className="form-grid"
+        onSubmit={(event) => {
+          event.preventDefault();
+          onRun(draft);
+        }}
+      >
+        <div className="form-section">
+          <label>
+            <span>Prompt</span>
+            <input value={draft.prompt} onChange={(event) => setDraft({ ...draft, prompt: event.target.value })} autoFocus />
+          </label>
+        </div>
+        <div className="form-section">
+          <div className="form-grid two">
+            <label>
+              <span>Repository</span>
+              <select value={draft.repository ?? ""} onChange={(event) => setRepository(event.target.value)}>
+                <option value="">None</option>
+                {repositories.map((repo) => (
+                  <option key={repo.nameWithOwner} value={repo.nameWithOwner}>
+                    {repo.nameWithOwner}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              <span>Branch</span>
+              <select value={draft.branch ?? ""} disabled={!draft.repository} onChange={(event) => setDraft({ ...draft, branch: event.target.value || null })}>
+                <option value="">None</option>
+                {branchOptions.map((branch) => (
+                  <option key={branch} value={branch}>
+                    {branch}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
+          {repositoryResult && !repositoryResult.authenticated ? <div className="notice compact">GitHub is unavailable, so only None is available.</div> : null}
+        </div>
+        <div className="dialog-actions">
+          <button className="secondary-button" type="button" onClick={onClose}>
+            <X size={16} aria-hidden="true" />
+            Close
+          </button>
+          <button className="primary-button" type="submit" disabled={running}>
+            {running ? <Loader2 className="spin" size={16} aria-hidden="true" /> : <Play size={16} aria-hidden="true" />}
+            Start
           </button>
         </div>
       </form>
@@ -2274,7 +2537,7 @@ function SessionsDialog({
                         <Play size={15} aria-hidden="true" />
                       </span>
                       <div>
-                        <strong>Play prompt</strong>
+                        <strong>Start prompt</strong>
                         <span>{formatDateTime(selectedSession.createdAt)}</span>
                       </div>
                     </div>
@@ -2378,7 +2641,7 @@ function CanvasHelpDialog({ onClose }: { onClose: () => void }) {
     <Modal title="Canvas controls" onClose={onClose}>
       <div className="canvas-help">
         <div className="shortcut-list" aria-label="Canvas shortcuts">
-          <InfoRow icon={<Play size={15} />} label="Run" value="Use the play card button or open the play card." />
+          <InfoRow icon={<Play size={15} />} label="Run" value="Use the top start button or open a start card." />
           <InfoRow icon={<Layers size={15} />} label="Agents" value="Drag agent specs from the side panel onto the canvas." />
           <InfoRow icon={<CircleDot size={15} />} label="Connect" value="Drag the connector dot or drag one card onto another." />
           <InfoRow icon={<RotateCcw size={15} />} label="View" value="Drag empty canvas to pan. Use ctrl or command wheel to zoom." />
@@ -2475,6 +2738,53 @@ function InfoRow({ icon, label, value }: { icon: React.ReactNode; label: string;
       <strong>{value}</strong>
     </div>
   );
+}
+
+function readPaletteCollapsedState() {
+  try {
+    return window.localStorage.getItem(paletteCollapsedStorageKey) === "true";
+  } catch {
+    return false;
+  }
+}
+
+function writePaletteCollapsedState(collapsed: boolean) {
+  try {
+    window.localStorage.setItem(paletteCollapsedStorageKey, String(collapsed));
+  } catch {
+    // Ignore unavailable storage; collapse still works for the current session.
+  }
+}
+
+function isPlayNode(node: GraphNode): boolean {
+  return node.type === "play";
+}
+
+function playLaunchSelectionForProject(project: ProjectRecord | null, playNodes: GraphNode[]): PlayLaunchSelection | null {
+  if (playNodes.length === 0) return null;
+  const remembered = project?.lastPlaySelection ?? null;
+  const rememberedNode = remembered
+    ? playNodes.find((node) => node.id === remembered.playNodeId && node.type === "play") ?? null
+    : null;
+  if (remembered && rememberedNode) {
+    return {
+      playNodeId: remembered.playNodeId,
+      prompt: remembered.prompt,
+      repository: remembered.repository,
+      branch: remembered.repository ? remembered.branch : null,
+    };
+  }
+  return playLaunchSelectionForNode(playNodes[0]);
+}
+
+function playLaunchSelectionForNode(node: GraphNode): PlayLaunchSelection {
+  const repository = node.repository ?? null;
+  return {
+    playNodeId: node.id,
+    prompt: node.prompt ?? "",
+    repository,
+    branch: repository ? node.branch ?? null : null,
+  };
 }
 
 function paletteItemKey(item: PaletteItem): string {
@@ -2720,6 +3030,39 @@ function updateEdgeInState(state: GraphState, edgeId: string, update: (edge: Gra
   });
 }
 
+function withPlayLaunchSelection(state: GraphState, selection: PlayLaunchSelection): GraphState {
+  const repository = selection.repository || null;
+  const lastPlaySelection: PlayLaunchSelection = {
+    playNodeId: selection.playNodeId,
+    prompt: selection.prompt,
+    repository,
+    branch: repository ? selection.branch : null,
+  };
+  const graph = {
+    ...state.graph,
+    nodes: state.graph.nodes.map((node) => (
+      node.id === selection.playNodeId && node.type === "play"
+        ? {
+          ...node,
+          prompt: lastPlaySelection.prompt,
+          repository: lastPlaySelection.repository,
+          branch: lastPlaySelection.branch,
+        }
+        : node
+    )),
+  };
+  const now = new Date().toISOString();
+  return {
+    ...state,
+    graph,
+    projects: state.projects.map((project) => (
+      project.id === state.selectedProjectId
+        ? { ...project, graph, lastPlaySelection, updatedAt: now }
+        : project
+    )),
+  };
+}
+
 function withActiveGraph(state: GraphState, graph: GraphDocument): GraphState {
   const now = new Date().toISOString();
   return {
@@ -2731,8 +3074,13 @@ function withActiveGraph(state: GraphState, graph: GraphDocument): GraphState {
   };
 }
 
+function selectedProjectForState(state: GraphState): ProjectRecord | null {
+  return state.projects.find((candidate) => candidate.id === state.selectedProjectId) ?? state.projects[0] ?? null;
+}
+
 function withSelectedProjectGraph(state: GraphState): GraphState {
-  const project = state.projects.find((candidate) => candidate.id === state.selectedProjectId) ?? state.projects[0];
+  const project = selectedProjectForState(state);
+  if (!project) return state;
   return {
     ...state,
     selectedProjectId: project.id,
@@ -2811,7 +3159,7 @@ function agentModelSummary(agent: AgentSpec) {
 }
 
 function nodeLabel(node: GraphNode, state: GraphState) {
-  if (node.type === "play") return `Play ${shortId(node.id)}`;
+  if (node.type === "play") return `Start ${shortId(node.id)}`;
   if (node.type === "expression") return `Expression ${shortId(node.id)}`;
   const agent = state.agents.find((candidate) => candidate.id === node.agentId);
   return agent?.name ?? `Agent ${shortId(node.id)}`;

@@ -3,6 +3,7 @@ import { listBranches, listRepositories } from "./github.mjs";
 import { readGraphData, replaceGraphState } from "./graphStore.mjs";
 import { appendCallbackStatus, createGraphSession, deleteGraphSession, stopGraphSession } from "./graphRuntime.mjs";
 import { modelCatalog } from "./modelCatalog.mjs";
+import { commandWorks } from "./processUtils.mjs";
 import { HttpError } from "./errors.mjs";
 import { asPayload, readJsonBody, sendJson } from "./httpUtils.mjs";
 
@@ -23,6 +24,21 @@ export async function handleGraphApi(req, res, url) {
 
   if (resource === "models" && req.method === "GET" && segments.length === 1) {
     sendJson(res, 200, { models: modelCatalog });
+    return;
+  }
+
+  if (resource === "cli-status" && req.method === "GET" && segments.length === 1) {
+    const [codexAvailable, claudeAvailable] = await Promise.all([
+      commandWorks("codex", ["--version"], { timeoutMs: 5_000 }),
+      commandWorks("claude", ["--version"], { timeoutMs: 5_000 }),
+    ]);
+    sendJson(res, 200, {
+      checkedAt: new Date().toISOString(),
+      agents: [
+        { id: "codex", label: "Codex", command: "codex", available: codexAvailable },
+        { id: "claude", label: "Claude", command: "claude", available: claudeAvailable },
+      ],
+    });
     return;
   }
 
