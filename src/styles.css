@@ -1402,6 +1402,12 @@ textarea:focus {
   gap: 14px;
 }
 
+.settings-project-actions {
+  display: flex;
+  justify-content: flex-start;
+  padding-top: 6px;
+}
+
 .agent-cli-status-list {
   width: 100%;
   display: grid;

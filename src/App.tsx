@@ -132,7 +132,8 @@ type GraphExecutionView = {
 };
 
 const api = new RaddusGraphApi();
-const reservedResultIds = new Set(["unknown", "fallback"]);
+const reservedResultIds = new Set(["completed", "failed", "ask-for-approval", "default"]);
+const protectedResultIds = new Set([...reservedResultIds, "unknown", "fallback"]);
 const paletteCollapsedStorageKey = "raddus-graph:card-palette-collapsed";
 
 export default function App() {
@@ -342,6 +343,8 @@ export default function App() {
       id: newId("project"),
       name,
       graph: defaultProjectGraph(),
+      agents: [],
+      results: defaultProjectResults(),
       lastPlaySelection: null,
       createdAt: now,
       updatedAt: now,
@@ -368,6 +371,38 @@ export default function App() {
     }));
   }
 
+  function deleteProject(projectId: string) {
+    const current = latestState.current;
+    if (!current) return;
+    if (current.projects.length <= 1) {
+      setError("Create another project before deleting this one.");
+      return;
+    }
+    const deletedIndex = current.projects.findIndex((project) => project.id === projectId);
+    if (deletedIndex === -1) return;
+
+    const deletingSelectedProject = current.selectedProjectId === projectId;
+    const remainingProjects = current.projects.filter((project) => project.id !== projectId);
+    const nextSelectedProjectId = deletingSelectedProject
+      ? (remainingProjects[deletedIndex] ?? remainingProjects[deletedIndex - 1] ?? remainingProjects[0]).id
+      : current.selectedProjectId;
+
+    mutateState((current) => selectProjectInState({
+      ...current,
+      projects: current.projects.filter((project) => project.id !== projectId),
+    }, nextSelectedProjectId));
+
+    const nextState = latestState.current;
+    if (deletingSelectedProject) {
+      restoreCanvasViewport(nextSelectedProjectId);
+      setFollowedSessionId(nextState ? latestSessionForProject(nextState.sessions, nextSelectedProjectId)?.id ?? null : null);
+      setFocusedAgentSessionId(null);
+    } else if (current.sessions.find((session) => session.id === followedSessionId)?.projectId === projectId) {
+      setFollowedSessionId(null);
+      setFocusedAgentSessionId(null);
+    }
+  }
+
   function createAgent(draft: AgentDraft): AgentSpec | null {
     const name = draft.name.trim();
     const model = draft.model.trim();
@@ -385,16 +420,14 @@ export default function App() {
       createdAt: now,
       updatedAt: now,
     };
-    mutateState((current) => ({
-      ...current,
+    mutateState((current) => withActiveProject(current, {
       agents: [...current.agents, agent],
     }));
     return agent;
   }
 
   function updateAgent(agentId: string, patch: Partial<AgentSpec>) {
-    mutateState((current) => ({
-      ...current,
+    mutateState((current) => withActiveProject(current, {
       agents: current.agents.map((agent) => {
         if (agent.id !== agentId) return agent;
         const model = (patch.model ?? agent.model).trim();
@@ -415,20 +448,15 @@ export default function App() {
 
   function deleteAgent(agentId: string) {
     mutateState((current) => {
-      const projects = current.projects.map((project) => ({
-        ...project,
-        graph: {
-          ...project.graph,
-          nodes: project.graph.nodes.map((node) => (
-            node.type === "agent" && node.agentId === agentId ? { ...node, agentId: null } : node
-          )),
-        },
-        updatedAt: new Date().toISOString(),
-      }));
-      return withSelectedProjectGraph({
-        ...current,
+      const graph = {
+        ...current.graph,
+        nodes: current.graph.nodes.map((node) => (
+          node.type === "agent" && node.agentId === agentId ? { ...node, agentId: null } : node
+        )),
+      };
+      return withActiveProject(current, {
+        graph,
         agents: current.agents.filter((agent) => agent.id !== agentId),
-        projects,
       });
     });
     if (dialog?.type === "agent-details" && dialog.agentId === agentId) setDialog(null);
@@ -440,7 +468,7 @@ export default function App() {
       setError("Result id and description are required.");
       return null;
     }
-    if (reservedResultIds.has(id)) {
+    if (protectedResultIds.has(id)) {
       setError(`${id} is a reserved system result.`);
       return null;
     }
@@ -449,19 +477,15 @@ export default function App() {
       return null;
     }
     const result: ResultDefinition = { id, description: resultDraft.description.trim(), reserved: false };
-    mutateState((current) => {
-      return {
-        ...current,
-        results: [...current.results, result],
-      };
-    });
+    mutateState((current) => withActiveProject(current, {
+      results: [...current.results, result],
+    }));
     setResultDraft({ id: "", description: "" });
     return result;
   }
 
   function updateResult(resultId: string, description: string) {
-    mutateState((current) => ({
-      ...current,
+    mutateState((current) => withActiveProject(current, {
       results: current.results.map((result) => result.id === resultId ? { ...result, description } : result),
     }));
   }
@@ -469,31 +493,20 @@ export default function App() {
   function deleteResult(resultId: string) {
     if (reservedResultIds.has(resultId)) return;
     mutateState((current) => {
-      const now = new Date().toISOString();
-      const projects = current.projects.map((project) => {
-        const expressionNodeIds = new Set(project.graph.nodes
-          .filter((node) => node.type === "expression" && normalizeResultId(node.resultId ?? "") === resultId)
-          .map((node) => node.id));
-        return {
-          ...project,
-          graph: {
-            nodes: project.graph.nodes.filter((node) => !expressionNodeIds.has(node.id)),
-            edges: project.graph.edges.filter((edge) => (
-              edge.resultId !== resultId &&
-              !expressionNodeIds.has(edge.source) &&
-              !expressionNodeIds.has(edge.target)
-            )),
-          },
-          updatedAt: now,
-        };
-      });
-      const selectedProject = projects.find((project) => project.id === current.selectedProjectId) ?? projects[0];
-      return {
-        ...current,
+      const expressionNodeIds = new Set(current.graph.nodes
+        .filter((node) => node.type === "expression" && normalizeResultId(node.resultId ?? "") === resultId)
+        .map((node) => node.id));
+      return withActiveProject(current, {
+        graph: {
+          nodes: current.graph.nodes.filter((node) => !expressionNodeIds.has(node.id)),
+          edges: current.graph.edges.filter((edge) => (
+            edge.resultId !== resultId &&
+            !expressionNodeIds.has(edge.source) &&
+            !expressionNodeIds.has(edge.target)
+          )),
+        },
         results: current.results.filter((result) => result.id !== resultId),
-        projects,
-        graph: selectedProject.graph,
-      };
+      });
     });
     if (dialog?.type === "expression-definition" && dialog.resultId === resultId) setDialog(null);
   }
@@ -509,14 +522,31 @@ export default function App() {
   }
 
   function requestDeleteResult(resultId: string) {
-    const expressionCount = latestState.current?.projects.reduce((count, project) => (
-      count + project.graph.nodes.filter((node) => node.type === "expression" && normalizeResultId(node.resultId ?? "") === resultId).length
-    ), 0) ?? 0;
+    const expressionCount = latestState.current?.graph.nodes
+      .filter((node) => node.type === "expression" && normalizeResultId(node.resultId ?? "") === resultId)
+      .length ?? 0;
     requestConfirmation({
       title: "Remove Expression",
       message: `Remove ${resultId}? This also removes ${expressionCount === 1 ? "1 expression card" : `${expressionCount} expression cards`} using it.`,
       confirmLabel: "Remove",
       onConfirm: () => deleteResult(resultId),
+    });
+  }
+
+  function requestDeleteProject(projectId: string) {
+    const current = latestState.current;
+    const project = current?.projects.find((candidate) => candidate.id === projectId);
+    if (!current || !project) return;
+    if (current.projects.length <= 1) {
+      setError("Create another project before deleting this one.");
+      return;
+    }
+    const sessionCount = current.sessions.filter((session) => session.projectId === projectId).length;
+    requestConfirmation({
+      title: "Delete Project",
+      message: `Delete ${project.name}? Its canvas, agents, and expressions will be removed.${sessionCount > 0 ? ` ${sessionCount === 1 ? "1 existing session" : `${sessionCount} existing sessions`} will remain in session history.` : ""}`,
+      confirmLabel: "Delete",
+      onConfirm: () => deleteProject(projectId),
     });
   }
 
@@ -1153,6 +1183,8 @@ export default function App() {
 
   const repositories = repositoryResult?.repositories ?? [];
   const graph: GraphDocument = state?.graph ?? { nodes: [], edges: [] };
+  const activeAgents = state?.agents ?? [];
+  const activeResults = state?.results ?? defaultProjectResults();
   const selectedProject = state ? selectedProjectForState(state) : null;
   const playNodes = graph.nodes.filter(isPlayNode);
   const graphSessions = state?.sessions.filter((session) => session.projectId === state.selectedProjectId) ?? [];
@@ -1162,7 +1194,7 @@ export default function App() {
       ? dialog.resultId
       : null;
   const activeExpressionResult = activeExpressionResultId
-    ? state?.results.find((result) => result.id === activeExpressionResultId) ?? null
+    ? activeResults.find((result) => result.id === activeExpressionResultId) ?? null
     : null;
   const followedSession = followedSessionId ? state?.sessions.find((session) => session.id === followedSessionId) ?? null : null;
   const selectedGraphSession = followedSession && graphSessions.some((session) => session.id === followedSession.id) ? followedSession : null;
@@ -1281,8 +1313,8 @@ export default function App() {
               {state && overlayPanel ? (
                 <CardPalette
                   activeTab={overlayPanel}
-                  agents={state.agents}
-                  results={state.results}
+                  agents={activeAgents}
+                  results={activeResults}
                   draggingItemKey={draggingPaletteItemKey}
                   onActiveTabChange={setOverlayPanel}
                   onBeginDrag={beginPaletteItemDrag}
@@ -1414,7 +1446,7 @@ export default function App() {
                     />
                   );
                 })}
-                {paletteDragPreview ? <PaletteNodePreview preview={paletteDragPreview} agents={state?.agents ?? []} results={state?.results ?? []} /> : null}
+                {paletteDragPreview ? <PaletteNodePreview preview={paletteDragPreview} agents={activeAgents} results={activeResults} /> : null}
               </div>
             </div>
           </section>
@@ -1442,7 +1474,7 @@ export default function App() {
       ) : null}
       {state && dialog?.type === "agent-details" ? (
         <AgentDialog
-          agent={state.agents.find((agent) => agent.id === dialog.agentId) ?? null}
+          agent={activeAgents.find((agent) => agent.id === dialog.agentId) ?? null}
           models={models}
           onClose={() => setDialog(null)}
           onSave={(draft) => {
@@ -1536,6 +1568,7 @@ export default function App() {
           selectedProjectId={state.selectedProjectId}
           onSelectProject={selectProject}
           onRenameProject={updateProjectName}
+          onDeleteProject={requestDeleteProject}
           onClose={() => setDialog(null)}
         />
       ) : null}
@@ -1975,12 +2008,14 @@ function SettingsDialog({
   selectedProjectId,
   onSelectProject,
   onRenameProject,
+  onDeleteProject,
   onClose,
 }: {
   projects: ProjectRecord[];
   selectedProjectId: string;
   onSelectProject: (projectId: string) => void;
   onRenameProject: (projectId: string, name: string) => void;
+  onDeleteProject: (projectId: string) => void;
   onClose: () => void;
 }) {
   const [activeTab, setActiveTab] = React.useState<SettingsTab>("projects");
@@ -2071,6 +2106,20 @@ function SettingsDialog({
                   disabled={!selectedProject}
                 />
               </label>
+              <div className="settings-project-actions">
+                <button
+                  className="danger-button"
+                  type="button"
+                  disabled={!selectedProject || projects.length <= 1}
+                  onClick={() => {
+                    if (selectedProject) onDeleteProject(selectedProject.id);
+                  }}
+                  title={projects.length <= 1 ? "Create another project before deleting this one" : "Delete project"}
+                >
+                  <Trash2 size={16} aria-hidden="true" />
+                  Delete Project
+                </button>
+              </div>
             </div>
           ) : (
             <div className="agent-cli-status-list" aria-label="Agent CLI status">
@@ -3220,7 +3269,8 @@ function expressionResultIdForNode(state: GraphState, node: GraphNode): string {
 }
 
 function defaultExpressionResultId(state: Pick<GraphState, "results">): string {
-  return state.results.find((result) => !result.reserved)?.id ?? state.results[0]?.id ?? "unknown";
+  const results = state.results ?? defaultProjectResults();
+  return results.find((result) => !result.reserved)?.id ?? results[0]?.id ?? "default";
 }
 
 function projectNodeCenter(node: GraphNode): { x: number; y: number } {
@@ -3295,25 +3345,42 @@ function withPlayLaunchSelection(state: GraphState, selection: PlayLaunchSelecti
         : node
     )),
   };
-  const now = new Date().toISOString();
-  return {
-    ...state,
+  return withActiveProject(state, {
     graph,
-    projects: state.projects.map((project) => (
-      project.id === state.selectedProjectId
-        ? { ...project, graph, lastPlaySelection, updatedAt: now }
-        : project
-    )),
-  };
+    lastPlaySelection,
+  });
 }
 
 function withActiveGraph(state: GraphState, graph: GraphDocument): GraphState {
+  return withActiveProject(state, { graph });
+}
+
+function withActiveProject(
+  state: GraphState,
+  patch: Partial<Pick<ProjectRecord, "graph" | "agents" | "results" | "lastPlaySelection">>,
+): GraphState {
+  const project = selectedProjectForState(state);
+  if (!project) return state;
   const now = new Date().toISOString();
+  const graph = patch.graph ?? project.graph;
+  const agents = patch.agents ?? agentsForProject(project, state);
+  const results = patch.results ?? resultsForProject(project, state);
+  const nextProject: ProjectRecord = {
+    ...project,
+    ...patch,
+    graph,
+    agents,
+    results,
+    updatedAt: now,
+  };
   return {
     ...state,
+    selectedProjectId: project.id,
     graph,
+    agents,
+    results,
     projects: state.projects.map((project) => (
-      project.id === state.selectedProjectId ? { ...project, graph, updatedAt: now } : project
+      project.id === nextProject.id ? nextProject : project
     )),
   };
 }
@@ -3329,6 +3396,8 @@ function withSelectedProjectGraph(state: GraphState): GraphState {
     ...state,
     selectedProjectId: project.id,
     graph: project.graph,
+    agents: agentsForProject(project, state),
+    results: resultsForProject(project, state),
   };
 }
 
@@ -3338,6 +3407,8 @@ function selectProjectInState(state: GraphState, projectId: string): GraphState 
     ...state,
     selectedProjectId: project.id,
     graph: project.graph,
+    agents: agentsForProject(project, state),
+    results: resultsForProject(project, state),
   };
 }
 
@@ -3356,6 +3427,39 @@ function defaultProjectGraph(): GraphDocument {
     ],
     edges: [],
   };
+}
+
+function defaultProjectResults(): ResultDefinition[] {
+  return [
+    {
+      id: "completed",
+      description: "System route for a successful terminal outcome when no more-specific result is emitted.",
+      reserved: true,
+    },
+    {
+      id: "failed",
+      description: "System route for a failed terminal outcome.",
+      reserved: true,
+    },
+    {
+      id: "ask-for-approval",
+      description: "System route for pausing at a review card to ask for approval.",
+      reserved: true,
+    },
+    {
+      id: "default",
+      description: "System default route for unrecognized results or outcomes without a more-specific branch.",
+      reserved: true,
+    },
+  ];
+}
+
+function agentsForProject(project: ProjectRecord, state: GraphState): AgentSpec[] {
+  return Array.isArray(project.agents) ? project.agents : state.agents ?? [];
+}
+
+function resultsForProject(project: ProjectRecord, state: GraphState): ResultDefinition[] {
+  return Array.isArray(project.results) ? project.results : state.results ?? defaultProjectResults();
 }
 
 function eventTargetClosest(target: EventTarget | null, selector: string): Element | null {
@@ -3406,7 +3510,7 @@ function nodeLabel(node: GraphNode, state: GraphState) {
   if (node.type === "play") return `Start ${shortId(node.id)}`;
   if (node.type === "review") return `Review ${shortId(node.id)}`;
   if (node.type === "expression") return `Expression ${shortId(node.id)}`;
-  const agent = state.agents.find((candidate) => candidate.id === node.agentId);
+  const agent = (state.agents ?? []).find((candidate) => candidate.id === node.agentId);
   return agent?.name ?? `Agent ${shortId(node.id)}`;
 }
 

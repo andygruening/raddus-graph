@@ -123,7 +123,7 @@ DELETE /api/graph/sessions/:graphSessionId
 
 Removing a graph session stops active child processes first and deletes the retained session workspace.
 
-Expression cards route only after terminal outcomes. `completed` routes by a valid emitted result ID. Invalid, missing, or absent terminal results route through reserved `unknown`. A recognized result with no matching branch routes through reserved `fallback`. `stopped` ends without routing.
+Expression cards route only after terminal outcomes. `completed` routes by a valid emitted result ID. Unknown, invalid, or unbranched outcomes route through reserved `default`. `stopped` ends without routing.
 
 The canvas can follow a graph session. In follow mode, the active agent node is highlighted, the previous node and incoming expression path are shown less strongly, and earlier visited nodes/routes keep subtle markers. Selecting a graph session from the Sessions window switches the canvas to that session's execution state.
 

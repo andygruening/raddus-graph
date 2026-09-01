@@ -1,6 +1,15 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import { availableResultsForAgent, buildAgentPrompt, cliArgsForRunner, nextGraphRouteFromOutcome, reviewQuestionFromAgentSession, statusPayloadsFromText } from "../server/graphRuntime.mjs";
+
+test("runAgentNode receives userPrompt before building an agent prompt", async () => {
+  const source = await readFile(new URL("../server/graphRuntime.mjs", import.meta.url), "utf8");
+  const params = source.match(/async function runAgentNode\(\{(?<params>[\s\S]*?)\}\) \{/)?.groups?.params ?? "";
+
+  assert.match(params, /\buserPrompt\b/);
+  assert.match(source, /buildAgentPrompt\(\{[\s\S]*\buserPrompt\b[\s\S]*\}\)/);
+});
 
 test("codex runner args use the current noninteractive approval flag", () => {
   const { args, input } = cliArgsForRunner(
@@ -162,6 +171,10 @@ test("agent prompt result IDs are limited to reachable expression routes", () =>
       { id: "agent-b", type: "agent", agentId: "agent-b" },
       { id: "expr-ready", type: "expression", resultId: "ready" },
       { id: "expr-blocked", type: "expression", resultId: "blocked" },
+      { id: "expr-completed", type: "expression", resultId: "completed" },
+      { id: "expr-approval", type: "expression", resultId: "ask-for-approval" },
+      { id: "expr-failed", type: "expression", resultId: "failed" },
+      { id: "expr-default", type: "expression", resultId: "default" },
       { id: "expr-incomplete", type: "expression", resultId: "incomplete" },
       { id: "expr-disconnected", type: "expression", resultId: "manual" },
     ],
@@ -170,6 +183,14 @@ test("agent prompt result IDs are limited to reachable expression routes", () =>
       { id: "edge-ready-b", source: "expr-ready", target: "agent-b", type: "routes", resultId: "ready" },
       { id: "edge-a-blocked", source: "agent-a", target: "expr-blocked", type: "evaluates" },
       { id: "edge-blocked-b", source: "expr-blocked", target: "agent-b", type: "routes", resultId: "blocked" },
+      { id: "edge-a-completed", source: "agent-a", target: "expr-completed", type: "evaluates" },
+      { id: "edge-completed-b", source: "expr-completed", target: "agent-b", type: "routes", resultId: "completed" },
+      { id: "edge-a-approval", source: "agent-a", target: "expr-approval", type: "evaluates" },
+      { id: "edge-approval-review", source: "expr-approval", target: "agent-b", type: "routes", resultId: "ask-for-approval" },
+      { id: "edge-a-failed", source: "agent-a", target: "expr-failed", type: "evaluates" },
+      { id: "edge-failed-b", source: "expr-failed", target: "agent-b", type: "routes", resultId: "failed" },
+      { id: "edge-a-default", source: "agent-a", target: "expr-default", type: "evaluates" },
+      { id: "edge-default-b", source: "expr-default", target: "agent-b", type: "routes", resultId: "default" },
       { id: "edge-a-incomplete", source: "agent-a", target: "expr-incomplete", type: "evaluates" },
       { id: "edge-disconnected-b", source: "expr-disconnected", target: "agent-b", type: "routes", resultId: "manual" },
     ],
@@ -182,12 +203,17 @@ test("agent prompt result IDs are limited to reachable expression routes", () =>
       { id: "blocked", description: "Blocked route" },
       { id: "incomplete", description: "Incomplete route" },
       { id: "manual", description: "Disconnected route" },
-      { id: "fallback", description: "Reserved fallback" },
+      { id: "completed", description: "Built-in completed route", reserved: true },
+      { id: "failed", description: "Built-in failed route", reserved: true },
+      { id: "ask-for-approval", description: "Built-in approval route", reserved: true },
+      { id: "default", description: "Built-in default route", reserved: true },
     ],
     node: { id: "agent-a", type: "agent", agentId: "agent-a" },
   }), [
     { id: "ready", description: "Ready route" },
     { id: "blocked", description: "Blocked route" },
+    { id: "completed", description: "Built-in completed route" },
+    { id: "ask-for-approval", description: "Built-in approval route" },
   ]);
 });
 

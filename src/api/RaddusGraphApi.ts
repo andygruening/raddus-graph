@@ -77,6 +77,8 @@ export interface ProjectRecord {
   id: string;
   name: string;
   graph: GraphDocument;
+  agents: AgentSpec[];
+  results: ResultDefinition[];
   lastPlaySelection: PlayLaunchSelection | null;
   createdAt: string;
   updatedAt: string;
