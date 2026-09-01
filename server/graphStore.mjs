@@ -440,7 +440,7 @@ function normalizeGraph(value) {
 function normalizeGraphNode(value) {
   const record = asRecord(value);
   const type = stringValue(record.type);
-  if (type !== "play" && type !== "agent" && type !== "expression") return null;
+  if (type !== "play" && type !== "agent" && type !== "expression" && type !== "review") return null;
   const id = stringValue(record.id) || cryptoId(type);
   return {
     id,
@@ -530,9 +530,31 @@ function normalizeGraphSession(value) {
     agentsSnapshot: Array.isArray(record.agentsSnapshot) ? normalizeAgents(record.agentsSnapshot) : null,
     resultsSnapshot: Array.isArray(record.resultsSnapshot) ? normalizeResults(record.resultsSnapshot) : null,
     agentSessions,
+    pendingReview: status === "waiting_review" ? normalizePendingReview(record.pendingReview, id) : null,
     error: nullableString(record.error),
     createdAt: stringValue(record.createdAt) || now,
     updatedAt: stringValue(record.updatedAt) || now,
+  };
+}
+
+function normalizePendingReview(value, graphSessionId) {
+  const record = asRecord(value);
+  const reviewNodeId = stringValue(record.reviewNodeId);
+  const agentNodeId = stringValue(record.agentNodeId);
+  const previousAgentSessionId = stringValue(record.previousAgentSessionId);
+  if (!reviewNodeId || !agentNodeId || !previousAgentSessionId) return null;
+  return {
+    id: stringValue(record.id) || cryptoId("pending-review"),
+    graphSessionId,
+    reviewNodeId,
+    agentNodeId,
+    previousAgentSessionId,
+    incomingExpressionNodeId: nullableString(record.incomingExpressionNodeId),
+    incomingEdgeIds: arrayOfStrings(record.incomingEdgeIds),
+    incomingResultId: nullableString(record.incomingResultId),
+    upstreamAgentSessionIds: arrayOfStrings(record.upstreamAgentSessionIds),
+    question: textValue(record.question) || "Review requested.",
+    createdAt: stringValue(record.createdAt) || new Date().toISOString(),
   };
 }
 
@@ -730,7 +752,13 @@ function markRunningSessionsStopped(data, reason) {
 }
 
 function sessionStatusValue(value) {
-  return value === "running" || value === "completed" || value === "failed" || value === "stopped" ? value : "completed";
+  return value === "running" ||
+    value === "waiting_review" ||
+    value === "completed" ||
+    value === "failed" ||
+    value === "stopped"
+    ? value
+    : "completed";
 }
 
 function nodeStateValue(value) {
