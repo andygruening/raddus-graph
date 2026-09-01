@@ -64,7 +64,7 @@ import {
   writeCanvasViewport,
 } from "./canvasViewportStorage";
 
-type PaletteTab = "agents" | "expressions";
+type PaletteTab = "agents" | "expressions" | "other";
 type OverlayPanel = PaletteTab | null;
 type SettingsTab = "projects" | "agents";
 type SaveStatus = "idle" | "saving" | "saved" | "error";
@@ -1675,6 +1675,7 @@ function CardPalette({
   onOpenExpression: (result: ResultDefinition) => void;
   onRemoveExpression: (resultId: string) => void;
 }) {
+  const addButtonAction = activeTab === "agents" ? onCreateAgent : activeTab === "expressions" ? onCreateExpression : null;
   const addButtonTitle = activeTab === "agents" ? "Create agent" : "Create expression";
   const [collapsed, setCollapsed] = React.useState(readPaletteCollapsedState);
 
@@ -1706,10 +1707,22 @@ function CardPalette({
             <Braces size={14} aria-hidden="true" />
             <span>Expressions</span>
           </button>
+          <button
+            className={activeTab === "other" ? "active" : ""}
+            type="button"
+            role="tab"
+            aria-selected={activeTab === "other"}
+            onClick={() => onActiveTabChange("other")}
+          >
+            <CircleDot size={14} aria-hidden="true" />
+            <span>Other</span>
+          </button>
         </div>
-        <button className="palette-tab-add-button" type="button" onClick={activeTab === "agents" ? onCreateAgent : onCreateExpression} title={addButtonTitle} aria-label={addButtonTitle}>
-          <Plus size={13} aria-hidden="true" />
-        </button>
+        {addButtonAction ? (
+          <button className="palette-tab-add-button" type="button" onClick={addButtonAction} title={addButtonTitle} aria-label={addButtonTitle}>
+            <Plus size={13} aria-hidden="true" />
+          </button>
+        ) : null}
       </div>
       {!collapsed ? (
         <div className="palette-list">
@@ -1727,9 +1740,8 @@ function CardPalette({
                 />
               ))}
             </>
-          ) : (
+          ) : activeTab === "expressions" ? (
             <>
-              <PaletteReviewButton draggingItemKey={draggingItemKey} onBeginDrag={onBeginDrag} />
               {results.length === 0 ? <div className="palette-empty">No expressions available</div> : null}
               {results.map((result) => (
                 <PaletteExpressionButton
@@ -1742,6 +1754,8 @@ function CardPalette({
                 />
               ))}
             </>
+          ) : (
+            <PaletteReviewButton draggingItemKey={draggingItemKey} onBeginDrag={onBeginDrag} />
           )}
         </div>
       ) : null}

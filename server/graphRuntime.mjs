@@ -402,10 +402,7 @@ async function runAgentNode({ session, graph, agents, results, node, upstreamAge
 }
 
 export function buildAgentPrompt({ session, graph, agents, results, node, agent, agentSession, upstreamAgentSessionIds, userPrompt }) {
-  const availableResults = results.filter((result) => !reservedResultIds.has(result.id)).map((result) => ({
-    id: result.id,
-    description: result.description,
-  }));
+  const availableResults = availableResultsForAgent({ graph, results, node });
 
   return [
     "# Agent Session",
@@ -425,6 +422,37 @@ export function buildAgentPrompt({ session, graph, agents, results, node, agent,
     "## User Context",
     markdownFence(userPrompt ?? session.prompt, "md"),
   ].join("\n");
+}
+
+export function availableResultsForAgent({ graph, results, node }) {
+  const graphNodes = Array.isArray(graph?.nodes) ? graph.nodes : [];
+  const graphEdges = Array.isArray(graph?.edges) ? graph.edges : [];
+  const resultDefinitions = Array.isArray(results) ? results : [];
+  const evaluatedExpressionNodeIds = new Set(
+    graphEdges
+      .filter((edge) => edge.source === node?.id && edge.type === "evaluates")
+      .flatMap((edge) => {
+        const expressionNode = graphNodes.find((candidate) => candidate.id === edge.target && candidate.type === "expression");
+        return expressionNode ? [expressionNode.id] : [];
+      }),
+  );
+  const reachableResultIds = new Set(
+    graphEdges
+      .filter((edge) => edge.type === "routes" && evaluatedExpressionNodeIds.has(edge.source))
+      .flatMap((edge) => {
+        const routeTarget = graphNodes.find((candidate) => (
+          candidate.id === edge.target && (candidate.type === "agent" || candidate.type === "review")
+        ));
+        return edge.resultId && routeTarget && !reservedResultIds.has(edge.resultId) ? [edge.resultId] : [];
+      }),
+  );
+
+  return resultDefinitions
+    .filter((result) => reachableResultIds.has(result.id) && !reservedResultIds.has(result.id))
+    .map((result) => ({
+      id: result.id,
+      description: result.description,
+    }));
 }
 
 export function agentSessionTranscriptOutput(agentSession) {
@@ -482,7 +510,7 @@ function updatesSection(availableResults) {
 
 function resultListSection(availableResults) {
   if (availableResults.length === 0) {
-    return "- No custom completed result IDs are defined. If you complete successfully, omit `resultId`; the graph will route through `unknown`.";
+    return "- No connected custom completed result IDs are defined for this agent. If you complete successfully, omit `resultId`; the graph will route through `unknown`.";
   }
   return availableResults.map((result) => `- \`${result.id}\`: ${result.description || "No description."}`).join("\n");
 }

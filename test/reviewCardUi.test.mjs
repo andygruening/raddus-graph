@@ -17,6 +17,9 @@ test("review cards are available in the canvas UI and styled like start cards", 
   assert.deepEqual(projectNodeSizeForType("review"), projectNodeSizeForType("play"));
   assert.deepEqual(projectNodeSizeForType("review"), { width: 56, height: 56 });
   assert.deepEqual(projectNodeSizeForType("play"), { width: 56, height: 56 });
+  assert.ok(app.includes('type PaletteTab = "agents" | "expressions" | "other"'), "The palette should include an Other tab.");
+  assert.ok(app.includes("<span>Other</span>"), "The Other tab should be visible in the palette.");
+  assert.ok(app.includes('activeTab === "other"'), "The Review palette item should live behind the Other tab.");
   assert.ok(app.includes("function PaletteReviewButton"), "The palette should expose a review card.");
   assert.ok(app.includes("function ReviewDialog"), "Clicking a pending review should open a response dialog.");
   assert.ok(app.includes("submitReviewResponse"), "Review answers should call the resume API.");
