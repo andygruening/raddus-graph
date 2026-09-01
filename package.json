@@ -1,6 +1,6 @@
 {
   "name": "@raddus/graph",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": false,
   "description": "Raddus Graph local CLI agent graph app.",
   "type": "module",
