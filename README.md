@@ -100,10 +100,10 @@ Each agent session records the node and agent spec it ran, the full assembled pr
 Agent prompts are assembled as structured Markdown with:
 
 - repository and branch
-- behavior instructions
+- compact behavior instructions
 - the local status callback contract
-- prior agent session output under `History`
-- the original play-node prompt as the final `User Context` section
+- recent prior agent handoff details under `History`
+- the play-node prompt or review response as the final `User Context` section
 
 Agent sessions append progress and terminal outcome JSON to the local status file named by `RADDUS_GRAPH_STATUS_FILE`. The file uses one compact JSON object per line and is deleted by the server before workspace changes are published.
 
@@ -122,6 +122,7 @@ DELETE /api/graph/sessions/:graphSessionId
 ```
 
 Removing a graph session stops active child processes first and deletes the retained session workspace.
+Completed, failed, and stopped graph sessions can be continued from the Sessions window. Continuation reuses the retained workspace, tries the current project graph first, and falls back to the stored session snapshot.
 
 Expression cards route only after terminal outcomes. `completed` routes by a valid emitted result ID. Unknown, invalid, or unbranched outcomes route through reserved `default`. `stopped` ends without routing.
 

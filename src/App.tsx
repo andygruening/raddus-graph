@@ -130,11 +130,21 @@ type GraphExecutionView = {
   primaryActiveAgentSession: AgentSession | null;
   primaryPreviousAgentSession: AgentSession | null;
 };
+type AgentHandoffDingTracker = {
+  initialized: boolean;
+  activeAgentSessionIds: Set<string>;
+  playedAgentSessionIds: Set<string>;
+};
+type AudioContextFactory = new () => AudioContext;
+type BrowserWindowWithLegacyAudio = Window & typeof globalThis & {
+  webkitAudioContext?: AudioContextFactory;
+};
 
 const api = new RaddusGraphApi();
 const reservedResultIds = new Set(["completed", "failed", "ask-for-approval", "default"]);
 const protectedResultIds = new Set([...reservedResultIds, "unknown", "fallback"]);
 const paletteCollapsedStorageKey = "raddus-graph:card-palette-collapsed";
+let agentHandoffAudioContext: AudioContext | null = null;
 
 export default function App() {
   const [state, setState] = React.useState<GraphState | null>(null);
@@ -151,6 +161,7 @@ export default function App() {
   const [followedSessionId, setFollowedSessionId] = React.useState<string | null>(null);
   const [focusedAgentSessionId, setFocusedAgentSessionId] = React.useState<string | null>(null);
   const [runningPlayNodeId, setRunningPlayNodeId] = React.useState<string | null>(null);
+  const [continuingSessionId, setContinuingSessionId] = React.useState<string | null>(null);
   const [resultDraft, setResultDraft] = React.useState({ id: "", description: "" });
   const [camera, setCamera] = React.useState<CanvasViewport>(defaultCanvasViewport);
   const [draggingNodeId, setDraggingNodeId] = React.useState<string | null>(null);
@@ -175,6 +186,11 @@ export default function App() {
   const suppressNodeClickRef = React.useRef(false);
   const edgeDragMovedRef = React.useRef(false);
   const edgeAnchorDragChangedRef = React.useRef(false);
+  const agentHandoffDingRef = React.useRef<AgentHandoffDingTracker>({
+    initialized: false,
+    activeAgentSessionIds: new Set(),
+    playedAgentSessionIds: new Set(),
+  });
 
   React.useEffect(() => {
     latestState.current = state;
@@ -195,12 +211,44 @@ export default function App() {
   }, []);
 
   React.useEffect(() => {
+    const unlockAudio = () => primeAgentHandoffDing();
+    window.addEventListener("pointerdown", unlockAudio, { capture: true, once: true });
+    window.addEventListener("keydown", unlockAudio, { capture: true, once: true });
+    return () => {
+      window.removeEventListener("pointerdown", unlockAudio, { capture: true });
+      window.removeEventListener("keydown", unlockAudio, { capture: true });
+    };
+  }, []);
+
+  React.useEffect(() => {
     if (!state?.sessions.some((session) => session.status === "running")) return undefined;
     const timer = window.setInterval(() => {
       void refreshSessions();
     }, 2500);
     return () => window.clearInterval(timer);
   }, [state?.sessions]);
+
+  React.useEffect(() => {
+    if (!state) return;
+    const tracker = agentHandoffDingRef.current;
+    const activeAgentSessionIds = new Set<string>();
+    let shouldPlayDing = false;
+
+    for (const session of state.sessions) {
+      for (const agentSession of session.agentSessions) {
+        if (!session.activeAgentSessionIds.includes(agentSession.id) || !isStartedAgentSession(agentSession)) continue;
+        activeAgentSessionIds.add(agentSession.id);
+        if (!tracker.initialized || tracker.activeAgentSessionIds.has(agentSession.id) || tracker.playedAgentSessionIds.has(agentSession.id)) continue;
+        if (!didAgentStartAfterPreviousFinished(session, agentSession)) continue;
+        tracker.playedAgentSessionIds.add(agentSession.id);
+        shouldPlayDing = true;
+      }
+    }
+
+    tracker.initialized = true;
+    tracker.activeAgentSessionIds = activeAgentSessionIds;
+    if (shouldPlayDing) playAgentHandoffDing();
+  }, [state]);
 
   React.useEffect(() => {
     if (!followedSessionId || !state) return;
@@ -712,6 +760,7 @@ export default function App() {
       setDialog(launchSelection ? { type: "graph-play" } : { type: "play", nodeId: node.id });
       return false;
     }
+    primeAgentHandoffDing();
     setRunningPlayNodeId(node.id);
     setError(null);
     try {
@@ -774,12 +823,35 @@ export default function App() {
     }
   }
 
+  async function continueSession(sessionId: string) {
+    setContinuingSessionId(sessionId);
+    setError(null);
+    try {
+      const payload = await api.continueSession(sessionId);
+      setState((current) => {
+        const next = current ? {
+          ...current,
+          sessions: current.sessions.map((session) => session.id === payload.session.id ? payload.session : session),
+        } : current;
+        latestState.current = next;
+        return next;
+      });
+      setFollowedSessionId(payload.session.id);
+      setFocusedAgentSessionId(null);
+    } catch (continueError) {
+      setError(errorMessage(continueError));
+    } finally {
+      setContinuingSessionId(null);
+    }
+  }
+
   async function submitPendingReview(reviewNodeId: string, answer: string): Promise<boolean> {
     const sessionId = selectedGraphSession?.id;
     if (!sessionId) {
       setError("Select a waiting session before responding.");
       return false;
     }
+    primeAgentHandoffDing();
     setError(null);
     try {
       const payload = await api.submitReviewResponse(sessionId, { reviewNodeId, answer });
@@ -1555,8 +1627,10 @@ export default function App() {
           sessions={state.sessions}
           followedSessionId={followedSessionId}
           focusedAgentSessionId={focusedAgentSessionId}
+          continuingSessionId={continuingSessionId}
           onRefresh={() => void refreshSessions()}
           onFollowSession={followGraphSession}
+          onContinueSession={(sessionId) => void continueSession(sessionId)}
           onStop={requestStopSession}
           onRemoveSession={requestRemoveSession}
           onClose={() => setDialog(null)}
@@ -2663,8 +2737,10 @@ function SessionsDialog({
   sessions,
   followedSessionId,
   focusedAgentSessionId,
+  continuingSessionId,
   onRefresh,
   onFollowSession,
+  onContinueSession,
   onStop,
   onRemoveSession,
   onClose,
@@ -2672,8 +2748,10 @@ function SessionsDialog({
   sessions: GraphSession[];
   followedSessionId: string | null;
   focusedAgentSessionId: string | null;
+  continuingSessionId: string | null;
   onRefresh: () => void;
   onFollowSession: (sessionId: string) => void;
+  onContinueSession: (sessionId: string) => void;
   onStop: (sessionId: string) => void;
   onRemoveSession: (sessionId: string) => void;
   onClose: () => void;
@@ -2789,6 +2867,17 @@ function SessionsDialog({
                       <button className="secondary-button compact-button" type="button" onClick={() => onStop(selectedSession.id)}>
                         <Square size={15} aria-hidden="true" />
                         Stop
+                      </button>
+                    ) : null}
+                    {canContinueGraphSession(selectedSession) ? (
+                      <button
+                        className="secondary-button compact-button"
+                        type="button"
+                        onClick={() => onContinueSession(selectedSession.id)}
+                        disabled={continuingSessionId === selectedSession.id}
+                      >
+                        {continuingSessionId === selectedSession.id ? <Loader2 className="spin" size={15} aria-hidden="true" /> : <Play size={15} aria-hidden="true" />}
+                        Continue
                       </button>
                     ) : null}
                     <button className="danger-button compact-button" type="button" onClick={() => onRemoveSession(selectedSession.id)}>
@@ -3654,6 +3743,82 @@ function edgeExecutionClass(edgeId: string, executionView: GraphExecutionView | 
 
 function isTerminalAgentSession(agentSession: AgentSession): boolean {
   return agentSession.status === "completed" || agentSession.status === "failed" || agentSession.status === "stopped";
+}
+
+function canContinueGraphSession(session: GraphSession): boolean {
+  return session.status === "completed" || session.status === "failed" || session.status === "stopped";
+}
+
+function isStartedAgentSession(agentSession: AgentSession): boolean {
+  return agentSession.status !== "queued" && !isTerminalAgentSession(agentSession);
+}
+
+function didAgentStartAfterPreviousFinished(session: GraphSession, agentSession: AgentSession): boolean {
+  if (!agentSession.previousAgentSessionId) return false;
+  const previousAgentSession = session.agentSessions.find((candidate) => candidate.id === agentSession.previousAgentSessionId);
+  return Boolean(previousAgentSession && isTerminalAgentSession(previousAgentSession));
+}
+
+function primeAgentHandoffDing() {
+  const audioContext = agentHandoffAudioContextForWindow();
+  if (!audioContext || audioContext.state !== "suspended") return;
+  void audioContext.resume().catch(() => undefined);
+}
+
+function playAgentHandoffDing() {
+  const audioContext = agentHandoffAudioContextForWindow();
+  if (!audioContext) return;
+  if (audioContext.state === "suspended") {
+    void audioContext.resume().then(() => emitAgentHandoffDing(audioContext)).catch(() => undefined);
+    return;
+  }
+  emitAgentHandoffDing(audioContext);
+}
+
+function agentHandoffAudioContextForWindow(): AudioContext | null {
+  if (agentHandoffAudioContext && agentHandoffAudioContext.state !== "closed") return agentHandoffAudioContext;
+  const AudioContextConstructor = window.AudioContext ?? (window as BrowserWindowWithLegacyAudio).webkitAudioContext;
+  if (!AudioContextConstructor) return null;
+  agentHandoffAudioContext = new AudioContextConstructor();
+  return agentHandoffAudioContext;
+}
+
+function emitAgentHandoffDing(audioContext: AudioContext) {
+  const now = audioContext.currentTime;
+  const duration = 0.42;
+  const masterGain = audioContext.createGain();
+  const overtoneGain = audioContext.createGain();
+  const fundamental = audioContext.createOscillator();
+  const overtone = audioContext.createOscillator();
+
+  masterGain.gain.setValueAtTime(0.0001, now);
+  masterGain.gain.exponentialRampToValueAtTime(0.16, now + 0.018);
+  masterGain.gain.exponentialRampToValueAtTime(0.0001, now + duration);
+  overtoneGain.gain.setValueAtTime(0.28, now);
+
+  fundamental.type = "sine";
+  fundamental.frequency.setValueAtTime(880, now);
+  fundamental.frequency.exponentialRampToValueAtTime(1174.66, now + 0.09);
+
+  overtone.type = "triangle";
+  overtone.frequency.setValueAtTime(1760, now);
+
+  fundamental.connect(masterGain);
+  overtone.connect(overtoneGain);
+  overtoneGain.connect(masterGain);
+  masterGain.connect(audioContext.destination);
+
+  fundamental.start(now);
+  overtone.start(now);
+  fundamental.stop(now + duration);
+  overtone.stop(now + duration * 0.72);
+
+  fundamental.addEventListener("ended", () => {
+    fundamental.disconnect();
+    overtone.disconnect();
+    overtoneGain.disconnect();
+    masterGain.disconnect();
+  }, { once: true });
 }
 
 function formatElapsedTime(startValue: string, endValue?: string) {

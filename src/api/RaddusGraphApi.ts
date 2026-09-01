@@ -267,6 +267,10 @@ export class RaddusGraphApi {
     return requestJson<{ session: GraphSession }>(`/api/graph/sessions/${encodeURIComponent(sessionId)}/stop`, jsonInit("POST"));
   }
 
+  continueSession(sessionId: string): Promise<{ session: GraphSession }> {
+    return requestJson<{ session: GraphSession }>(`/api/graph/sessions/${encodeURIComponent(sessionId)}/continue`, jsonInit("POST"));
+  }
+
   deleteSession(sessionId: string): Promise<{ removedSessionId: string; sessions: GraphSession[] }> {
     return requestJson<{ removedSessionId: string; sessions: GraphSession[] }>(`/api/graph/sessions/${encodeURIComponent(sessionId)}`, jsonInit("DELETE"));
   }

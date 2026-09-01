@@ -19,6 +19,10 @@ import { commandWorks, runProcess } from "./processUtils.mjs";
 
 let graphServerOrigin = "http://127.0.0.1:5174";
 const runningProcesses = new Map();
+const maxPromptHistoryEntries = 6;
+const maxPromptHistoryHandoffChars = 1600;
+const maxPromptHistorySummaryChars = 240;
+const maxPromptResultDescriptionChars = 120;
 
 export function setGraphServerOrigin(origin) {
   graphServerOrigin = origin;
@@ -221,6 +225,39 @@ export async function submitReviewResponse(sessionId, body) {
   return session;
 }
 
+export async function continueGraphSession(sessionId) {
+  const existingSession = await getSession(sessionId);
+  if (!existingSession) return null;
+  if (existingSession.status === "running") throw new Error("Graph session is already running.");
+  if (existingSession.status === "waiting_review") throw new Error("Answer the pending review before continuing this graph session.");
+
+  const plan = await continuationPlanForSession(existingSession);
+  const session = await updateGraphSession(sessionId, (current) => {
+    if (current.status === "running") throw new Error("Graph session is already running.");
+    if (current.status === "waiting_review") throw new Error("Answer the pending review before continuing this graph session.");
+    return {
+      ...current,
+      status: "running",
+      activeAgentSessionIds: [],
+      pendingReview: null,
+      error: null,
+      graphSnapshot: plan.graph,
+      agentsSnapshot: plan.agents,
+      resultsSnapshot: plan.results,
+      projectName: plan.projectName ?? current.projectName,
+      updatedAt: new Date().toISOString(),
+    };
+  });
+
+  queueMicrotask(() => {
+    continueGraphSessionFromPlan(sessionId, plan).catch(async (error) => {
+      await failSession(sessionId, error);
+    });
+  });
+
+  return session;
+}
+
 async function continueGraphSessionFromReview(sessionId, pendingReview, answer) {
   let session = await getSession(sessionId);
   if (!session) throw new Error(`Graph session not found: ${sessionId}`);
@@ -245,6 +282,24 @@ async function continueGraphSessionFromReview(sessionId, pendingReview, answer) 
       incomingResultId: pendingReview.incomingResultId,
     },
     userPrompt: answer,
+  });
+}
+
+async function continueGraphSessionFromPlan(sessionId, plan) {
+  if (plan.target.reviewPause) {
+    await pauseSessionForReview({ sessionId, ...plan.target.reviewPause });
+    return;
+  }
+
+  await continueGraphSessionFromAgent({
+    sessionId,
+    graph: plan.graph,
+    agents: plan.agents,
+    results: plan.results,
+    currentAgentNode: plan.target.currentAgentNode,
+    visitedAgentSessionIds: plan.target.visitedAgentSessionIds,
+    currentArrival: plan.target.currentArrival,
+    userPrompt: plan.userPrompt,
   });
 }
 
@@ -403,6 +458,110 @@ async function runAgentNode({ session, graph, agents, results, node, upstreamAge
   return agentSession.id;
 }
 
+async function continuationPlanForSession(session) {
+  const data = await readGraphData();
+  const candidates = continuationDefinitionCandidates(data, session);
+  let lastError = null;
+
+  for (const candidate of candidates) {
+    try {
+      return {
+        ...candidate,
+        target: continuationTargetForSession({ session, graph: candidate.graph }),
+        userPrompt: session.prompt,
+      };
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  throw lastError ?? new Error("Graph session has no graph definition to continue.");
+}
+
+function continuationDefinitionCandidates(data, session) {
+  const project = data.projects?.find((candidate) => candidate.id === session.projectId) ?? null;
+  const candidates = [];
+
+  if (project?.graph) {
+    candidates.push({
+      graph: project.graph,
+      agents: project.agents ?? [],
+      results: project.results ?? [],
+      projectName: project.name,
+    });
+  }
+
+  if (session.graphSnapshot) {
+    candidates.push({
+      graph: session.graphSnapshot,
+      agents: session.agentsSnapshot ?? [],
+      results: session.resultsSnapshot ?? [],
+      projectName: session.projectName,
+    });
+  }
+
+  return candidates;
+}
+
+export function continuationTargetForSession({ session, graph }) {
+  const orderedSessions = orderedAgentSessionsForRuntime(session);
+  if (orderedSessions.length === 0) {
+    const firstAgentNode = firstAgentNodeForPlay(graph, session.playNodeId);
+    if (!firstAgentNode) throw new Error("No agent node is connected to this session's play node.");
+    return {
+      currentAgentNode: firstAgentNode,
+      currentArrival: null,
+      visitedAgentSessionIds: [],
+      reviewPause: null,
+    };
+  }
+
+  const lastAgentSession = orderedSessions.at(-1);
+  const lastAgentNode = graph.nodes.find((candidate) => candidate.id === lastAgentSession.nodeId && candidate.type === "agent");
+  if (!lastAgentNode) throw new Error("The last agent node is no longer available in this graph.");
+
+  const lastOutcome = lastAgentSession.terminalOutcome;
+  if (!lastOutcome || lastOutcome.state === "stopped" || lastAgentSession.status === "stopped") {
+    return {
+      currentAgentNode: lastAgentNode,
+      currentArrival: arrivalForAgentSession(lastAgentSession),
+      visitedAgentSessionIds: orderedSessions.slice(0, -1).map((agentSession) => agentSession.id),
+      reviewPause: null,
+    };
+  }
+
+  const nextRoute = nextGraphRouteFromOutcome({ graph, currentAgentNode: lastAgentNode, outcome: lastOutcome });
+  if (!nextRoute) throw new Error("No next agent or review card is connected to continue from the last result.");
+
+  const visitedAgentSessionIds = orderedSessions.map((agentSession) => agentSession.id);
+  if (nextRoute.node.type === "review") {
+    return {
+      currentAgentNode: null,
+      currentArrival: null,
+      visitedAgentSessionIds,
+      reviewPause: {
+        reviewNode: nextRoute.node,
+        agentNode: lastAgentNode,
+        agentSession: lastAgentSession,
+        route: nextRoute,
+        upstreamAgentSessionIds: visitedAgentSessionIds,
+      },
+    };
+  }
+
+  return {
+    currentAgentNode: nextRoute.node,
+    currentArrival: {
+      previousAgentSessionId: lastAgentSession.id,
+      incomingExpressionNodeId: nextRoute.expressionNodeId,
+      incomingEdgeIds: nextRoute.edgeIds,
+      incomingResultId: nextRoute.resultId,
+    },
+    visitedAgentSessionIds,
+    reviewPause: null,
+  };
+}
+
 export function buildAgentPrompt({ session, graph, agents, results, node, agent, agentSession, upstreamAgentSessionIds, userPrompt }) {
   const availableResults = availableResultsForAgent({ graph, results, node });
 
@@ -467,81 +626,95 @@ export function agentSessionTranscriptOutput(agentSession) {
 
 function repositorySection(session) {
   const repository = session.repository?.nameWithOwner ? session.repository.nameWithOwner : "None selected";
-  const branch = session.repository?.branch || session.branchName || "None selected";
-  return [
-    `Repository: ${repository}`,
-    `Branch: ${branch}`,
-    "Work from the current working directory for this agent session.",
-  ].join("\n");
+  const branch = session.repository?.branch || session.branchName;
+  return `Repo: ${branch ? `${repository} @ ${branch}` : repository}\nCwd: current agent session workspace.`;
 }
 
 function behaviorSection(agent) {
   const instructions = stringValue(agent.systemPrompt) || `You are ${agent.name}.`;
   return [
     markdownFence(instructions, "md"),
-    "",
-    "- Use the History section as context from earlier agent sessions in this graph session.",
-    "- Do not repeat completed work unless it is needed to finish the current task.",
-    "- Keep changes scoped to the user context and the repository state in front of you.",
-    "- When your work is useful to later agent sessions, put the handoff details in your terminal result detail and final response.",
-    "- If you are blocked, post a failed terminal result that explains the blocker and what is needed next.",
+    "Use History as concise handoff context. Keep scope tight, avoid repeat work, and put downstream handoff details in terminal `detail`.",
   ].join("\n");
 }
 
 function updatesSection(availableResults) {
   const completedResultId = availableResults[0]?.id ?? "completed";
   return [
-    "Append progress and terminal results as one compact JSON object per line to `$RADDUS_GRAPH_STATUS_FILE`.",
-    "Do not write Markdown, comments, or pretty-printed JSON to that file.",
-    "",
-    "Progress update example:",
-    markdownFence('{"state":"working","summary":"Short update.","detail":"Optional detail."}', "json"),
-    "",
-    "Terminal success example:",
-    markdownFence(`{"state":"completed","resultId":"${completedResultId}","summary":"Short result.","detail":"What downstream agents need to know."}`, "json"),
-    "",
-    "Terminal failure example:",
-    markdownFence('{"state":"failed","summary":"Short failure.","detail":"Why it failed and what is needed next."}', "json"),
-    "",
-    "Before your CLI session finishes, append exactly one terminal result with `state` set to `completed` or `failed`.",
-    "If that terminal result is meant to pause for user review, put the exact question you want answered in `detail`.",
-    "When `state` is `failed`, omit `resultId`; the graph routes through `failed`.",
-    "When `state` is `completed`, use one of these result IDs when a connected route should run:",
+    'Write compact JSONL to `$RADDUS_GRAPH_STATUS_FILE`. Progress is optional: {"state":"working","summary":"Short update.","detail":"Optional detail."}',
+    `Before exit, append exactly one terminal object: {"state":"completed","resultId":"${completedResultId}","summary":"Short result.","detail":"Downstream handoff."} or {"state":"failed","summary":"Short failure.","detail":"Blocker or next step."}`,
+    "Failed terminal results omit `resultId`. Review pauses put the exact user question in `detail`.",
     resultListSection(availableResults),
   ].join("\n");
 }
 
 function resultListSection(availableResults) {
   if (availableResults.length === 0) {
-    return "- No connected completed result IDs are defined for this agent. Use `completed` or omit `resultId`; the graph will route through `completed`.";
+    return "Success routes: use `completed` or omit `resultId`.";
   }
-  return availableResults.map((result) => `- \`${result.id}\`: ${result.description || "No description."}`).join("\n");
+  return `Success routes: ${availableResults.map((result) => {
+    const description = compactSingleLine(result.description, maxPromptResultDescriptionChars);
+    return description ? `\`${result.id}\` (${description})` : `\`${result.id}\``;
+  }).join("; ")}`;
 }
 
 function historySection({ session, graph, agents, upstreamAgentSessionIds }) {
-  const sections = upstreamAgentSessionIds.flatMap((agentSessionId, index) => {
+  const historyAgentSessionIds = upstreamAgentSessionIds.slice(-maxPromptHistoryEntries);
+  const omittedCount = upstreamAgentSessionIds.length - historyAgentSessionIds.length;
+  const sections = historyAgentSessionIds.flatMap((agentSessionId, index) => {
     const upstreamAgentSession = session.agentSessions.find((candidate) => candidate.id === agentSessionId);
     if (!upstreamAgentSession) return [];
     const upstreamNode = graph.nodes.find((candidate) => candidate.id === upstreamAgentSession.nodeId);
     const upstreamAgent = upstreamAgentSession.agentId ? agents.find((candidate) => candidate.id === upstreamAgentSession.agentId) : null;
     const outcome = upstreamAgentSession.terminalOutcome ?? null;
-    const agentName = upstreamAgent?.name || upstreamNode?.id || `Agent Session ${index + 1}`;
+    const agentName = upstreamAgent?.name || upstreamNode?.id || `Agent Session ${omittedCount + index + 1}`;
+    const summary = compactSingleLine(outcome?.summary, maxPromptHistorySummaryChars);
+    const handoff = compactText(agentSessionHandoffOutput(upstreamAgentSession), maxPromptHistoryHandoffChars);
+    const includeHandoff = handoff && handoff !== summary;
     return [[
-      `### ${index + 1}. ${agentName}`,
-      `Result: ${historyResultLabel(outcome, upstreamAgentSession.status)}`,
-      outcome?.summary ? `Summary: ${outcome.summary}` : null,
-      "",
-      markdownFence(agentSessionTranscriptOutput(upstreamAgentSession) || "No output captured.", "md"),
+      `### ${omittedCount + index + 1}. ${agentName}`,
+      `Result: ${historyResultLabel(outcome, upstreamAgentSession.status)}${summary ? ` - ${summary}` : ""}`,
+      includeHandoff ? markdownFence(handoff, "md") : null,
     ].filter(Boolean).join("\n")];
   });
 
-  return sections.length > 0 ? sections.join("\n\n") : "No prior agent session output.";
+  if (omittedCount > 0) {
+    sections.unshift(`${omittedCount} earlier agent session${omittedCount === 1 ? "" : "s"} omitted; rely on repository state plus recent handoffs.`);
+  }
+
+  return sections.length > 0 ? sections.join("\n\n") : "No prior agent handoff.";
 }
 
 function historyResultLabel(outcome, fallbackStatus) {
   if (!outcome) return fallbackStatus || "unavailable";
   const resultId = outcome.emittedResultId || outcome.routedResultId;
   return resultId ? `${outcome.state} / ${resultId}` : outcome.state;
+}
+
+function agentSessionHandoffOutput(agentSession) {
+  const outcome = agentSession?.terminalOutcome ?? null;
+  return stringValue(outcome?.detail) ||
+    stringValue(outcome?.summary) ||
+    agentSessionTranscriptOutput(agentSession);
+}
+
+function compactText(value, maxChars) {
+  const text = String(value ?? "")
+    .trim()
+    .replace(/\r\n/g, "\n")
+    .replace(/[ \t]+$/gm, "")
+    .replace(/\n{3,}/g, "\n\n");
+  if (!text || text.length <= maxChars) return text;
+  const clippedLength = Math.max(0, maxChars - 28);
+  const clipped = text.slice(0, clippedLength).trimEnd();
+  return `${clipped}\n\n[truncated ${text.length - clipped.length} chars]`;
+}
+
+function compactSingleLine(value, maxChars) {
+  const text = String(value ?? "").trim().replace(/\s+/g, " ");
+  if (!text || text.length <= maxChars) return text;
+  const clippedLength = Math.max(0, maxChars - 15);
+  return `${text.slice(0, clippedLength).trimEnd()}... [truncated]`;
 }
 
 function markdownFence(value, language = "") {
@@ -722,6 +895,23 @@ function routeForResult(graph, expressionEntries, resultId) {
   return null;
 }
 
+function orderedAgentSessionsForRuntime(session) {
+  const agentSessions = Array.isArray(session?.agentSessions) ? session.agentSessions : [];
+  return [...agentSessions].sort((a, b) => {
+    const sequenceComparison = numberValue(a?.sequence, 0) - numberValue(b?.sequence, 0);
+    return sequenceComparison || stringValue(a?.startedAt).localeCompare(stringValue(b?.startedAt));
+  });
+}
+
+function arrivalForAgentSession(agentSession) {
+  return {
+    previousAgentSessionId: nullableString(agentSession?.previousAgentSessionId),
+    incomingExpressionNodeId: nullableString(agentSession?.incomingExpressionNodeId),
+    incomingEdgeIds: Array.isArray(agentSession?.incomingEdgeIds) ? agentSession.incomingEdgeIds.map(stringValue).filter(Boolean) : [],
+    incomingResultId: nullableString(agentSession?.incomingResultId),
+  };
+}
+
 async function pauseSessionForReview({ sessionId, reviewNode, agentNode, agentSession, route, upstreamAgentSessionIds }) {
   if (!agentSession?.id) throw new Error("Cannot pause for review without a completed agent session.");
   const now = new Date().toISOString();
@@ -804,6 +994,11 @@ function stringValue(value) {
 function nullableString(value) {
   const text = stringValue(value);
   return text || null;
+}
+
+function numberValue(value, fallback) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : fallback;
 }
 
 function textValue(value) {
