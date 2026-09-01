@@ -3,7 +3,7 @@
 Raddus Graph is a local web app for designing and running CLI-backed agent graphs. It lets you define agent specs, result IDs, play nodes, and expression cards, then run graph sessions through local Codex or Claude CLI processes.
 
 [![npmjs.com](https://img.shields.io/badge/View%20on%20npmjs.com-6d9abf)](https://www.npmjs.com/package/@raddus/graph)
-<img width="1214" height="625" alt="Raddus Graph canvas screenshot" src="https://github.com/user-attachments/assets/517b66cd-6986-4027-b91f-3fd3ee0d8750" />
+<img width="1235" height="629" alt="Raddus Graph canvas screenshot" src="https://github.com/user-attachments/assets/1edcdda9-132a-4690-a156-08f0e0b4a46c" />
 
 ## Features
 
