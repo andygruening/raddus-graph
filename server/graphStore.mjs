@@ -320,6 +320,7 @@ function defaultProjectRecord({ id, name, graph, now }) {
     id,
     name,
     graph,
+    lastPlaySelection: null,
     createdAt: now,
     updatedAt: now,
   };
@@ -334,10 +335,11 @@ function normalizeProjects(value, legacyGraph) {
       const id = stringValue(record.id) || cryptoId("project");
       if (seen.has(id)) return [];
       seen.add(id);
+      const graph = normalizeGraph(record.graph);
       return [defaultProjectRecord({
         id,
         name: stringValue(record.name) || "Untitled Project",
-        graph: normalizeGraph(record.graph),
+        graph,
         now,
       })];
     })
@@ -348,6 +350,7 @@ function normalizeProjects(value, legacyGraph) {
       const record = asRecord(value[index]);
       return {
         ...project,
+        lastPlaySelection: normalizePlayLaunchSelection(record.lastPlaySelection, project.graph),
         createdAt: stringValue(record.createdAt) || project.createdAt,
         updatedAt: stringValue(record.updatedAt) || project.updatedAt,
       };
@@ -360,6 +363,19 @@ function normalizeProjects(value, legacyGraph) {
     graph: normalizeGraph(legacyGraph),
     now,
   })];
+}
+
+function normalizePlayLaunchSelection(value, graph) {
+  const record = asRecord(value);
+  const playNodeId = stringValue(record.playNodeId);
+  if (!playNodeId || !graph.nodes.some((node) => node.id === playNodeId && node.type === "play")) return null;
+  const repository = nullableString(record.repository);
+  return {
+    playNodeId,
+    prompt: stringValue(record.prompt),
+    repository,
+    branch: repository ? nullableString(record.branch) : null,
+  };
 }
 
 function selectedProjectIdValue(value, projects) {

@@ -66,10 +66,18 @@ export interface GraphDocument {
   edges: GraphEdge[];
 }
 
+export interface PlayLaunchSelection {
+  playNodeId: string;
+  prompt: string;
+  repository: string | null;
+  branch: string | null;
+}
+
 export interface ProjectRecord {
   id: string;
   name: string;
   graph: GraphDocument;
+  lastPlaySelection: PlayLaunchSelection | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -183,6 +191,18 @@ export interface BranchListResult {
   branches: string[];
 }
 
+export interface AgentCliStatus {
+  id: RunnerId;
+  label: string;
+  command: string;
+  available: boolean;
+}
+
+export interface AgentCliStatusResult {
+  agents: AgentCliStatus[];
+  checkedAt: string;
+}
+
 export class RaddusGraphApiError extends Error {
   constructor(
     message: string,
@@ -204,6 +224,10 @@ export class RaddusGraphApi {
 
   getModels(): Promise<{ models: ModelCatalogEntry[] }> {
     return requestJson<{ models: ModelCatalogEntry[] }>("/api/graph/models");
+  }
+
+  getCliStatus(): Promise<AgentCliStatusResult> {
+    return requestJson<AgentCliStatusResult>("/api/graph/cli-status");
   }
 
   listRepositories(): Promise<RepositoryListResult> {
