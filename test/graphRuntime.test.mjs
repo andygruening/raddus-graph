@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { buildAgentPrompt, cliArgsForRunner, statusPayloadsFromText } from "../server/graphRuntime.mjs";
+import { buildAgentPrompt, cliArgsForRunner, nextGraphRouteFromOutcome, reviewQuestionFromAgentSession, statusPayloadsFromText } from "../server/graphRuntime.mjs";
 
 test("codex runner args use the current noninteractive approval flag", () => {
   const { args, input } = cliArgsForRunner(
@@ -126,6 +126,7 @@ test("agent prompt is structured markdown with history output and user context l
   assert.match(prompt, /^# Agent Session\n/);
   assert.match(prompt, /## Repository\nRepository: owner\/repo\nBranch: feature\/session-prompts/);
   assert.match(prompt, /## Updates And Session Result\n[\s\S]*\$RADDUS_GRAPH_STATUS_FILE/);
+  assert.match(prompt, /pause for user review[\s\S]*`detail`/);
   assert.match(prompt, /- `approved`: Approved result/);
   assert.match(prompt, /## History\n### 1\. Agent A\nResult: completed \/ approved\nSummary: Tiny terminal summary/);
   assert.match(prompt, /Actual transcript output from Agent A\./);
@@ -137,6 +138,69 @@ test("agent prompt is structured markdown with history output and user context l
     "## User Context",
     "```md",
     "Ship the requested change.",
+    "```",
+  ].join("\n")));
+});
+
+test("review routes pause at a review node and review answers become the next user context", () => {
+  const route = nextGraphRouteFromOutcome({
+    graph: {
+      nodes: [
+        { id: "agent-a", type: "agent", agentId: "agent-a" },
+        { id: "expr-review", type: "expression", resultId: "needs-review" },
+        { id: "review-a", type: "review" },
+      ],
+      edges: [
+        { id: "edge-agent-expr", source: "agent-a", target: "expr-review", type: "evaluates" },
+        { id: "edge-expr-review", source: "expr-review", target: "review-a", type: "routes", resultId: "needs-review" },
+      ],
+    },
+    currentAgentNode: { id: "agent-a", type: "agent", agentId: "agent-a" },
+    outcome: {
+      state: "completed",
+      routedResultId: "needs-review",
+    },
+  });
+
+  assert.equal(route?.node.type, "review");
+  assert.equal(route?.node.id, "review-a");
+  assert.deepEqual(route?.edgeIds, ["edge-agent-expr", "edge-expr-review"]);
+
+  const question = reviewQuestionFromAgentSession({
+    response: "Raw response",
+    terminalOutcome: {
+      detail: "Should I apply this change?",
+      summary: "Review needed.",
+    },
+  });
+
+  assert.equal(question, "Should I apply this change?");
+
+  const prompt = buildAgentPrompt({
+    session: {
+      id: "graph-session-review",
+      prompt: "Original graph prompt.",
+      repository: null,
+      workspacePath: "/tmp/raddus-workspace",
+      agentSessions: [],
+    },
+    graph: {
+      nodes: [{ id: "agent-a", type: "agent", agentId: "agent-a" }],
+      edges: [],
+    },
+    agents: [{ id: "agent-a", name: "Agent A", model: "gpt-5", systemPrompt: "" }],
+    results: [{ id: "approved", description: "Approved result" }],
+    node: { id: "agent-a", type: "agent", agentId: "agent-a" },
+    agent: { id: "agent-a", name: "Agent A", model: "gpt-5", systemPrompt: "" },
+    agentSession: { id: "agent-session-review" },
+    upstreamAgentSessionIds: [],
+    userPrompt: "Use option B and continue.",
+  });
+
+  assert.ok(prompt.trim().endsWith([
+    "## User Context",
+    "```md",
+    "Use option B and continue.",
     "```",
   ].join("\n")));
 });

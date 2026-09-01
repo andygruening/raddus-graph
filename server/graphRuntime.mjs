@@ -76,6 +76,7 @@ export async function createGraphSession(body) {
     agentsSnapshot: state.agents,
     resultsSnapshot: state.results,
     agentSessions: [],
+    pendingReview: null,
     error: null,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
@@ -105,11 +106,32 @@ export async function runGraphSession(sessionId) {
     return;
   }
 
-  const visitedAgentSessionIds = [];
-  let currentArrival = null;
+  await continueGraphSessionFromAgent({
+    sessionId,
+    graph,
+    agents,
+    results,
+    currentAgentNode,
+    visitedAgentSessionIds: [],
+    currentArrival: null,
+    userPrompt: session.prompt,
+  });
+}
+
+async function continueGraphSessionFromAgent({
+  sessionId,
+  graph,
+  agents,
+  results,
+  currentAgentNode,
+  visitedAgentSessionIds,
+  currentArrival,
+  userPrompt,
+}) {
+  visitedAgentSessionIds = [...visitedAgentSessionIds];
   let step = 0;
   for (; step < 50 && currentAgentNode; step += 1) {
-    session = await getSession(sessionId);
+    const session = await getSession(sessionId);
     if (!session || session.status === "stopped") return;
 
     const agentSessionId = await runAgentNode({
@@ -120,12 +142,14 @@ export async function runGraphSession(sessionId) {
       node: currentAgentNode,
       upstreamAgentSessionIds: visitedAgentSessionIds,
       arrival: currentArrival,
+      userPrompt,
     });
+    userPrompt = session.prompt;
     if (!agentSessionId) return;
     visitedAgentSessionIds.push(agentSessionId);
 
-    session = await getSession(sessionId);
-    const currentExecution = session?.agentSessions.find((agentSession) => agentSession.id === agentSessionId) ?? null;
+    const latestSession = await getSession(sessionId);
+    const currentExecution = latestSession?.agentSessions.find((agentSession) => agentSession.id === agentSessionId) ?? null;
     const outcome = currentExecution?.terminalOutcome ?? null;
     if (!outcome) {
       await failSession(sessionId, new Error(`Agent node ${currentAgentNode.id} finished without a terminal outcome.`));
@@ -136,8 +160,19 @@ export async function runGraphSession(sessionId) {
       return;
     }
 
-    const nextRoute = nextAgentRouteFromOutcome({ graph, currentAgentNode, outcome });
-    currentAgentNode = nextRoute?.node ?? null;
+    const nextRoute = nextGraphRouteFromOutcome({ graph, currentAgentNode, outcome });
+    if (nextRoute?.node.type === "review") {
+      await pauseSessionForReview({
+        sessionId,
+        reviewNode: nextRoute.node,
+        agentNode: currentAgentNode,
+        agentSession: currentExecution,
+        route: nextRoute,
+        upstreamAgentSessionIds: visitedAgentSessionIds,
+      });
+      return;
+    }
+    currentAgentNode = nextRoute?.node.type === "agent" ? nextRoute.node : null;
     currentArrival = nextRoute ? {
       previousAgentSessionId: agentSessionId,
       incomingExpressionNodeId: nextRoute.expressionNodeId,
@@ -154,6 +189,63 @@ export async function runGraphSession(sessionId) {
   await completeSession(sessionId, "Graph session finished.");
 }
 
+export async function submitReviewResponse(sessionId, body) {
+  const payload = asRecord(body);
+  const answer = textValue(payload.answer);
+  const reviewNodeId = stringValue(payload.reviewNodeId);
+  if (!answer) throw new Error("Enter a response before continuing the graph.");
+
+  let pendingReview = null;
+  const session = await updateGraphSession(sessionId, (current) => {
+    if (current.status !== "waiting_review" || !current.pendingReview) throw new Error("Graph session is not waiting for review.");
+    if (reviewNodeId && current.pendingReview.reviewNodeId !== reviewNodeId) throw new Error("This review card is not waiting for input.");
+    pendingReview = current.pendingReview;
+    return {
+      ...current,
+      status: "running",
+      pendingReview: null,
+      error: null,
+      updatedAt: new Date().toISOString(),
+    };
+  });
+  if (!session || !pendingReview) throw new Error("Graph session is not waiting for review.");
+
+  queueMicrotask(() => {
+    continueGraphSessionFromReview(sessionId, pendingReview, answer).catch(async (error) => {
+      await failSession(sessionId, error);
+    });
+  });
+
+  return session;
+}
+
+async function continueGraphSessionFromReview(sessionId, pendingReview, answer) {
+  let session = await getSession(sessionId);
+  if (!session) throw new Error(`Graph session not found: ${sessionId}`);
+  const graph = session.graphSnapshot;
+  const agents = session.agentsSnapshot ?? [];
+  const results = session.resultsSnapshot ?? [];
+  if (!graph) throw new Error("Graph session is missing its graph snapshot.");
+  const agentNode = graph.nodes.find((node) => node.id === pendingReview.agentNodeId && node.type === "agent");
+  if (!agentNode) throw new Error("The review response target agent is no longer available.");
+
+  await continueGraphSessionFromAgent({
+    sessionId,
+    graph,
+    agents,
+    results,
+    currentAgentNode: agentNode,
+    visitedAgentSessionIds: pendingReview.upstreamAgentSessionIds,
+    currentArrival: {
+      previousAgentSessionId: pendingReview.previousAgentSessionId,
+      incomingExpressionNodeId: pendingReview.incomingExpressionNodeId,
+      incomingEdgeIds: pendingReview.incomingEdgeIds,
+      incomingResultId: pendingReview.incomingResultId,
+    },
+    userPrompt: answer,
+  });
+}
+
 export async function stopGraphSession(sessionId) {
   const currentSession = await getSession(sessionId);
   const activeAgentSessionIds = currentSession?.activeAgentSessionIds ?? [];
@@ -167,6 +259,7 @@ export async function stopGraphSession(sessionId) {
     ...current,
     status: "stopped",
     activeAgentSessionIds: [],
+    pendingReview: null,
     updatedAt: new Date().toISOString(),
   }));
   return session;
@@ -237,7 +330,7 @@ async function runAgentNode({ session, graph, agents, results, node, upstreamAge
   const statusFilePath = statusFilePathForAgentSession(session.workspacePath, agentSession.id);
   await rm(statusFilePath, { force: true }).catch(() => undefined);
 
-  const prompt = buildAgentPrompt({ session, graph, agents, results, node, agent, agentSession, upstreamAgentSessionIds, statusFilePath });
+  const prompt = buildAgentPrompt({ session, graph, agents, results, node, agent, agentSession, upstreamAgentSessionIds, statusFilePath, userPrompt });
   await setAgentSessionPrompt(session.id, agentSession.id, prompt);
   await recordAgentSessionStatus(session.id, agentSession.id, { state: "started", summary: `Starting ${agent.name}.` }, "server");
 
@@ -308,7 +401,7 @@ async function runAgentNode({ session, graph, agents, results, node, upstreamAge
   return agentSession.id;
 }
 
-export function buildAgentPrompt({ session, graph, agents, results, node, agent, agentSession, upstreamAgentSessionIds }) {
+export function buildAgentPrompt({ session, graph, agents, results, node, agent, agentSession, upstreamAgentSessionIds, userPrompt }) {
   const availableResults = results.filter((result) => !reservedResultIds.has(result.id)).map((result) => ({
     id: result.id,
     description: result.description,
@@ -330,7 +423,7 @@ export function buildAgentPrompt({ session, graph, agents, results, node, agent,
     historySection({ session, graph, agents, upstreamAgentSessionIds }),
     "",
     "## User Context",
-    markdownFence(session.prompt, "md"),
+    markdownFence(userPrompt ?? session.prompt, "md"),
   ].join("\n");
 }
 
@@ -381,6 +474,7 @@ function updatesSection(availableResults) {
     markdownFence('{"state":"failed","summary":"Short failure.","detail":"Why it failed and what is needed next."}', "json"),
     "",
     "Before your CLI session finishes, append exactly one terminal result with `state` set to `completed` or `failed`.",
+    "If that terminal result is meant to pause for user review, put the exact question you want answered in `detail`.",
     "When `state` is `completed`, use one of these result IDs:",
     resultListSection(availableResults),
   ].join("\n");
@@ -561,7 +655,7 @@ function firstAgentNodeForPlay(graph, playNodeId) {
   return edge ? graph.nodes.find((node) => node.id === edge.target && node.type === "agent") ?? null : null;
 }
 
-function nextAgentRouteFromOutcome({ graph, currentAgentNode, outcome }) {
+export function nextGraphRouteFromOutcome({ graph, currentAgentNode, outcome }) {
   const routedResultId = outcome.routedResultId;
   if (!routedResultId || outcome.state === "stopped") return null;
 
@@ -583,7 +677,9 @@ function routeForResult(graph, expressionEntries, resultId) {
     if (routeEdge.type !== "routes" || routeEdge.resultId !== resultId) continue;
     const expressionEntry = expressionEntries.find((entry) => entry.node.id === routeEdge.source);
     if (!expressionEntry) continue;
-    const node = graph.nodes.find((candidate) => candidate.id === routeEdge.target && candidate.type === "agent");
+    const node = graph.nodes.find((candidate) => (
+      candidate.id === routeEdge.target && (candidate.type === "agent" || candidate.type === "review")
+    ));
     if (!node) continue;
     return {
       node,
@@ -593,6 +689,40 @@ function routeForResult(graph, expressionEntries, resultId) {
     };
   }
   return null;
+}
+
+async function pauseSessionForReview({ sessionId, reviewNode, agentNode, agentSession, route, upstreamAgentSessionIds }) {
+  if (!agentSession?.id) throw new Error("Cannot pause for review without a completed agent session.");
+  const now = new Date().toISOString();
+  await updateGraphSession(sessionId, (current) => ({
+    ...current,
+    status: "waiting_review",
+    activeAgentSessionIds: [],
+    pendingReview: {
+      id: `pending-review-${globalThis.crypto.randomUUID().slice(0, 8)}`,
+      graphSessionId: sessionId,
+      reviewNodeId: reviewNode.id,
+      agentNodeId: agentNode.id,
+      previousAgentSessionId: agentSession.id,
+      incomingExpressionNodeId: route.expressionNodeId,
+      incomingEdgeIds: route.edgeIds,
+      incomingResultId: route.resultId,
+      upstreamAgentSessionIds,
+      question: reviewQuestionFromAgentSession(agentSession),
+      createdAt: now,
+    },
+    error: null,
+    updatedAt: now,
+  }));
+}
+
+export function reviewQuestionFromAgentSession(agentSession) {
+  const outcome = agentSession?.terminalOutcome ?? null;
+  return stringValue(outcome?.detail) ||
+    stringValue(outcome?.summary) ||
+    stringValue(agentSession?.response) ||
+    stringValue(agentSession?.stdout) ||
+    "Review requested.";
 }
 
 async function getSession(sessionId) {
@@ -605,6 +735,7 @@ async function completeSession(sessionId, summary) {
     ...current,
     status: current.status === "stopped" ? "stopped" : "completed",
     activeAgentSessionIds: [],
+    pendingReview: null,
     error: null,
     updatedAt: new Date().toISOString(),
     completionSummary: summary,
@@ -617,6 +748,7 @@ async function failSession(sessionId, error) {
     ...current,
     status: "failed",
     activeAgentSessionIds: [],
+    pendingReview: null,
     error: message,
     updatedAt: new Date().toISOString(),
   }));
@@ -641,4 +773,8 @@ function stringValue(value) {
 function nullableString(value) {
   const text = stringValue(value);
   return text || null;
+}
+
+function textValue(value) {
+  return typeof value === "string" ? value.trim() : "";
 }

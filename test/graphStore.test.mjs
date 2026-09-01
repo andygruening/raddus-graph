@@ -134,3 +134,89 @@ test("saving agents preserves supported Codex reasoning effort", async () => {
     delete process.env.RADDUS_GRAPH_DIR;
   }
 });
+
+test("graph store preserves review cards and pending review state", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "raddus-graph-store-"));
+  process.env.RADDUS_GRAPH_DIR = dataDir;
+  try {
+    const store = await import(`../server/graphStore.mjs?graph-store-test=${Date.now()}-review`);
+    await store.initializeGraphStore();
+
+    const graph = {
+      nodes: [
+        { id: "agent-a", type: "agent", x: 0, y: 0, agentId: "agent-a" },
+        { id: "expr-review", type: "expression", x: 220, y: 0, resultId: "needs-review" },
+        { id: "review-a", type: "review", x: 440, y: 0 },
+      ],
+      edges: [
+        { id: "edge-agent-expr", source: "agent-a", target: "expr-review", type: "evaluates" },
+        { id: "edge-expr-review", source: "expr-review", target: "review-a", type: "routes", resultId: "needs-review" },
+      ],
+    };
+
+    await store.replaceGraphState({
+      selectedProjectId: "project-review",
+      projects: [{
+        id: "project-review",
+        name: "Review Project",
+        graph,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      }],
+      graph,
+      agents: [{ id: "agent-a", name: "Agent A", model: "gpt-5", systemPrompt: "" }],
+      results: [{ id: "needs-review", description: "Ask the user." }],
+    });
+
+    await store.addGraphSession({
+      id: "graph-session-review",
+      status: "waiting_review",
+      playNodeId: "play-start",
+      prompt: "Original prompt",
+      repository: null,
+      workspacePath: join(dataDir, "sessions", "graph-session-review", "worktree"),
+      activeAgentSessionIds: [],
+      projectId: "project-review",
+      projectName: "Review Project",
+      graphSnapshot: graph,
+      agentsSnapshot: [{ id: "agent-a", name: "Agent A", model: "gpt-5", systemPrompt: "" }],
+      resultsSnapshot: [{ id: "needs-review", description: "Ask the user." }],
+      agentSessions: [],
+      pendingReview: {
+        id: "pending-review-a",
+        reviewNodeId: "review-a",
+        agentNodeId: "agent-a",
+        previousAgentSessionId: "agent-session-a",
+        incomingExpressionNodeId: "expr-review",
+        incomingEdgeIds: ["edge-agent-expr", "edge-expr-review"],
+        incomingResultId: "needs-review",
+        upstreamAgentSessionIds: ["agent-session-a"],
+        question: "Should I continue?",
+        createdAt: "2026-01-01T00:00:00.000Z",
+      },
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+
+    const saved = await store.readGraphData();
+    assert.equal(saved.graph.nodes.find((node) => node.id === "review-a")?.type, "review");
+    assert.equal(saved.graph.edges.find((edge) => edge.id === "edge-expr-review")?.target, "review-a");
+    assert.equal(saved.sessions[0].status, "waiting_review");
+    assert.deepEqual(saved.sessions[0].pendingReview, {
+      id: "pending-review-a",
+      graphSessionId: "graph-session-review",
+      reviewNodeId: "review-a",
+      agentNodeId: "agent-a",
+      previousAgentSessionId: "agent-session-a",
+      incomingExpressionNodeId: "expr-review",
+      incomingEdgeIds: ["edge-agent-expr", "edge-expr-review"],
+      incomingResultId: "needs-review",
+      upstreamAgentSessionIds: ["agent-session-a"],
+      question: "Should I continue?",
+      createdAt: "2026-01-01T00:00:00.000Z",
+    });
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+    delete process.env.RADDUS_GRAPH_DIR;
+  }
+});

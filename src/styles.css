@@ -657,23 +657,6 @@ a:focus-visible {
   cursor: grabbing;
 }
 
-.project-edge-label {
-  fill: var(--edge-blue, #5f9dea);
-  paint-order: stroke;
-  stroke: var(--surface-bg);
-  stroke-width: 5px;
-  stroke-linejoin: round;
-  text-anchor: middle;
-  font-size: 12px;
-  font-weight: 900;
-  pointer-events: none;
-}
-
-.project-edge-group.execution-visited-route .project-edge-label,
-.project-edge-group.execution-active-route .project-edge-label {
-  fill: var(--edge-color);
-}
-
 .project-node {
   position: absolute;
   z-index: 1;
@@ -821,13 +804,13 @@ a:focus-visible {
 
 .project-node.play {
   --node-accent: #0f8b5f;
-  width: 168px;
-  height: 72px;
-  min-height: 72px;
+  width: 56px;
+  height: 56px;
+  min-height: 56px;
   align-content: center;
   gap: 0;
   overflow: hidden;
-  padding: 10px;
+  padding: 0;
   border-color: color-mix(in srgb, var(--node-accent) 70%, var(--border-subtle));
   background: var(--surface-bg);
 }
@@ -835,6 +818,28 @@ a:focus-visible {
 .project-node.play.running {
   border-color: var(--node-accent);
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--node-accent) 14%, transparent), var(--popover-shadow);
+}
+
+.project-node.review {
+  --node-accent: #b45309;
+  width: 56px;
+  height: 56px;
+  min-height: 56px;
+  align-content: center;
+  gap: 0;
+  overflow: visible;
+  padding: 0;
+  border-color: color-mix(in srgb, var(--node-accent) 70%, var(--border-subtle));
+  background: var(--surface-bg);
+}
+
+.project-node.review .project-card-remove {
+  top: -6px;
+  right: -6px;
+}
+
+.project-node.palette-node-preview.review {
+  overflow: hidden;
 }
 
 .project-node.agent {
@@ -851,12 +856,36 @@ a:focus-visible {
 .project-node.expression {
   --node-accent: #7c3aed;
   border-color: var(--node-accent);
-  width: 168px;
-  height: 72px;
-  min-height: 72px;
+  width: 140px;
+  height: 44px;
+  min-height: 44px;
   align-content: center;
   gap: 0;
-  padding: 10px;
+  padding: 6px 14px;
+  border-radius: 999px;
+  overflow: visible;
+}
+
+.project-node.expression .project-node-identity-main {
+  gap: 6px;
+}
+
+.project-node.expression .project-node-identity-main > svg {
+  width: 14px;
+  height: 14px;
+}
+
+.project-node.expression .project-node-identity strong {
+  max-width: calc(100% - 20px);
+  font-size: 13px;
+}
+
+.project-node.expression .project-card-remove {
+  top: -6px;
+  right: -6px;
+}
+
+.project-node.palette-node-preview.expression {
   overflow: hidden;
 }
 
@@ -1553,6 +1582,7 @@ textarea:focus {
 }
 
 .status-pill.running,
+.status-pill.waiting_review,
 .status-pill.started,
 .status-pill.working,
 .status-pill.queued {
@@ -1574,6 +1604,31 @@ textarea:focus {
 .status-pill.stopped {
   background: var(--surface-hover);
   color: var(--secondary-text);
+}
+
+.review-question {
+  min-width: 0;
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--card-radius);
+  background: var(--surface-hover);
+}
+
+.review-question > span {
+  color: var(--secondary-text);
+  font-size: 12px;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.review-question p {
+  margin: 0;
+  color: var(--primary-text);
+  font-size: 14px;
+  line-height: 1.45;
+  white-space: pre-wrap;
 }
 
 .play-sessions-panel {

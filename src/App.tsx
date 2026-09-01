@@ -13,6 +13,7 @@ import {
   List,
   Loader2,
   Menu,
+  MessageSquareText,
   Play,
   Plus,
   RefreshCw,
@@ -37,6 +38,7 @@ import {
   type GraphSession,
   type GraphState,
   type ModelCatalogEntry,
+  type PendingReview,
   type PlayLaunchSelection,
   type ProjectRecord,
   type ReasoningEffortOption,
@@ -55,12 +57,17 @@ import {
   type Point,
   projectNodeSizeForType,
 } from "./edgeRouting";
+import {
+  defaultCanvasViewport,
+  readCanvasViewport,
+  type CanvasViewport,
+  writeCanvasViewport,
+} from "./canvasViewportStorage";
 
 type PaletteTab = "agents" | "expressions";
 type OverlayPanel = PaletteTab | null;
 type SettingsTab = "projects" | "agents";
 type SaveStatus = "idle" | "saving" | "saved" | "error";
-type CanvasViewport = { x: number; y: number; zoom: number };
 type ConnectionState = "idle" | "source" | "valid" | "invalid";
 type EdgeEndpoint = "source" | "target";
 type EdgeAnchorDrag = { edgeId: string; endpoint: EdgeEndpoint } | null;
@@ -69,6 +76,7 @@ type DialogState =
   | { type: "agent-details"; agentId: string }
   | { type: "play"; nodeId: string }
   | { type: "graph-play" }
+  | { type: "review"; nodeId: string }
   | { type: "expression"; nodeId: string }
   | { type: "expression-definition"; resultId: string }
   | { type: "result-create" }
@@ -87,7 +95,8 @@ type AgentDraft = Pick<AgentSpec, "name" | "model" | "modelReasoningEffort" | "s
 type ProjectDraft = Pick<ProjectRecord, "name">;
 type PaletteItem =
   | { type: "agent"; agentId: string }
-  | { type: "expression"; resultId: string };
+  | { type: "expression"; resultId: string }
+  | { type: "review" };
 type PaletteDropConnection = {
   source: GraphNode;
   target: GraphNode;
@@ -111,6 +120,7 @@ type GraphExecutionView = {
   previousAgentSessionIds: Set<string>;
   previousNodeIds: Set<string>;
   activeExpressionNodeIds: Set<string>;
+  activeReviewNodeIds: Set<string>;
   activeRouteEdgeIds: Set<string>;
   visitedNodeIds: Set<string>;
   visitedExpressionNodeIds: Set<string>;
@@ -122,7 +132,6 @@ type GraphExecutionView = {
 };
 
 const api = new RaddusGraphApi();
-const defaultCanvasViewport: CanvasViewport = { x: 0, y: 0, zoom: 1 };
 const reservedResultIds = new Set(["unknown", "fallback"]);
 const paletteCollapsedStorageKey = "raddus-graph:card-palette-collapsed";
 
@@ -156,6 +165,9 @@ export default function App() {
   const connectionPreviewPathRef = React.useRef<SVGPathElement | null>(null);
   const cameraRef = React.useRef(camera);
   const cameraFrameRef = React.useRef<number | null>(null);
+  const persistCameraFrameRef = React.useRef(false);
+  const persistCameraProjectIdFrameRef = React.useRef<string | null>(null);
+  const persistCameraValueFrameRef = React.useRef<CanvasViewport | null>(null);
   const latestState = React.useRef<GraphState | null>(null);
   const localEditVersionRef = React.useRef(0);
   const saveRequestIdRef = React.useRef(0);
@@ -170,6 +182,12 @@ export default function App() {
   React.useEffect(() => {
     cameraRef.current = camera;
   }, [camera]);
+
+  React.useEffect(() => {
+    const projectId = state?.selectedProjectId;
+    if (!projectId) return;
+    restoreCanvasViewport(projectId);
+  }, [state?.selectedProjectId]);
 
   React.useEffect(() => {
     void loadInitial();
@@ -293,7 +311,7 @@ export default function App() {
       setFollowedSessionId(current ? latestSessionForProject(current.sessions, selectedProjectId)?.id ?? null : null);
       setFocusedAgentSessionId(null);
     }
-    setCamera(defaultCanvasViewport);
+    restoreCanvasViewport(selectedProjectId);
   }
 
   function followGraphSession(sessionId: string) {
@@ -332,7 +350,7 @@ export default function App() {
       ...current,
       projects: [...current.projects, project],
     }, project.id));
-    setCamera(defaultCanvasViewport);
+    restoreCanvasViewport(project.id);
     return project;
   }
 
@@ -637,20 +655,20 @@ export default function App() {
     });
   }
 
-  async function runPlayLaunch(selection: PlayLaunchSelection) {
+  async function runPlayLaunch(selection: PlayLaunchSelection): Promise<boolean> {
     const current = latestState.current;
     const node = current?.graph.nodes.find((candidate) => candidate.id === selection.playNodeId && candidate.type === "play");
     if (!node) {
       setError("Select a play prompt before running.");
       setDialog({ type: "graph-play" });
-      return;
+      return false;
     }
-    await runPlayNode(node, selection);
+    return runPlayNode(node, selection);
   }
 
-  async function runPlayNode(node: GraphNode, launchSelection?: PlayLaunchSelection) {
+  async function runPlayNode(node: GraphNode, launchSelection?: PlayLaunchSelection): Promise<boolean> {
     const current = latestState.current;
-    if (!current || node.type !== "play") return;
+    if (!current || node.type !== "play") return false;
     const freshNode = current.graph.nodes.find((candidate) => candidate.id === node.id && candidate.type === "play") ?? node;
     const nextSelection: PlayLaunchSelection = {
       playNodeId: freshNode.id,
@@ -662,7 +680,7 @@ export default function App() {
     if (!prompt) {
       setError("Enter a play prompt before running.");
       setDialog(launchSelection ? { type: "graph-play" } : { type: "play", nodeId: node.id });
-      return;
+      return false;
     }
     setRunningPlayNodeId(node.id);
     setError(null);
@@ -701,8 +719,10 @@ export default function App() {
       setState(next);
       setFollowedSessionId(payload.session.id);
       setFocusedAgentSessionId(null);
+      return true;
     } catch (runError) {
       setError(errorMessage(runError));
+      return false;
     } finally {
       setRunningPlayNodeId(null);
     }
@@ -721,6 +741,32 @@ export default function App() {
       });
     } catch (stopError) {
       setError(errorMessage(stopError));
+    }
+  }
+
+  async function submitPendingReview(reviewNodeId: string, answer: string): Promise<boolean> {
+    const sessionId = selectedGraphSession?.id;
+    if (!sessionId) {
+      setError("Select a waiting session before responding.");
+      return false;
+    }
+    setError(null);
+    try {
+      const payload = await api.submitReviewResponse(sessionId, { reviewNodeId, answer });
+      setState((current) => {
+        const next = current ? {
+          ...current,
+          sessions: current.sessions.map((session) => session.id === payload.session.id ? payload.session : session),
+        } : current;
+        latestState.current = next;
+        return next;
+      });
+      setFollowedSessionId(payload.session.id);
+      setFocusedAgentSessionId(null);
+      return true;
+    } catch (reviewError) {
+      setError(errorMessage(reviewError));
+      return false;
     }
   }
 
@@ -752,15 +798,41 @@ export default function App() {
 
   function scheduleCamera(nextCamera: CanvasViewport) {
     cameraRef.current = nextCamera;
+    const projectId = latestState.current?.selectedProjectId ?? null;
+    if (projectId) {
+      persistCameraFrameRef.current = true;
+      persistCameraProjectIdFrameRef.current = projectId;
+      persistCameraValueFrameRef.current = nextCamera;
+    }
     if (cameraFrameRef.current !== null) return;
     cameraFrameRef.current = window.requestAnimationFrame(() => {
       cameraFrameRef.current = null;
-      setCamera(cameraRef.current);
+      const nextCamera = cameraRef.current;
+      const shouldPersist = persistCameraFrameRef.current;
+      const persistProjectId = persistCameraProjectIdFrameRef.current;
+      const persistCamera = persistCameraValueFrameRef.current;
+      persistCameraFrameRef.current = false;
+      persistCameraProjectIdFrameRef.current = null;
+      persistCameraValueFrameRef.current = null;
+      setCamera(nextCamera);
+      if (shouldPersist && persistProjectId && persistCamera) writeCanvasViewport(persistProjectId, persistCamera);
     });
   }
 
   function resetCanvasViewport() {
     scheduleCamera(defaultCanvasViewport);
+  }
+
+  function restoreCanvasViewport(projectId: string) {
+    const nextCamera = readCanvasViewport(projectId);
+    cameraRef.current = nextCamera;
+    setCamera(nextCamera);
+  }
+
+  function persistCanvasViewport(nextCamera = cameraRef.current) {
+    const projectId = latestState.current?.selectedProjectId;
+    if (!projectId) return;
+    writeCanvasViewport(projectId, nextCamera);
   }
 
   function screenToWorld(clientX: number, clientY: number, viewCamera = cameraRef.current): { x: number; y: number } {
@@ -1038,6 +1110,7 @@ export default function App() {
     function onUp() {
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
+      persistCanvasViewport();
     }
 
     window.addEventListener("pointermove", onMove);
@@ -1093,6 +1166,7 @@ export default function App() {
     : null;
   const followedSession = followedSessionId ? state?.sessions.find((session) => session.id === followedSessionId) ?? null : null;
   const selectedGraphSession = followedSession && graphSessions.some((session) => session.id === followedSession.id) ? followedSession : null;
+  const pendingReview = selectedGraphSession?.pendingReview ?? null;
   const executionView = selectedGraphSession ? graphExecutionViewForSession(selectedGraphSession) : null;
 
   return (
@@ -1258,11 +1332,6 @@ export default function App() {
                           d="M -5 -5 L 5 0 L -5 5 Z"
                           transform={`translate(${geometry.arrow.x} ${geometry.arrow.y}) rotate(${geometry.arrow.angle})`}
                         />
-                        {edge.resultId ? (
-                          <text className="project-edge-label" x={geometry.label.x} y={geometry.label.y - 12}>
-                            {edge.resultId}
-                          </text>
-                        ) : null}
                         <circle
                           className={`project-edge-handle ${edge.type}`}
                           cx={geometry.handle.x}
@@ -1337,6 +1406,7 @@ export default function App() {
                         }
                         if (node.type === "agent" && node.agentId) setDialog({ type: "agent-details", agentId: node.agentId });
                         if (node.type === "play") setDialog({ type: "play", nodeId: node.id });
+                        if (node.type === "review") setDialog({ type: "review", nodeId: node.id });
                         if (node.type === "expression") setDialog({ type: "expression", nodeId: node.id });
                       }}
                       shouldSuppressClick={suppressesNodeClick}
@@ -1392,7 +1462,12 @@ export default function App() {
           onClose={() => setDialog(null)}
           onUpdate={(patch) => updatePlayNode(dialog.nodeId, patch)}
           onLoadBranches={(repo) => void loadBranches(repo)}
-          onRun={(node) => void runPlayNode(node)}
+          onRun={(node) => {
+            void (async () => {
+              const started = await runPlayNode(node);
+              if (started) setDialog(null);
+            })();
+          }}
         />
       ) : null}
       {state && dialog?.type === "graph-play" ? (
@@ -1405,7 +1480,23 @@ export default function App() {
           runningPlayNodeId={runningPlayNodeId}
           onClose={() => setDialog(null)}
           onLoadBranches={(repo) => void loadBranches(repo)}
-          onRun={(selection) => void runPlayLaunch(selection)}
+          onRun={(selection) => {
+            void (async () => {
+              const started = await runPlayLaunch(selection);
+              if (started) setDialog(null);
+            })();
+          }}
+        />
+      ) : null}
+      {state && dialog?.type === "review" ? (
+        <ReviewDialog
+          pendingReview={pendingReview?.reviewNodeId === dialog.nodeId ? pendingReview : null}
+          onClose={() => setDialog(null)}
+          onSubmit={async (answer) => {
+            const started = await submitPendingReview(dialog.nodeId, answer);
+            if (started) setDialog(null);
+            return started;
+          }}
         />
       ) : null}
       {state && activeExpressionResultId && (dialog?.type === "expression" || dialog?.type === "expression-definition") ? (
@@ -1525,8 +1616,19 @@ function ProjectNodeCard({
         <>
           <div className="project-node-identity">
             <span className="project-node-identity-main">
-              {running ? <Loader2 className="spin" size={16} aria-hidden="true" /> : <Play size={16} aria-hidden="true" />}
-              <strong>Start</strong>
+              {running ? <Loader2 className="spin" size={20} aria-hidden="true" /> : <Play size={20} aria-hidden="true" />}
+            </span>
+          </div>
+        </>
+      ) : node.type === "expression" ? (
+        <>
+          <button className="icon-button compact-icon project-card-remove" type="button" onClick={onRemove} title="Remove card" aria-label="Remove card">
+            <X size={12} aria-hidden="true" />
+          </button>
+          <div className="project-node-identity">
+            <span className="project-node-identity-main">
+              <Braces size={16} aria-hidden="true" />
+              <strong>{expressionResultId}</strong>
             </span>
           </div>
         </>
@@ -1537,8 +1639,7 @@ function ProjectNodeCard({
           </button>
           <div className="project-node-identity">
             <span className="project-node-identity-main">
-              <Braces size={16} aria-hidden="true" />
-              <strong>{expressionResultId}</strong>
+              <MessageSquareText size={20} aria-hidden="true" />
             </span>
           </div>
         </>
@@ -1628,6 +1729,7 @@ function CardPalette({
             </>
           ) : (
             <>
+              <PaletteReviewButton draggingItemKey={draggingItemKey} onBeginDrag={onBeginDrag} />
               {results.length === 0 ? <div className="palette-empty">No expressions available</div> : null}
               {results.map((result) => (
                 <PaletteExpressionButton
@@ -1656,6 +1758,37 @@ function CardPalette({
         </button>
       </div>
     </aside>
+  );
+}
+
+function PaletteReviewButton({
+  draggingItemKey,
+  onBeginDrag,
+}: {
+  draggingItemKey: string | null;
+  onBeginDrag: (event: React.PointerEvent<HTMLElement>, item: PaletteItem, onOpen?: () => void) => void;
+}) {
+  const item: PaletteItem = { type: "review" };
+  const itemKey = paletteItemKey(item);
+  return (
+    <div
+      className={draggingItemKey === itemKey ? "palette-drag-item dragging" : "palette-drag-item"}
+      role="button"
+      tabIndex={0}
+      onPointerDown={(event) => onBeginDrag(event, item)}
+      onKeyDown={(event) => {
+        if (event.key !== "Enter" && event.key !== " ") return;
+        event.preventDefault();
+      }}
+      title="Review"
+      aria-label="Review. Drag to canvas."
+    >
+      <MessageSquareText size={16} aria-hidden="true" />
+      <span>
+        <strong>Review</strong>
+        <small>Wait for user input</small>
+      </span>
+    </div>
   );
 }
 
@@ -1767,7 +1900,9 @@ function PaletteNodePreview({ preview, agents, results }: { preview: PaletteDrag
   const item = preview.item;
   const previewLabel = item.type === "agent"
     ? agents.find((record) => record.id === item.agentId)?.name ?? "Agent"
-    : results.find((record) => record.id === item.resultId)?.id ?? item.resultId;
+    : item.type === "expression"
+      ? results.find((record) => record.id === item.resultId)?.id ?? item.resultId
+      : "Review";
   return (
     <article
       className={`project-node palette-node-preview ${preview.item.type} ${preview.connection ? "connect-valid" : ""}`}
@@ -1775,7 +1910,7 @@ function PaletteNodePreview({ preview, agents, results }: { preview: PaletteDrag
       aria-hidden="true"
     >
       <div className="palette-node-preview-label">
-        {preview.item.type === "agent" ? <Bot size={16} aria-hidden="true" /> : <Braces size={16} aria-hidden="true" />}
+        {preview.item.type === "agent" ? <Bot size={16} aria-hidden="true" /> : preview.item.type === "expression" ? <Braces size={16} aria-hidden="true" /> : <MessageSquareText size={16} aria-hidden="true" />}
         <span>{previewLabel}</span>
       </div>
     </article>
@@ -2279,6 +2414,82 @@ function GraphPlayDialog({
   );
 }
 
+function ReviewDialog({
+  pendingReview,
+  onClose,
+  onSubmit,
+}: {
+  pendingReview: PendingReview | null;
+  onClose: () => void;
+  onSubmit: (answer: string) => Promise<boolean>;
+}) {
+  const [answer, setAnswer] = React.useState("");
+  const [submitting, setSubmitting] = React.useState(false);
+
+  React.useEffect(() => {
+    setAnswer("");
+    setSubmitting(false);
+  }, [pendingReview?.id]);
+
+  if (!pendingReview) {
+    return (
+      <Modal title="Review" onClose={onClose}>
+        <div className="confirmation-dialog">
+          <div className="empty-state">
+            <MessageSquareText size={24} aria-hidden="true" />
+            <strong>No review waiting</strong>
+          </div>
+          <div className="dialog-actions">
+            <button className="secondary-button" type="button" onClick={onClose}>
+              <X size={16} aria-hidden="true" />
+              Close
+            </button>
+          </div>
+        </div>
+      </Modal>
+    );
+  }
+
+  return (
+    <Modal title="Review" onClose={onClose}>
+      <form
+        className="form-grid"
+        onSubmit={(event) => {
+          event.preventDefault();
+          const trimmedAnswer = answer.trim();
+          if (!trimmedAnswer || submitting) return;
+          setSubmitting(true);
+          void (async () => {
+            const started = await onSubmit(trimmedAnswer);
+            if (!started) setSubmitting(false);
+          })();
+        }}
+      >
+        <div className="form-section">
+          <div className="review-question">
+            <span>Question</span>
+            <p>{pendingReview.question}</p>
+          </div>
+          <label>
+            <span>Answer</span>
+            <textarea value={answer} onChange={(event) => setAnswer(event.target.value)} rows={5} autoFocus required />
+          </label>
+        </div>
+        <div className="dialog-actions">
+          <button className="secondary-button" type="button" onClick={onClose} disabled={submitting}>
+            <X size={16} aria-hidden="true" />
+            Close
+          </button>
+          <button className="primary-button" type="submit" disabled={submitting || !answer.trim()}>
+            {submitting ? <Loader2 className="spin" size={16} aria-hidden="true" /> : <MessageSquareText size={16} aria-hidden="true" />}
+            Continue
+          </button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
 function ExpressionDetailsDialog({
   resultId,
   result,
@@ -2511,7 +2722,7 @@ function SessionsDialog({
                         PR
                       </a>
                     ) : null}
-                    {selectedSession.status === "running" ? (
+                    {selectedSession.status === "running" || selectedSession.status === "waiting_review" ? (
                       <button className="secondary-button compact-button" type="button" onClick={() => onStop(selectedSession.id)}>
                         <Square size={15} aria-hidden="true" />
                         Stop
@@ -2788,7 +2999,9 @@ function playLaunchSelectionForNode(node: GraphNode): PlayLaunchSelection {
 }
 
 function paletteItemKey(item: PaletteItem): string {
-  return item.type === "agent" ? `${item.type}:${item.agentId}` : `${item.type}:${item.resultId}`;
+  if (item.type === "agent") return `${item.type}:${item.agentId}`;
+  if (item.type === "expression") return `${item.type}:${item.resultId}`;
+  return item.type;
 }
 
 function nodeFromPaletteItem(item: PaletteItem, x: number, y: number, id = newId(item.type)): GraphNode {
@@ -2797,6 +3010,14 @@ function nodeFromPaletteItem(item: PaletteItem, x: number, y: number, id = newId
       id,
       type: "agent",
       agentId: item.agentId,
+      x,
+      y,
+    };
+  }
+  if (item.type === "review") {
+    return {
+      id,
+      type: "review",
       x,
       y,
     };
@@ -2819,6 +3040,15 @@ function paletteConnectionForTarget(
     return { source: target, target: sourceCandidate, type: "runs", targetNodeId: target.id };
   }
   if (sourceCandidate.type === "agent" && target.type === "expression") {
+    return {
+      source: target,
+      target: sourceCandidate,
+      type: "routes",
+      resultId: selectedRouteResultForExpression(state, target.id),
+      targetNodeId: target.id,
+    };
+  }
+  if (sourceCandidate.type === "review" && target.type === "expression") {
     return {
       source: target,
       target: sourceCandidate,
@@ -2867,7 +3097,7 @@ function edgeForConnection(
   if (source.id === target.id) return null;
   if (source.type === "play" && target.type === "agent") return { source: source.id, target: target.id, type: "runs" };
   if (source.type === "agent" && target.type === "expression") return { source: source.id, target: target.id, type: "evaluates" };
-  if (source.type === "expression" && target.type === "agent") {
+  if (source.type === "expression" && (target.type === "agent" || target.type === "review")) {
     return {
       source: source.id,
       target: target.id,
@@ -3160,6 +3390,7 @@ function agentModelSummary(agent: AgentSpec) {
 
 function nodeLabel(node: GraphNode, state: GraphState) {
   if (node.type === "play") return `Start ${shortId(node.id)}`;
+  if (node.type === "review") return `Review ${shortId(node.id)}`;
   if (node.type === "expression") return `Expression ${shortId(node.id)}`;
   const agent = state.agents.find((candidate) => candidate.id === node.agentId);
   return agent?.name ?? `Agent ${shortId(node.id)}`;
@@ -3208,6 +3439,7 @@ function graphExecutionViewForSession(session: GraphSession): GraphExecutionView
   const previousAgentSessionIds = new Set<string>();
   const previousNodeIds = new Set<string>();
   const activeExpressionNodeIds = new Set<string>();
+  const activeReviewNodeIds = new Set<string>();
   const activeRouteEdgeIds = new Set<string>();
   const visitedNodeIds = new Set<string>();
   const visitedExpressionNodeIds = new Set<string>();
@@ -3231,6 +3463,15 @@ function graphExecutionViewForSession(session: GraphSession): GraphExecutionView
     if (agentSession.previousAgentSessionId) previousAgentSessionIds.add(agentSession.previousAgentSessionId);
     if (agentSession.incomingExpressionNodeId) activeExpressionNodeIds.add(agentSession.incomingExpressionNodeId);
     for (const edgeId of agentSession.incomingEdgeIds) activeRouteEdgeIds.add(edgeId);
+  }
+
+  if (session.pendingReview) {
+    activeReviewNodeIds.add(session.pendingReview.reviewNodeId);
+    visitedNodeIds.add(session.pendingReview.reviewNodeId);
+    if (session.pendingReview.incomingExpressionNodeId) activeExpressionNodeIds.add(session.pendingReview.incomingExpressionNodeId);
+    if (session.pendingReview.previousAgentSessionId) previousAgentSessionIds.add(session.pendingReview.previousAgentSessionId);
+    for (const edgeId of session.pendingReview.incomingEdgeIds) activeRouteEdgeIds.add(edgeId);
+    executionBadgesByNodeId.set(session.pendingReview.reviewNodeId, "!");
   }
 
   for (const agentSessionId of previousAgentSessionIds) {
@@ -3260,6 +3501,7 @@ function graphExecutionViewForSession(session: GraphSession): GraphExecutionView
     previousAgentSessionIds,
     previousNodeIds,
     activeExpressionNodeIds,
+    activeReviewNodeIds,
     activeRouteEdgeIds,
     visitedNodeIds,
     visitedExpressionNodeIds,
@@ -3277,6 +3519,7 @@ function nodeExecutionClass(nodeId: string, executionView: GraphExecutionView | 
   if (executionView.visitedNodeIds.has(nodeId) || executionView.visitedExpressionNodeIds.has(nodeId)) classes.push("execution-visited");
   if (executionView.previousNodeIds.has(nodeId)) classes.push("execution-previous");
   if (executionView.activeExpressionNodeIds.has(nodeId)) classes.push("execution-expression");
+  if (executionView.activeReviewNodeIds.has(nodeId)) classes.push("execution-review", "execution-active");
   if (executionView.activeNodeIds.has(nodeId)) classes.push("execution-active");
   const latestAgentSession = executionView.latestAgentSessionByNodeId.get(nodeId);
   if (latestAgentSession?.terminalOutcome?.state === "failed") classes.push("execution-failed");

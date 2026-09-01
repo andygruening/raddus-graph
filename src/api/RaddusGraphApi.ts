@@ -1,9 +1,9 @@
 export type RunnerId = "codex" | "claude";
-export type GraphNodeType = "play" | "agent" | "expression";
+export type GraphNodeType = "play" | "agent" | "expression" | "review";
 export type GraphEdgeType = "runs" | "evaluates" | "routes";
 export type CardAnchor = "top" | "right" | "bottom" | "left";
 export type EdgeRoutingMode = "auto" | "manual";
-export type GraphSessionStatus = "running" | "completed" | "failed" | "stopped";
+export type GraphSessionStatus = "running" | "waiting_review" | "completed" | "failed" | "stopped";
 export type AgentSessionStatusState = "queued" | "started" | "working" | "blocked" | "completed" | "failed" | "stopped";
 
 export interface ModelCatalogEntry {
@@ -136,6 +136,20 @@ export interface AgentSession {
   completedAt: string | null;
 }
 
+export interface PendingReview {
+  id: string;
+  graphSessionId: string;
+  reviewNodeId: string;
+  agentNodeId: string;
+  previousAgentSessionId: string;
+  incomingExpressionNodeId: string | null;
+  incomingEdgeIds: string[];
+  incomingResultId: string | null;
+  upstreamAgentSessionIds: string[];
+  question: string;
+  createdAt: string;
+}
+
 export interface GraphSession {
   id: string;
   status: GraphSessionStatus;
@@ -152,6 +166,7 @@ export interface GraphSession {
   agentsSnapshot: AgentSpec[] | null;
   resultsSnapshot: ResultDefinition[] | null;
   agentSessions: AgentSession[];
+  pendingReview: PendingReview | null;
   error: string | null;
   createdAt: string;
   updatedAt: string;
@@ -252,6 +267,10 @@ export class RaddusGraphApi {
 
   deleteSession(sessionId: string): Promise<{ removedSessionId: string; sessions: GraphSession[] }> {
     return requestJson<{ removedSessionId: string; sessions: GraphSession[] }>(`/api/graph/sessions/${encodeURIComponent(sessionId)}`, jsonInit("DELETE"));
+  }
+
+  submitReviewResponse(sessionId: string, payload: { reviewNodeId: string; answer: string }): Promise<{ session: GraphSession }> {
+    return requestJson<{ session: GraphSession }>(`/api/graph/sessions/${encodeURIComponent(sessionId)}/review-response`, jsonInit("POST", payload));
   }
 }
 

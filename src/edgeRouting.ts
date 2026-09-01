@@ -7,7 +7,6 @@ export type EdgeGeometry = {
   points: Point[];
   length: number;
   handle: Point;
-  label: Point;
   arrow: Point & { angle: number };
   sourcePoint: Point;
   targetPoint: Point;
@@ -37,7 +36,6 @@ export function edgeGeometry(edge: EdgeRoutingInput, source: GraphNode, target: 
     points: route.points,
     length: polylineLength(route.points),
     handle: route.controls[0] ?? routeHandle(route.points),
-    label: arrow,
     arrow,
     sourcePoint: route.sourcePoint,
     targetPoint: route.targetPoint,
@@ -335,6 +333,8 @@ function projectNodeCenter(node: GraphNode): Point {
 }
 
 export function projectNodeSizeForType(type: GraphNodeType): { width: number; height: number } {
-  if (type === "play" || type === "agent" || type === "expression") return { width: 168, height: 72 };
+  if (type === "expression") return { width: 140, height: 44 };
+  if (type === "play" || type === "review") return { width: 56, height: 56 };
+  if (type === "agent") return { width: 168, height: 72 };
   return { width: 168, height: 72 };
 }
