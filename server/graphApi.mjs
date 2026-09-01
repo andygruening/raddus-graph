@@ -1,7 +1,7 @@
 import { graphDataDir } from "./config.mjs";
 import { listBranches, listRepositories } from "./github.mjs";
 import { readGraphData, replaceGraphState } from "./graphStore.mjs";
-import { appendCallbackStatus, createGraphSession, deleteGraphSession, stopGraphSession, submitReviewResponse } from "./graphRuntime.mjs";
+import { appendCallbackStatus, continueGraphSession, createGraphSession, deleteGraphSession, stopGraphSession, submitReviewResponse } from "./graphRuntime.mjs";
 import { modelCatalog } from "./modelCatalog.mjs";
 import { commandWorks } from "./processUtils.mjs";
 import { HttpError } from "./errors.mjs";
@@ -80,6 +80,17 @@ export async function handleGraphApi(req, res, url) {
     const session = await stopGraphSession(id);
     if (!session) throw new HttpError(404, "Graph session not found.");
     sendJson(res, 200, { session });
+    return;
+  }
+
+  if (resource === "sessions" && id && child === "continue" && req.method === "POST" && segments.length === 3) {
+    try {
+      const session = await continueGraphSession(id);
+      if (!session) throw new HttpError(404, "Graph session not found.");
+      sendJson(res, 200, { session });
+    } catch (error) {
+      throw new HttpError(400, error instanceof Error ? error.message : String(error));
+    }
     return;
   }
 
