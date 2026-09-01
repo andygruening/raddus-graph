@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { buildAgentPrompt, cliArgsForRunner, nextGraphRouteFromOutcome, reviewQuestionFromAgentSession, statusPayloadsFromText } from "../server/graphRuntime.mjs";
+import { availableResultsForAgent, buildAgentPrompt, cliArgsForRunner, nextGraphRouteFromOutcome, reviewQuestionFromAgentSession, statusPayloadsFromText } from "../server/graphRuntime.mjs";
 
 test("codex runner args use the current noninteractive approval flag", () => {
   const { args, input } = cliArgsForRunner(
@@ -102,14 +102,26 @@ test("agent prompt is structured markdown with history output and user context l
       nodes: [
         { id: "node-a", type: "agent", agentId: "agent-a" },
         { id: "node-b", type: "agent", agentId: "agent-b" },
+        { id: "node-c", type: "agent", agentId: "agent-c" },
+        { id: "expr-approved", type: "expression", resultId: "approved" },
+        { id: "expr-ignored", type: "expression", resultId: "ignored" },
       ],
-      edges: [],
+      edges: [
+        { id: "edge-b-approved", source: "node-b", target: "expr-approved", type: "evaluates" },
+        { id: "edge-approved-c", source: "expr-approved", target: "node-c", type: "routes", resultId: "approved" },
+        { id: "edge-a-ignored", source: "node-a", target: "expr-ignored", type: "evaluates" },
+        { id: "edge-ignored-c", source: "expr-ignored", target: "node-c", type: "routes", resultId: "ignored" },
+      ],
     },
     agents: [
       { id: "agent-a", name: "Agent A", model: "gpt-5", systemPrompt: "" },
       { id: "agent-b", name: "Agent B", model: "gpt-5", systemPrompt: "" },
+      { id: "agent-c", name: "Agent C", model: "gpt-5", systemPrompt: "" },
     ],
-    results: [{ id: "approved", description: "Approved result" }],
+    results: [
+      { id: "approved", description: "Approved result" },
+      { id: "ignored", description: "Ignored result" },
+    ],
     node: { id: "node-b", type: "agent", agentId: "agent-b" },
     agent: { id: "agent-b", name: "Agent B", model: "gpt-5", systemPrompt: "" },
     agentSession: {
@@ -128,6 +140,7 @@ test("agent prompt is structured markdown with history output and user context l
   assert.match(prompt, /## Updates And Session Result\n[\s\S]*\$RADDUS_GRAPH_STATUS_FILE/);
   assert.match(prompt, /pause for user review[\s\S]*`detail`/);
   assert.match(prompt, /- `approved`: Approved result/);
+  assert.equal(prompt.includes("- `ignored`: Ignored result"), false);
   assert.match(prompt, /## History\n### 1\. Agent A\nResult: completed \/ approved\nSummary: Tiny terminal summary/);
   assert.match(prompt, /Actual transcript output from Agent A\./);
   assert.equal(prompt.includes("Raddus Graph execution context:"), false);
@@ -140,6 +153,42 @@ test("agent prompt is structured markdown with history output and user context l
     "Ship the requested change.",
     "```",
   ].join("\n")));
+});
+
+test("agent prompt result IDs are limited to reachable expression routes", () => {
+  const graph = {
+    nodes: [
+      { id: "agent-a", type: "agent", agentId: "agent-a" },
+      { id: "agent-b", type: "agent", agentId: "agent-b" },
+      { id: "expr-ready", type: "expression", resultId: "ready" },
+      { id: "expr-blocked", type: "expression", resultId: "blocked" },
+      { id: "expr-incomplete", type: "expression", resultId: "incomplete" },
+      { id: "expr-disconnected", type: "expression", resultId: "manual" },
+    ],
+    edges: [
+      { id: "edge-a-ready", source: "agent-a", target: "expr-ready", type: "evaluates" },
+      { id: "edge-ready-b", source: "expr-ready", target: "agent-b", type: "routes", resultId: "ready" },
+      { id: "edge-a-blocked", source: "agent-a", target: "expr-blocked", type: "evaluates" },
+      { id: "edge-blocked-b", source: "expr-blocked", target: "agent-b", type: "routes", resultId: "blocked" },
+      { id: "edge-a-incomplete", source: "agent-a", target: "expr-incomplete", type: "evaluates" },
+      { id: "edge-disconnected-b", source: "expr-disconnected", target: "agent-b", type: "routes", resultId: "manual" },
+    ],
+  };
+
+  assert.deepEqual(availableResultsForAgent({
+    graph,
+    results: [
+      { id: "ready", description: "Ready route" },
+      { id: "blocked", description: "Blocked route" },
+      { id: "incomplete", description: "Incomplete route" },
+      { id: "manual", description: "Disconnected route" },
+      { id: "fallback", description: "Reserved fallback" },
+    ],
+    node: { id: "agent-a", type: "agent", agentId: "agent-a" },
+  }), [
+    { id: "ready", description: "Ready route" },
+    { id: "blocked", description: "Blocked route" },
+  ]);
 });
 
 test("review routes pause at a review node and review answers become the next user context", () => {
