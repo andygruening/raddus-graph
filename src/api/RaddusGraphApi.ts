@@ -1,5 +1,5 @@
 export type RunnerId = "codex" | "claude";
-export type GraphNodeType = "play" | "agent" | "expression" | "review";
+export type GraphNodeType = "play" | "agent" | "expression" | "review" | "graph";
 export type GraphEdgeType = "runs" | "evaluates" | "routes";
 export type CardAnchor = "top" | "right" | "bottom" | "left";
 export type EdgeRoutingMode = "auto" | "manual";
@@ -46,6 +46,7 @@ export interface GraphNode {
   branch?: string | null;
   agentId?: string | null;
   resultId?: string;
+  graphId?: string | null;
 }
 
 export interface GraphEdge {
@@ -120,6 +121,7 @@ export interface TerminalOutcome {
 export interface AgentSession {
   id: string;
   graphSessionId: string;
+  graphId: string | null;
   nodeId: string;
   agentId: string | null;
   sequence: number;
@@ -141,6 +143,7 @@ export interface AgentSession {
 export interface PendingReview {
   id: string;
   graphSessionId: string;
+  graphId: string | null;
   reviewNodeId: string;
   agentNodeId: string;
   previousAgentSessionId: string;
@@ -165,6 +168,7 @@ export interface GraphSession {
   projectId: string | null;
   projectName: string | null;
   graphSnapshot: GraphDocument | null;
+  projectsSnapshot: ProjectRecord[] | null;
   agentsSnapshot: AgentSpec[] | null;
   resultsSnapshot: ResultDefinition[] | null;
   agentSessions: AgentSession[];

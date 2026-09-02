@@ -79,6 +79,7 @@ export async function createGraphSession(body) {
     projectId: project?.id ?? null,
     projectName: project?.name ?? null,
     graphSnapshot: graph,
+    projectsSnapshot: state.projects ?? [],
     agentsSnapshot: agents,
     resultsSnapshot: results,
     agentSessions: [],
@@ -106,35 +107,38 @@ export async function runGraphSession(sessionId) {
   const results = session.resultsSnapshot ?? [];
   if (!graph) throw new Error("Graph session is missing its graph snapshot.");
 
-  let currentAgentNode = firstAgentNodeForPlay(graph, session.playNodeId);
-  if (!currentAgentNode) {
-    await completeSession(sessionId, "No agent node is connected to the play node.");
+  const definition = graphDefinitionForSession(session, {
+    graph,
+    agents,
+    results,
+    projects: session.projectsSnapshot ?? [],
+  });
+  const startRoute = firstAgentRouteForStart(definition, session.playNodeId);
+  if (!startRoute) {
+    await completeSession(sessionId, "No agent node or graph card is connected to the play node.");
     return;
   }
 
   await continueGraphSessionFromAgent({
     sessionId,
-    graph,
-    agents,
-    results,
-    currentAgentNode,
+    definition: startRoute.definition,
+    currentAgentNode: startRoute.node,
     visitedAgentSessionIds: [],
-    currentArrival: null,
+    currentArrival: startRoute.arrival,
     userPrompt: session.prompt,
   });
 }
 
 async function continueGraphSessionFromAgent({
   sessionId,
-  graph,
-  agents,
-  results,
+  definition,
   currentAgentNode,
   visitedAgentSessionIds,
   currentArrival,
   userPrompt,
 }) {
   visitedAgentSessionIds = [...visitedAgentSessionIds];
+  let currentDefinition = definition;
   let step = 0;
   for (; step < 50 && currentAgentNode; step += 1) {
     const session = await getSession(sessionId);
@@ -142,15 +146,15 @@ async function continueGraphSessionFromAgent({
 
     const agentSessionId = await runAgentNode({
       session,
-      graph,
-      agents,
-      results,
+      graphId: currentDefinition.graphId,
+      graph: currentDefinition.graph,
+      agents: currentDefinition.agents,
+      results: currentDefinition.results,
       node: currentAgentNode,
       upstreamAgentSessionIds: visitedAgentSessionIds,
       arrival: currentArrival,
       userPrompt,
     });
-    userPrompt = session.prompt;
     if (!agentSessionId) return;
     visitedAgentSessionIds.push(agentSessionId);
 
@@ -166,10 +170,11 @@ async function continueGraphSessionFromAgent({
       return;
     }
 
-    const nextRoute = nextGraphRouteFromOutcome({ graph, currentAgentNode, outcome });
+    const nextRoute = nextGraphRouteFromOutcome({ graph: currentDefinition.graph, currentAgentNode, outcome });
     if (nextRoute?.node.type === "review") {
       await pauseSessionForReview({
         sessionId,
+        definition: currentDefinition,
         reviewNode: nextRoute.node,
         agentNode: currentAgentNode,
         agentSession: currentExecution,
@@ -178,13 +183,16 @@ async function continueGraphSessionFromAgent({
       });
       return;
     }
-    currentAgentNode = nextRoute?.node.type === "agent" ? nextRoute.node : null;
-    currentArrival = nextRoute ? {
-      previousAgentSessionId: agentSessionId,
-      incomingExpressionNodeId: nextRoute.expressionNodeId,
-      incomingEdgeIds: nextRoute.edgeIds,
-      incomingResultId: nextRoute.resultId,
-    } : null;
+    const nextAgentRoute = nextAgentRouteFromGraphRoute({
+      definition: currentDefinition,
+      route: nextRoute,
+      previousAgentSession: currentExecution,
+      fallbackUserPrompt: userPrompt ?? session.prompt,
+    });
+    currentAgentNode = nextAgentRoute?.node ?? null;
+    currentArrival = nextAgentRoute?.arrival ?? null;
+    currentDefinition = nextAgentRoute?.definition ?? currentDefinition;
+    userPrompt = nextAgentRoute?.userPrompt ?? userPrompt ?? session.prompt;
   }
 
   if (currentAgentNode) {
@@ -242,6 +250,7 @@ export async function continueGraphSession(sessionId) {
       pendingReview: null,
       error: null,
       graphSnapshot: plan.graph,
+      projectsSnapshot: plan.projects ?? current.projectsSnapshot,
       agentsSnapshot: plan.agents,
       resultsSnapshot: plan.results,
       projectName: plan.projectName ?? current.projectName,
@@ -265,14 +274,19 @@ async function continueGraphSessionFromReview(sessionId, pendingReview, answer) 
   const agents = session.agentsSnapshot ?? [];
   const results = session.resultsSnapshot ?? [];
   if (!graph) throw new Error("Graph session is missing its graph snapshot.");
-  const agentNode = graph.nodes.find((node) => node.id === pendingReview.agentNodeId && node.type === "agent");
+  const fallbackDefinition = graphDefinitionForSession(session, {
+    graph,
+    agents,
+    results,
+    projects: session.projectsSnapshot ?? [],
+  });
+  const definition = graphDefinitionForPendingReview(fallbackDefinition, pendingReview);
+  const agentNode = definition.graph.nodes.find((node) => node.id === pendingReview.agentNodeId && node.type === "agent");
   if (!agentNode) throw new Error("The review response target agent is no longer available.");
 
   await continueGraphSessionFromAgent({
     sessionId,
-    graph,
-    agents,
-    results,
+    definition,
     currentAgentNode: agentNode,
     visitedAgentSessionIds: pendingReview.upstreamAgentSessionIds,
     currentArrival: {
@@ -291,11 +305,10 @@ async function continueGraphSessionFromPlan(sessionId, plan) {
     return;
   }
 
+  const definition = plan.target.currentDefinition ?? plan;
   await continueGraphSessionFromAgent({
     sessionId,
-    graph: plan.graph,
-    agents: plan.agents,
-    results: plan.results,
+    definition,
     currentAgentNode: plan.target.currentAgentNode,
     visitedAgentSessionIds: plan.target.visitedAgentSessionIds,
     currentArrival: plan.target.currentArrival,
@@ -337,9 +350,10 @@ export async function appendCallbackStatus(sessionId, agentSessionId, payload) {
   return recordAgentSessionStatus(sessionId, agentSessionId, payload, "callback");
 }
 
-async function runAgentNode({ session, graph, agents, results, node, upstreamAgentSessionIds, arrival, userPrompt }) {
+async function runAgentNode({ session, graphId, graph, agents, results, node, upstreamAgentSessionIds, arrival, userPrompt }) {
   const created = await createAgentSession(session.id, {
     nodeId: node.id,
+    graphId,
     agentId: node.agentId,
     previousAgentSessionId: arrival?.previousAgentSessionId ?? null,
     incomingExpressionNodeId: arrival?.incomingExpressionNodeId ?? null,
@@ -465,10 +479,20 @@ async function continuationPlanForSession(session) {
 
   for (const candidate of candidates) {
     try {
+      const target = continuationTargetForSession({
+        session,
+        graph: candidate.graph,
+        agents: candidate.agents,
+        results: candidate.results,
+        projectId: candidate.graphId,
+        projectName: candidate.projectName,
+        projects: candidate.projects,
+        lastPlaySelection: candidate.lastPlaySelection,
+      });
       return {
         ...candidate,
-        target: continuationTargetForSession({ session, graph: candidate.graph }),
-        userPrompt: session.prompt,
+        target,
+        userPrompt: target.userPrompt ?? session.prompt,
       };
     } catch (error) {
       lastError = error;
@@ -480,85 +504,195 @@ async function continuationPlanForSession(session) {
 
 function continuationDefinitionCandidates(data, session) {
   const project = data.projects?.find((candidate) => candidate.id === session.projectId) ?? null;
+  const projects = data.projects ?? session.projectsSnapshot ?? [];
   const candidates = [];
 
   if (project?.graph) {
-    candidates.push({
-      graph: project.graph,
-      agents: project.agents ?? [],
-      results: project.results ?? [],
-      projectName: project.name,
-    });
+    candidates.push(graphDefinitionForProject(project, projects));
   }
 
   if (session.graphSnapshot) {
-    candidates.push({
+    candidates.push(graphDefinitionForSession(session, {
       graph: session.graphSnapshot,
       agents: session.agentsSnapshot ?? [],
       results: session.resultsSnapshot ?? [],
-      projectName: session.projectName,
-    });
+      projects: session.projectsSnapshot ?? projects,
+    }));
   }
 
   return candidates;
 }
 
-export function continuationTargetForSession({ session, graph }) {
+function graphDefinitionForProject(project, projects = []) {
+  return {
+    graphId: nullableString(project?.id),
+    projectName: nullableString(project?.name),
+    graph: project?.graph,
+    agents: Array.isArray(project?.agents) ? project.agents : [],
+    results: Array.isArray(project?.results) ? project.results : [],
+    lastPlaySelection: project?.lastPlaySelection ?? null,
+    projects: Array.isArray(projects) ? projects : [],
+  };
+}
+
+function graphDefinitionForSession(session, overrides = {}) {
+  const projects = Array.isArray(overrides.projects)
+    ? overrides.projects
+    : Array.isArray(session?.projectsSnapshot)
+      ? session.projectsSnapshot
+      : [];
+  return {
+    graphId: nullableString(overrides.projectId ?? session?.projectId),
+    projectName: nullableString(overrides.projectName ?? session?.projectName),
+    graph: overrides.graph ?? session?.graphSnapshot,
+    agents: Array.isArray(overrides.agents) ? overrides.agents : session?.agentsSnapshot ?? [],
+    results: Array.isArray(overrides.results) ? overrides.results : session?.resultsSnapshot ?? [],
+    lastPlaySelection: overrides.lastPlaySelection ?? null,
+    projects,
+  };
+}
+
+function graphStartNodeId(definition) {
+  const nodes = Array.isArray(definition?.graph?.nodes) ? definition.graph.nodes : [];
+  const rememberedPlayNodeId = nullableString(definition?.lastPlaySelection?.playNodeId);
+  if (rememberedPlayNodeId && nodes.some((node) => node.id === rememberedPlayNodeId && node.type === "play")) {
+    return rememberedPlayNodeId;
+  }
+  return nodes.find((node) => node.type === "play")?.id ?? null;
+}
+
+function graphDefinitionForGraphId(graphId, fallbackDefinition) {
+  const id = nullableString(graphId);
+  if (!id) return null;
+  if (id === nullableString(fallbackDefinition?.graphId)) return fallbackDefinition;
+  const projects = Array.isArray(fallbackDefinition?.projects) ? fallbackDefinition.projects : [];
+  const project = projects.find((candidate) => candidate.id === id);
+  return project?.graph ? graphDefinitionForProject(project, projects) : null;
+}
+
+function graphDefinitionForGraphNode(graphNode, fallbackDefinition) {
+  const graphId = nullableString(graphNode?.graphId ?? graphNode?.projectId);
+  if (!graphId) return fallbackDefinition;
+  const definition = graphDefinitionForGraphId(graphId, fallbackDefinition);
+  if (!definition) throw new Error(`Graph card ${graphNode.id} points to a graph that is no longer available.`);
+  return definition;
+}
+
+function graphDefinitionForAgentSession(session, fallbackDefinition, agentSession) {
+  const explicitDefinition = graphDefinitionForGraphId(agentSession?.graphId, fallbackDefinition);
+  if (explicitDefinition) return explicitDefinition;
+  if (fallbackDefinition?.graph?.nodes?.some((node) => node.id === agentSession?.nodeId && node.type === "agent")) {
+    return fallbackDefinition;
+  }
+  const projects = Array.isArray(fallbackDefinition?.projects) ? fallbackDefinition.projects : [];
+  const project = projects.find((candidate) => (
+    candidate.graph?.nodes?.some((node) => node.id === agentSession?.nodeId && node.type === "agent")
+  ));
+  return project?.graph ? graphDefinitionForProject(project, projects) : fallbackDefinition;
+}
+
+function graphDefinitionForPendingReview(fallbackDefinition, pendingReview) {
+  const explicitDefinition = graphDefinitionForGraphId(pendingReview?.graphId, fallbackDefinition);
+  if (explicitDefinition) return explicitDefinition;
+  if (fallbackDefinition?.graph?.nodes?.some((node) => (
+    node.id === pendingReview?.agentNodeId || node.id === pendingReview?.reviewNodeId
+  ))) {
+    return fallbackDefinition;
+  }
+  const projects = Array.isArray(fallbackDefinition?.projects) ? fallbackDefinition.projects : [];
+  const project = projects.find((candidate) => (
+    candidate.graph?.nodes?.some((node) => node.id === pendingReview?.agentNodeId || node.id === pendingReview?.reviewNodeId)
+  ));
+  return project?.graph ? graphDefinitionForProject(project, projects) : fallbackDefinition;
+}
+
+export function continuationTargetForSession({
+  session,
+  graph,
+  agents = [],
+  results = [],
+  projectId = session?.projectId ?? null,
+  projectName = session?.projectName ?? null,
+  projects = session?.projectsSnapshot ?? [],
+  lastPlaySelection = null,
+}) {
+  const fallbackDefinition = graphDefinitionForSession(session, {
+    graph,
+    agents,
+    results,
+    projectId,
+    projectName,
+    projects,
+    lastPlaySelection,
+  });
   const orderedSessions = orderedAgentSessionsForRuntime(session);
   if (orderedSessions.length === 0) {
-    const firstAgentNode = firstAgentNodeForPlay(graph, session.playNodeId);
-    if (!firstAgentNode) throw new Error("No agent node is connected to this session's play node.");
+    const startRoute = firstAgentRouteForStart(fallbackDefinition, session.playNodeId);
+    if (!startRoute) throw new Error("No agent node or graph card is connected to this session's play node.");
     return {
-      currentAgentNode: firstAgentNode,
-      currentArrival: null,
+      currentDefinition: startRoute.definition,
+      currentAgentNode: startRoute.node,
+      currentArrival: startRoute.arrival,
       visitedAgentSessionIds: [],
       reviewPause: null,
+      userPrompt: session.prompt,
     };
   }
 
   const lastAgentSession = orderedSessions.at(-1);
-  const lastAgentNode = graph.nodes.find((candidate) => candidate.id === lastAgentSession.nodeId && candidate.type === "agent");
+  const currentDefinition = graphDefinitionForAgentSession(session, fallbackDefinition, lastAgentSession);
+  const lastAgentNode = currentDefinition.graph.nodes.find((candidate) => candidate.id === lastAgentSession.nodeId && candidate.type === "agent");
   if (!lastAgentNode) throw new Error("The last agent node is no longer available in this graph.");
 
   const lastOutcome = lastAgentSession.terminalOutcome;
   if (!lastOutcome || lastOutcome.state === "stopped" || lastAgentSession.status === "stopped") {
     return {
+      currentDefinition,
       currentAgentNode: lastAgentNode,
       currentArrival: arrivalForAgentSession(lastAgentSession),
       visitedAgentSessionIds: orderedSessions.slice(0, -1).map((agentSession) => agentSession.id),
       reviewPause: null,
+      userPrompt: userPromptForAgentRerun(session, currentDefinition, lastAgentSession),
     };
   }
 
-  const nextRoute = nextGraphRouteFromOutcome({ graph, currentAgentNode: lastAgentNode, outcome: lastOutcome });
-  if (!nextRoute) throw new Error("No next agent or review card is connected to continue from the last result.");
+  const nextRoute = nextGraphRouteFromOutcome({ graph: currentDefinition.graph, currentAgentNode: lastAgentNode, outcome: lastOutcome });
+  if (!nextRoute) throw new Error("No next agent, graph, or review card is connected to continue from the last result.");
 
   const visitedAgentSessionIds = orderedSessions.map((agentSession) => agentSession.id);
+  const fallbackUserPrompt = userPromptForAgentRerun(session, currentDefinition, lastAgentSession);
   if (nextRoute.node.type === "review") {
     return {
+      currentDefinition,
       currentAgentNode: null,
       currentArrival: null,
       visitedAgentSessionIds,
       reviewPause: {
+        definition: currentDefinition,
         reviewNode: nextRoute.node,
         agentNode: lastAgentNode,
         agentSession: lastAgentSession,
         route: nextRoute,
         upstreamAgentSessionIds: visitedAgentSessionIds,
       },
+      userPrompt: fallbackUserPrompt,
     };
   }
 
+  const nextAgentRoute = nextAgentRouteFromGraphRoute({
+    definition: currentDefinition,
+    route: nextRoute,
+    previousAgentSession: lastAgentSession,
+    fallbackUserPrompt,
+  });
+
   return {
-    currentAgentNode: nextRoute.node,
-    currentArrival: {
-      previousAgentSessionId: lastAgentSession.id,
-      incomingExpressionNodeId: nextRoute.expressionNodeId,
-      incomingEdgeIds: nextRoute.edgeIds,
-      incomingResultId: nextRoute.resultId,
-    },
+    currentDefinition: nextAgentRoute?.definition ?? currentDefinition,
+    currentAgentNode: nextAgentRoute?.node ?? null,
+    currentArrival: nextAgentRoute?.arrival ?? null,
     visitedAgentSessionIds,
     reviewPause: null,
+    userPrompt: nextAgentRoute?.userPrompt ?? fallbackUserPrompt,
   };
 }
 
@@ -602,7 +736,7 @@ export function availableResultsForAgent({ graph, results, node }) {
       .filter((edge) => edge.type === "routes" && evaluatedExpressionNodeIds.has(edge.source))
       .flatMap((edge) => {
         const routeTarget = graphNodes.find((candidate) => (
-          candidate.id === edge.target && (candidate.type === "agent" || candidate.type === "review")
+          candidate.id === edge.target && (candidate.type === "agent" || candidate.type === "review" || candidate.type === "graph")
         ));
         return edge.resultId && routeTarget && !nonCompletionResultIds.has(edge.resultId) ? [edge.resultId] : [];
       }),
@@ -854,9 +988,99 @@ export function cliArgsForRunner(runner, agent, workspacePath, prompt) {
   };
 }
 
-function firstAgentNodeForPlay(graph, playNodeId) {
-  const edge = graph.edges.find((candidate) => candidate.source === playNodeId && candidate.type === "runs");
-  return edge ? graph.nodes.find((node) => node.id === edge.target && node.type === "agent") ?? null : null;
+function firstAgentRouteForStart(definition, startNodeId, visitedStartNodeIds = new Set(), prefixEdgeIds = []) {
+  const graph = definition?.graph;
+  if (!graph) return null;
+  const sourceNodeId = stringValue(startNodeId);
+  if (!sourceNodeId) return null;
+  const visitKey = `${nullableString(definition.graphId) ?? "__session"}:${sourceNodeId}`;
+  if (visitedStartNodeIds.has(visitKey)) return null;
+  const edge = graph.edges.find((candidate) => candidate.source === sourceNodeId && candidate.type === "runs");
+  if (!edge) return null;
+  const targetNode = graph.nodes.find((node) => node.id === edge.target);
+  const edgeIds = [...prefixEdgeIds, edge.id];
+  if (targetNode?.type === "agent") {
+    return {
+      definition,
+      node: targetNode,
+      edgeIds,
+      arrival: prefixEdgeIds.length > 0 || visitedStartNodeIds.size > 0 ? {
+        previousAgentSessionId: null,
+        incomingExpressionNodeId: null,
+        incomingEdgeIds: edgeIds,
+        incomingResultId: null,
+      } : null,
+    };
+  }
+  if (targetNode?.type !== "graph") return null;
+  const nextVisitedStartNodeIds = new Set([...visitedStartNodeIds, visitKey]);
+  const nextDefinition = graphDefinitionForGraphNode(targetNode, definition);
+  const nextStartNodeId = targetNode.graphId ? graphStartNodeId(nextDefinition) : targetNode.id;
+  if (!nextStartNodeId) throw new Error(`Graph card ${targetNode.id} points to a graph without a play node.`);
+  return firstAgentRouteForStart(nextDefinition, nextStartNodeId, nextVisitedStartNodeIds, edgeIds);
+}
+
+function nextAgentRouteFromGraphRoute({ definition, route, previousAgentSession, fallbackUserPrompt }) {
+  if (!route) return null;
+  if (!previousAgentSession?.id) throw new Error("Cannot route from a graph card without a completed parent agent session.");
+  if (route.node.type === "agent") {
+    return {
+      definition,
+      node: route.node,
+      arrival: arrivalForGraphRoute(route, previousAgentSession.id),
+      userPrompt: fallbackUserPrompt,
+    };
+  }
+  if (route.node.type !== "graph") return null;
+  const nextDefinition = graphDefinitionForGraphNode(route.node, definition);
+  const nextStartNodeId = route.node.graphId ? graphStartNodeId(nextDefinition) : route.node.id;
+  if (!nextStartNodeId) throw new Error(`Graph card ${route.node.id} points to a graph without a play node.`);
+  const graphStartRoute = firstAgentRouteForStart(nextDefinition, nextStartNodeId);
+  if (!graphStartRoute) throw new Error(`Graph card ${route.node.id} is not connected to an agent node.`);
+  return {
+    definition: graphStartRoute.definition,
+    node: graphStartRoute.node,
+    arrival: arrivalForGraphRoute(route, previousAgentSession.id, graphStartRoute.edgeIds),
+    userPrompt: graphPromptFromAgentSession(previousAgentSession) || fallbackUserPrompt,
+  };
+}
+
+function arrivalForGraphRoute(route, previousAgentSessionId, extraEdgeIds = []) {
+  return {
+    previousAgentSessionId,
+    incomingExpressionNodeId: route.expressionNodeId,
+    incomingEdgeIds: [...route.edgeIds, ...extraEdgeIds],
+    incomingResultId: route.resultId,
+  };
+}
+
+function userPromptForAgentRerun(session, definition, agentSession) {
+  const graphPrompt = inheritedGraphPromptForAgentSession(session, definition, agentSession);
+  if (graphPrompt) return graphPrompt;
+  return session.prompt;
+}
+
+function inheritedGraphPromptForAgentSession(session, definition, agentSession, seenAgentSessionIds = new Set()) {
+  if (!agentSession?.id || seenAgentSessionIds.has(agentSession.id)) return null;
+  seenAgentSessionIds.add(agentSession.id);
+  const incomingEdges = Array.isArray(agentSession?.incomingEdgeIds) ? agentSession.incomingEdgeIds : [];
+  const enteredFromGraphCard = incomingEdges.some((edgeId) => {
+    const edge = definition?.graph?.edges?.find((candidate) => candidate.id === edgeId && candidate.type === "runs");
+    const source = edge ? definition.graph.nodes.find((node) => node.id === edge.source) : null;
+    return source?.type === "graph";
+  });
+  if (!agentSession.previousAgentSessionId) return null;
+  const parentAgentSession = session.agentSessions.find((candidate) => candidate.id === agentSession.previousAgentSessionId);
+  const movedBetweenGraphs = nullableString(agentSession.graphId) &&
+    nullableString(agentSession.graphId) !== nullableString(parentAgentSession?.graphId);
+  if (enteredFromGraphCard) return graphPromptFromAgentSession(parentAgentSession);
+  if (movedBetweenGraphs) return graphPromptFromAgentSession(parentAgentSession);
+  const parentDefinition = graphDefinitionForAgentSession(session, definition, parentAgentSession);
+  return inheritedGraphPromptForAgentSession(session, parentDefinition, parentAgentSession, seenAgentSessionIds);
+}
+
+function graphPromptFromAgentSession(agentSession) {
+  return agentSessionHandoffOutput(agentSession);
 }
 
 export function nextGraphRouteFromOutcome({ graph, currentAgentNode, outcome }) {
@@ -882,7 +1106,7 @@ function routeForResult(graph, expressionEntries, resultId) {
     const expressionEntry = expressionEntries.find((entry) => entry.node.id === routeEdge.source);
     if (!expressionEntry) continue;
     const node = graph.nodes.find((candidate) => (
-      candidate.id === routeEdge.target && (candidate.type === "agent" || candidate.type === "review")
+      candidate.id === routeEdge.target && (candidate.type === "agent" || candidate.type === "review" || candidate.type === "graph")
     ));
     if (!node) continue;
     return {
@@ -912,7 +1136,7 @@ function arrivalForAgentSession(agentSession) {
   };
 }
 
-async function pauseSessionForReview({ sessionId, reviewNode, agentNode, agentSession, route, upstreamAgentSessionIds }) {
+async function pauseSessionForReview({ sessionId, definition, reviewNode, agentNode, agentSession, route, upstreamAgentSessionIds }) {
   if (!agentSession?.id) throw new Error("Cannot pause for review without a completed agent session.");
   const now = new Date().toISOString();
   await updateGraphSession(sessionId, (current) => ({
@@ -922,6 +1146,7 @@ async function pauseSessionForReview({ sessionId, reviewNode, agentNode, agentSe
     pendingReview: {
       id: `pending-review-${globalThis.crypto.randomUUID().slice(0, 8)}`,
       graphSessionId: sessionId,
+      graphId: nullableString(definition?.graphId),
       reviewNodeId: reviewNode.id,
       agentNodeId: agentNode.id,
       previousAgentSessionId: agentSession.id,

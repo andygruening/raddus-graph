@@ -96,7 +96,8 @@ type ProjectDraft = Pick<ProjectRecord, "name">;
 type PaletteItem =
   | { type: "agent"; agentId: string }
   | { type: "expression"; resultId: string }
-  | { type: "review" };
+  | { type: "review" }
+  | { type: "graph"; graphId: string };
 type PaletteDropConnection = {
   source: GraphNode;
   target: GraphNode;
@@ -121,6 +122,7 @@ type GraphExecutionView = {
   previousNodeIds: Set<string>;
   activeExpressionNodeIds: Set<string>;
   activeReviewNodeIds: Set<string>;
+  activeGraphNodeIds: Set<string>;
   activeRouteEdgeIds: Set<string>;
   visitedNodeIds: Set<string>;
   visitedExpressionNodeIds: Set<string>;
@@ -140,6 +142,7 @@ type BrowserWindowWithLegacyAudio = Window & typeof globalThis & {
   webkitAudioContext?: AudioContextFactory;
 };
 
+const paletteTabs: PaletteTab[] = ["agents", "expressions", "other"];
 const api = new RaddusGraphApi();
 const reservedResultIds = new Set(["completed", "failed", "ask-for-approval", "default"]);
 const protectedResultIds = new Set([...reservedResultIds, "unknown", "fallback"]);
@@ -152,6 +155,7 @@ export default function App() {
   const [repositoryResult, setRepositoryResult] = React.useState<RepositoryListResult | null>(null);
   const [branchesByRepo, setBranchesByRepo] = React.useState<Record<string, BranchListResult>>({});
   const [overlayPanel, setOverlayPanel] = React.useState<OverlayPanel>("agents");
+  const [paletteCollapsed, setPaletteCollapsed] = React.useState(readPaletteCollapsedState);
   const [actionMenuOpen, setActionMenuOpen] = React.useState(false);
   const [dialog, setDialog] = React.useState<DialogState>(null);
   const [confirmation, setConfirmation] = React.useState<ConfirmationState>(null);
@@ -181,6 +185,7 @@ export default function App() {
   const persistCameraProjectIdFrameRef = React.useRef<string | null>(null);
   const persistCameraValueFrameRef = React.useRef<CanvasViewport | null>(null);
   const latestState = React.useRef<GraphState | null>(null);
+  const shortcutKeysRef = React.useRef(new Set<string>());
   const localEditVersionRef = React.useRef(0);
   const saveRequestIdRef = React.useRef(0);
   const suppressNodeClickRef = React.useRef(false);
@@ -199,6 +204,10 @@ export default function App() {
   React.useEffect(() => {
     cameraRef.current = camera;
   }, [camera]);
+
+  React.useEffect(() => {
+    writePaletteCollapsedState(paletteCollapsed);
+  }, [paletteCollapsed]);
 
   React.useEffect(() => {
     const projectId = state?.selectedProjectId;
@@ -258,6 +267,105 @@ export default function App() {
       setFocusedAgentSessionId(null);
     }
   }, [followedSessionId, state]);
+
+  React.useEffect(() => {
+    const shortcutKeys = shortcutKeysRef.current;
+
+    function handleShortcutKeyDown(event: KeyboardEvent) {
+      shortcutKeys.add(event.code);
+
+      if (event.key === "Escape") {
+        if (confirmation) {
+          event.preventDefault();
+          shortcutKeys.clear();
+          setConfirmation(null);
+          return;
+        }
+        if (dialog) {
+          event.preventDefault();
+          shortcutKeys.clear();
+          setDialog(null);
+          setActionMenuOpen(false);
+          return;
+        }
+        if (actionMenuOpen) {
+          event.preventDefault();
+          shortcutKeys.clear();
+          setActionMenuOpen(false);
+          return;
+        }
+      }
+
+      if (!event.shiftKey || event.altKey || event.ctrlKey || event.metaKey || confirmation) return;
+      if (eventTargetClosest(event.target, "input, textarea, select, [contenteditable='true']")) return;
+
+      if (!event.repeat && event.code === "KeyS") {
+        event.preventDefault();
+        setDialog({ type: "sessions" });
+        setActionMenuOpen(false);
+        return;
+      }
+
+      const arrowOffset = listNavigationOffsetForKey(event.key);
+      const verticalArrowOffset = verticalNavigationOffsetForKey(event.key);
+      if (dialog) {
+        if (dialog.type === "sessions" && verticalArrowOffset !== null && shortcutKeys.has("KeyD")) {
+          event.preventDefault();
+          selectGraphSessionByOffset(verticalArrowOffset);
+        }
+        return;
+      }
+
+      if (arrowOffset !== null && shortcutKeys.has("KeyG")) {
+        event.preventDefault();
+        selectProjectByOffset(arrowOffset);
+        return;
+      }
+
+      if (verticalArrowOffset !== null && shortcutKeys.has("KeyD")) {
+        event.preventDefault();
+        selectGraphSessionByOffset(verticalArrowOffset);
+        return;
+      }
+
+      if (shortcutKeys.has("KeyF") && paletteShortcutForKey(event.key)) {
+        event.preventDefault();
+        applyPaletteShortcut(event.key);
+        return;
+      }
+
+      if (dialog) return;
+
+      if (!event.repeat && event.code === "KeyX") {
+        event.preventDefault();
+        openGraphPlayDialog();
+        return;
+      }
+
+      if (!event.repeat && event.code === "KeyA") {
+        event.preventDefault();
+        openCreateDialogForPaletteTab();
+      }
+    }
+
+    function handleShortcutKeyUp(event: KeyboardEvent) {
+      shortcutKeys.delete(event.code);
+      if (!event.shiftKey || event.key === "Shift") shortcutKeys.clear();
+    }
+
+    function resetShortcutKeys() {
+      shortcutKeys.clear();
+    }
+
+    window.addEventListener("keydown", handleShortcutKeyDown);
+    window.addEventListener("keyup", handleShortcutKeyUp);
+    window.addEventListener("blur", resetShortcutKeys);
+    return () => {
+      window.removeEventListener("keydown", handleShortcutKeyDown);
+      window.removeEventListener("keyup", handleShortcutKeyUp);
+      window.removeEventListener("blur", resetShortcutKeys);
+    };
+  }, [actionMenuOpen, confirmation, dialog, overlayPanel, followedSessionId]);
 
   async function loadInitial() {
     setLoading(true);
@@ -361,6 +469,55 @@ export default function App() {
       setFocusedAgentSessionId(null);
     }
     restoreCanvasViewport(selectedProjectId);
+  }
+
+  function selectProjectByOffset(offset: number) {
+    const current = latestState.current;
+    if (!current || current.projects.length < 2) return;
+    const selectedIndex = Math.max(0, current.projects.findIndex((project) => project.id === current.selectedProjectId));
+    const nextIndex = (selectedIndex + offset + current.projects.length) % current.projects.length;
+    selectProject(current.projects[nextIndex].id);
+  }
+
+  function selectGraphSessionByOffset(offset: number) {
+    const current = latestState.current;
+    if (!current) return;
+    const sessions = current.sessions;
+    if (sessions.length === 0) return;
+    const selectedIndex = sessions.findIndex((session) => session.id === followedSessionId);
+    const baseIndex = selectedIndex >= 0 ? selectedIndex : offset > 0 ? -1 : 0;
+    const nextIndex = (baseIndex + offset + sessions.length) % sessions.length;
+    followGraphSession(sessions[nextIndex].id);
+  }
+
+  function applyPaletteShortcut(key: string) {
+    const horizontalOffset = paletteTabOffsetForKey(key);
+    if (horizontalOffset !== null) {
+      setOverlayPanel((current) => paletteTabByOffset(current, horizontalOffset));
+      return;
+    }
+    if (key === "ArrowUp") setPaletteCollapsed(true);
+    if (key === "ArrowDown") setPaletteCollapsed(false);
+  }
+
+  function openGraphPlayDialog() {
+    if (!latestState.current) return;
+    setActionMenuOpen(false);
+    setDialog({ type: "graph-play" });
+  }
+
+  function openCreateDialogForPaletteTab() {
+    if (!latestState.current) return;
+    setActionMenuOpen(false);
+    if (overlayPanel === "expressions") {
+      setDialog({ type: "result-create" });
+      return;
+    }
+    if (overlayPanel === "other") {
+      setDialog({ type: "project-create" });
+      return;
+    }
+    setDialog({ type: "agent-create" });
   }
 
   function followGraphSession(sessionId: string) {
@@ -1387,8 +1544,11 @@ export default function App() {
                   activeTab={overlayPanel}
                   agents={activeAgents}
                   results={activeResults}
+                  projects={state.projects}
+                  collapsed={paletteCollapsed}
                   draggingItemKey={draggingPaletteItemKey}
                   onActiveTabChange={setOverlayPanel}
+                  onCollapsedChange={setPaletteCollapsed}
                   onBeginDrag={beginPaletteItemDrag}
                   onCreateAgent={() => setDialog({ type: "agent-create" })}
                   onCreateExpression={() => setDialog({ type: "result-create" })}
@@ -1512,13 +1672,20 @@ export default function App() {
                         if (node.type === "play") setDialog({ type: "play", nodeId: node.id });
                         if (node.type === "review") setDialog({ type: "review", nodeId: node.id });
                         if (node.type === "expression") setDialog({ type: "expression", nodeId: node.id });
+                        if (node.type === "graph") {
+                          if (node.graphId && state.projects.some((project) => project.id === node.graphId)) {
+                            selectProject(node.graphId);
+                            return;
+                          }
+                          setError("This graph card points to a graph that is no longer available.");
+                        }
                       }}
                       shouldSuppressClick={suppressesNodeClick}
                       enterDelayMs={Math.min(nodeIndex * 24, 180)}
                     />
                   );
                 })}
-                {paletteDragPreview ? <PaletteNodePreview preview={paletteDragPreview} agents={activeAgents} results={activeResults} /> : null}
+                {paletteDragPreview ? <PaletteNodePreview preview={paletteDragPreview} agents={activeAgents} results={activeResults} projects={state?.projects ?? []} /> : null}
               </div>
             </div>
           </section>
@@ -1693,6 +1860,10 @@ function ProjectNodeCard({
 }) {
   const agent = node.type === "agent" ? state.agents.find((record) => record.id === node.agentId) : undefined;
   const expressionResultId = node.type === "expression" ? selectedRouteResultForExpression(state, node.id) : "";
+  const graphProject = node.type === "graph" ? state.projects.find((project) => project.id === node.graphId) : undefined;
+  const graphName = node.type === "graph"
+    ? graphProject?.name ?? (node.graphId ? "Missing graph" : selectedProjectForState(state)?.name ?? "Missing graph")
+    : "";
 
   return (
     <article
@@ -1739,6 +1910,18 @@ function ProjectNodeCard({
             </span>
           </div>
         </>
+      ) : node.type === "graph" ? (
+        <>
+          <button className="icon-button compact-icon project-card-remove" type="button" onClick={onRemove} title="Remove card" aria-label="Remove card">
+            <X size={12} aria-hidden="true" />
+          </button>
+          <div className="project-node-identity">
+            <span className="project-node-identity-main">
+              <GitPullRequest size={16} aria-hidden="true" />
+              <strong>{graphName}</strong>
+            </span>
+          </div>
+        </>
       ) : (
         <>
           <button className="icon-button compact-icon project-card-remove" type="button" onClick={onRemove} title="Remove card" aria-label="Remove card">
@@ -1759,8 +1942,11 @@ function CardPalette({
   activeTab,
   agents,
   results,
+  projects,
+  collapsed,
   draggingItemKey,
   onActiveTabChange,
+  onCollapsedChange,
   onBeginDrag,
   onCreateAgent,
   onCreateExpression,
@@ -1772,8 +1958,11 @@ function CardPalette({
   activeTab: PaletteTab;
   agents: AgentSpec[];
   results: ResultDefinition[];
+  projects: ProjectRecord[];
+  collapsed: boolean;
   draggingItemKey: string | null;
   onActiveTabChange: (tab: PaletteTab) => void;
+  onCollapsedChange: React.Dispatch<React.SetStateAction<boolean>>;
   onBeginDrag: (event: React.PointerEvent<HTMLElement>, item: PaletteItem, onOpen?: () => void) => void;
   onCreateAgent: () => void;
   onCreateExpression: () => void;
@@ -1784,11 +1973,6 @@ function CardPalette({
 }) {
   const addButtonAction = activeTab === "agents" ? onCreateAgent : activeTab === "expressions" ? onCreateExpression : null;
   const addButtonTitle = activeTab === "agents" ? "Create agent" : "Create expression";
-  const [collapsed, setCollapsed] = React.useState(readPaletteCollapsedState);
-
-  React.useEffect(() => {
-    writePaletteCollapsedState(collapsed);
-  }, [collapsed]);
 
   return (
     <aside className={`project-card-palette ${collapsed ? "collapsed" : ""}`} aria-label="Card palette" onPointerDown={(event) => event.stopPropagation()} onWheel={(event) => event.stopPropagation()}>
@@ -1862,7 +2046,12 @@ function CardPalette({
               ))}
             </>
           ) : (
-            <PaletteReviewButton draggingItemKey={draggingItemKey} onBeginDrag={onBeginDrag} />
+            <>
+              {projects.map((project) => (
+                <PaletteGraphButton project={project} draggingItemKey={draggingItemKey} onBeginDrag={onBeginDrag} key={project.id} />
+              ))}
+              <PaletteReviewButton draggingItemKey={draggingItemKey} onBeginDrag={onBeginDrag} />
+            </>
           )}
         </div>
       ) : null}
@@ -1870,7 +2059,7 @@ function CardPalette({
         <button
           className="palette-collapse-button"
           type="button"
-          onClick={() => setCollapsed((current) => !current)}
+          onClick={() => onCollapsedChange((current) => !current)}
           title={collapsed ? "Expand cards" : "Collapse cards"}
           aria-label={collapsed ? "Expand cards" : "Collapse cards"}
           aria-expanded={!collapsed}
@@ -1879,6 +2068,39 @@ function CardPalette({
         </button>
       </div>
     </aside>
+  );
+}
+
+function PaletteGraphButton({
+  project,
+  draggingItemKey,
+  onBeginDrag,
+}: {
+  project: ProjectRecord;
+  draggingItemKey: string | null;
+  onBeginDrag: (event: React.PointerEvent<HTMLElement>, item: PaletteItem, onOpen?: () => void) => void;
+}) {
+  const item: PaletteItem = { type: "graph", graphId: project.id };
+  const itemKey = paletteItemKey(item);
+  return (
+    <div
+      className={draggingItemKey === itemKey ? "palette-drag-item graph dragging" : "palette-drag-item graph"}
+      role="button"
+      tabIndex={0}
+      onPointerDown={(event) => onBeginDrag(event, item)}
+      onKeyDown={(event) => {
+        if (event.key !== "Enter" && event.key !== " ") return;
+        event.preventDefault();
+      }}
+      title={project.name}
+      aria-label={`${project.name}. Drag graph to canvas.`}
+    >
+      <GitPullRequest size={16} aria-hidden="true" />
+      <span>
+        <strong>{project.name}</strong>
+        <small>Graph</small>
+      </span>
+    </div>
   );
 }
 
@@ -2017,13 +2239,15 @@ function PaletteExpressionButton({
   );
 }
 
-function PaletteNodePreview({ preview, agents, results }: { preview: PaletteDragPreview; agents: AgentSpec[]; results: ResultDefinition[] }) {
+function PaletteNodePreview({ preview, agents, results, projects }: { preview: PaletteDragPreview; agents: AgentSpec[]; results: ResultDefinition[]; projects: ProjectRecord[] }) {
   const item = preview.item;
   const previewLabel = item.type === "agent"
     ? agents.find((record) => record.id === item.agentId)?.name ?? "Agent"
     : item.type === "expression"
       ? results.find((record) => record.id === item.resultId)?.id ?? item.resultId
-      : "Review";
+      : item.type === "graph"
+        ? projects.find((project) => project.id === item.graphId)?.name ?? "Missing graph"
+        : "Review";
   return (
     <article
       className={`project-node palette-node-preview ${preview.item.type} ${preview.connection ? "connect-valid" : ""}`}
@@ -2031,7 +2255,7 @@ function PaletteNodePreview({ preview, agents, results }: { preview: PaletteDrag
       aria-hidden="true"
     >
       <div className="palette-node-preview-label">
-        {preview.item.type === "agent" ? <Bot size={16} aria-hidden="true" /> : preview.item.type === "expression" ? <Braces size={16} aria-hidden="true" /> : <MessageSquareText size={16} aria-hidden="true" />}
+        {preview.item.type === "agent" ? <Bot size={16} aria-hidden="true" /> : preview.item.type === "expression" ? <Braces size={16} aria-hidden="true" /> : preview.item.type === "graph" ? <GitPullRequest size={16} aria-hidden="true" /> : <MessageSquareText size={16} aria-hidden="true" />}
         <span>{previewLabel}</span>
       </div>
     </article>
@@ -2774,6 +2998,10 @@ function SessionsDialog({
       setSelectedSessionId(focusedSessionId);
       return;
     }
+    if (!focusedSessionId && followedSessionId && selectedSessionId !== followedSessionId && sessions.some((session) => session.id === followedSessionId)) {
+      setSelectedSessionId(followedSessionId);
+      return;
+    }
     if (!selectedSessionId || !sessions.some((session) => session.id === selectedSessionId)) {
       setSelectedSessionId(preferredSessionId);
     }
@@ -3119,6 +3347,34 @@ function writePaletteCollapsedState(collapsed: boolean) {
   }
 }
 
+function listNavigationOffsetForKey(key: string): number | null {
+  if (key === "ArrowDown" || key === "ArrowRight") return 1;
+  if (key === "ArrowUp" || key === "ArrowLeft") return -1;
+  return null;
+}
+
+function verticalNavigationOffsetForKey(key: string): number | null {
+  if (key === "ArrowDown") return 1;
+  if (key === "ArrowUp") return -1;
+  return null;
+}
+
+function paletteShortcutForKey(key: string): boolean {
+  return key === "ArrowLeft" || key === "ArrowRight" || key === "ArrowUp" || key === "ArrowDown";
+}
+
+function paletteTabOffsetForKey(key: string): number | null {
+  if (key === "ArrowRight") return 1;
+  if (key === "ArrowLeft") return -1;
+  return null;
+}
+
+function paletteTabByOffset(current: OverlayPanel, offset: number): PaletteTab {
+  const selectedTab = current ?? paletteTabs[0];
+  const selectedIndex = Math.max(0, paletteTabs.indexOf(selectedTab));
+  return paletteTabs[(selectedIndex + offset + paletteTabs.length) % paletteTabs.length];
+}
+
 function isPlayNode(node: GraphNode): boolean {
   return node.type === "play";
 }
@@ -3153,6 +3409,7 @@ function playLaunchSelectionForNode(node: GraphNode): PlayLaunchSelection {
 function paletteItemKey(item: PaletteItem): string {
   if (item.type === "agent") return `${item.type}:${item.agentId}`;
   if (item.type === "expression") return `${item.type}:${item.resultId}`;
+  if (item.type === "graph") return `${item.type}:${item.graphId}`;
   return item.type;
 }
 
@@ -3174,6 +3431,15 @@ function nodeFromPaletteItem(item: PaletteItem, x: number, y: number, id = newId
       y,
     };
   }
+  if (item.type === "graph") {
+    return {
+      id,
+      type: "graph",
+      graphId: item.graphId,
+      x,
+      y,
+    };
+  }
   return {
     id,
     type: "expression",
@@ -3188,19 +3454,13 @@ function paletteConnectionForTarget(
   sourceCandidate: GraphNode,
   target: GraphNode,
 ): PaletteDropConnection | null {
-  if (sourceCandidate.type === "agent" && target.type === "play") {
+  if (sourceCandidate.type === "agent" && (target.type === "play" || target.type === "graph")) {
     return { source: target, target: sourceCandidate, type: "runs", targetNodeId: target.id };
   }
-  if (sourceCandidate.type === "agent" && target.type === "expression") {
-    return {
-      source: target,
-      target: sourceCandidate,
-      type: "routes",
-      resultId: selectedRouteResultForExpression(state, target.id),
-      targetNodeId: target.id,
-    };
+  if (sourceCandidate.type === "graph" && target.type === "play") {
+    return { source: target, target: sourceCandidate, type: "runs", targetNodeId: target.id };
   }
-  if (sourceCandidate.type === "review" && target.type === "expression") {
+  if ((sourceCandidate.type === "agent" || sourceCandidate.type === "review" || sourceCandidate.type === "graph") && target.type === "expression") {
     return {
       source: target,
       target: sourceCandidate,
@@ -3248,8 +3508,10 @@ function edgeForConnection(
 ): Omit<GraphEdge, "id"> | null {
   if (source.id === target.id) return null;
   if (source.type === "play" && target.type === "agent") return { source: source.id, target: target.id, type: "runs" };
+  if (source.type === "play" && target.type === "graph") return { source: source.id, target: target.id, type: "runs" };
+  if (source.type === "graph" && target.type === "agent") return { source: source.id, target: target.id, type: "runs" };
   if (source.type === "agent" && target.type === "expression") return { source: source.id, target: target.id, type: "evaluates" };
-  if (source.type === "expression" && (target.type === "agent" || target.type === "review")) {
+  if (source.type === "expression" && (target.type === "agent" || target.type === "review" || target.type === "graph")) {
     return {
       source: source.id,
       target: target.id,
@@ -3597,6 +3859,10 @@ function agentModelSummary(agent: AgentSpec) {
 
 function nodeLabel(node: GraphNode, state: GraphState) {
   if (node.type === "play") return `Start ${shortId(node.id)}`;
+  if (node.type === "graph") {
+    return state.projects.find((project) => project.id === node.graphId)?.name ??
+      (node.graphId ? "Missing graph" : selectedProjectForState(state)?.name ?? "Missing graph");
+  }
   if (node.type === "review") return `Review ${shortId(node.id)}`;
   if (node.type === "expression") return `Expression ${shortId(node.id)}`;
   const agent = (state.agents ?? []).find((candidate) => candidate.id === node.agentId);
@@ -3612,9 +3878,14 @@ function latestAgentSessionStatus(agentSession: AgentSession): AgentSessionStatu
 }
 
 function agentSessionAgentName(session: GraphSession, agentSession: AgentSession) {
-  const agent = session.agentsSnapshot?.find((candidate) => candidate.id === agentSession.agentId);
+  const graphProject = agentSession.graphId
+    ? session.projectsSnapshot?.find((project) => project.id === agentSession.graphId) ?? null
+    : null;
+  const agents = graphProject?.agents ?? session.agentsSnapshot ?? [];
+  const graph = graphProject?.graph ?? session.graphSnapshot;
+  const agent = agents.find((candidate) => candidate.id === agentSession.agentId);
   if (agent) return agent.name;
-  const node = session.graphSnapshot?.nodes.find((candidate) => candidate.id === agentSession.nodeId);
+  const node = graph?.nodes.find((candidate) => candidate.id === agentSession.nodeId);
   return node?.type === "agent" ? `Agent ${shortId(node.id)}` : `Agent ${shortId(agentSession.nodeId)}`;
 }
 
@@ -3647,16 +3918,26 @@ function graphExecutionViewForSession(session: GraphSession): GraphExecutionView
   const previousNodeIds = new Set<string>();
   const activeExpressionNodeIds = new Set<string>();
   const activeReviewNodeIds = new Set<string>();
+  const activeGraphNodeIds = new Set<string>();
   const activeRouteEdgeIds = new Set<string>();
   const visitedNodeIds = new Set<string>();
   const visitedExpressionNodeIds = new Set<string>();
   const visitedRouteEdgeIds = new Set<string>();
+  const graphSnapshotNodes = session.graphSnapshot?.nodes ?? [];
+  const graphSnapshotEdges = session.graphSnapshot?.edges ?? [];
+  const graphNodeById = new Map(graphSnapshotNodes.map((node) => [node.id, node]));
+  const graphEdgeById = new Map(graphSnapshotEdges.map((edge) => [edge.id, edge]));
 
   for (const agentSession of orderedSessions) {
     latestAgentSessionByNodeId.set(agentSession.nodeId, agentSession);
     visitedNodeIds.add(agentSession.nodeId);
     if (agentSession.incomingExpressionNodeId) visitedExpressionNodeIds.add(agentSession.incomingExpressionNodeId);
-    for (const edgeId of agentSession.incomingEdgeIds) visitedRouteEdgeIds.add(edgeId);
+    for (const edgeId of agentSession.incomingEdgeIds) {
+      visitedRouteEdgeIds.add(edgeId);
+      for (const graphNodeId of graphNodeIdsForEdgeId(edgeId, graphEdgeById, graphNodeById)) {
+        visitedNodeIds.add(graphNodeId);
+      }
+    }
     const sessionsForNode = sessionsByNodeId.get(agentSession.nodeId) ?? [];
     sessionsForNode.push(agentSession);
     sessionsByNodeId.set(agentSession.nodeId, sessionsForNode);
@@ -3669,7 +3950,12 @@ function graphExecutionViewForSession(session: GraphSession): GraphExecutionView
   for (const agentSession of activeAgentSessions) {
     if (agentSession.previousAgentSessionId) previousAgentSessionIds.add(agentSession.previousAgentSessionId);
     if (agentSession.incomingExpressionNodeId) activeExpressionNodeIds.add(agentSession.incomingExpressionNodeId);
-    for (const edgeId of agentSession.incomingEdgeIds) activeRouteEdgeIds.add(edgeId);
+    for (const edgeId of agentSession.incomingEdgeIds) {
+      activeRouteEdgeIds.add(edgeId);
+      for (const graphNodeId of graphNodeIdsForEdgeId(edgeId, graphEdgeById, graphNodeById)) {
+        activeGraphNodeIds.add(graphNodeId);
+      }
+    }
   }
 
   if (session.pendingReview) {
@@ -3709,6 +3995,7 @@ function graphExecutionViewForSession(session: GraphSession): GraphExecutionView
     previousNodeIds,
     activeExpressionNodeIds,
     activeReviewNodeIds,
+    activeGraphNodeIds,
     activeRouteEdgeIds,
     visitedNodeIds,
     visitedExpressionNodeIds,
@@ -3727,6 +4014,7 @@ function nodeExecutionClass(nodeId: string, executionView: GraphExecutionView | 
   if (executionView.previousNodeIds.has(nodeId)) classes.push("execution-previous");
   if (executionView.activeExpressionNodeIds.has(nodeId)) classes.push("execution-expression");
   if (executionView.activeReviewNodeIds.has(nodeId)) classes.push("execution-review", "execution-active");
+  if (executionView.activeGraphNodeIds.has(nodeId)) classes.push("execution-graph", "execution-active");
   if (executionView.activeNodeIds.has(nodeId)) classes.push("execution-active");
   const latestAgentSession = executionView.latestAgentSessionByNodeId.get(nodeId);
   if (latestAgentSession?.terminalOutcome?.state === "failed") classes.push("execution-failed");
@@ -3739,6 +4027,12 @@ function edgeExecutionClass(edgeId: string, executionView: GraphExecutionView | 
   if (executionView.activeRouteEdgeIds.has(edgeId)) return "execution-active-route";
   if (executionView.visitedRouteEdgeIds.has(edgeId)) return "execution-visited-route";
   return "";
+}
+
+function graphNodeIdsForEdgeId(edgeId: string, edges: Map<string, GraphEdge>, nodes: Map<string, GraphNode>): string[] {
+  const edge = edges.get(edgeId);
+  if (!edge) return [];
+  return [edge.source, edge.target].filter((nodeId) => nodes.get(nodeId)?.type === "graph");
 }
 
 function isTerminalAgentSession(agentSession: AgentSession): boolean {

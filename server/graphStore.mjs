@@ -150,6 +150,7 @@ export async function createAgentSession(sessionId, payload) {
     createdAgentSession = normalizeAgentSession({
       id,
       graphSessionId: current.id,
+      graphId: nullableString(body.graphId),
       nodeId,
       agentId: nullableString(body.agentId),
       sequence: nextAgentSessionSequence(current.agentSessions),
@@ -205,7 +206,7 @@ export async function recordAgentSessionStatus(sessionId, agentSessionId, payloa
   const session = await updateGraphSession(sessionId, (current) => {
     const agentSession = current.agentSessions.find((candidate) => candidate.id === agentSessionId);
     if (!agentSession) return current;
-    const resultIds = new Set((current.resultsSnapshot ?? defaultResultDefinitions()).map((result) => result.id));
+    const resultIds = new Set(resultsForAgentSession(current, agentSession).map((result) => result.id));
     const status = normalizeAgentSessionStatus(payload, current.id, agentSession, resultIds, source);
     recordedStatus = status;
     const terminalOutcome = isTerminalState(status.state) ? terminalOutcomeFromStatus(status) : agentSession.terminalOutcome;
@@ -243,6 +244,15 @@ async function updateAgentSession(sessionId, agentSessionId, update, updatedAt) 
     updatedAt,
   }));
   return { agentSession: updatedAgentSession, session };
+}
+
+function resultsForAgentSession(session, agentSession) {
+  const graphId = nullableString(agentSession?.graphId);
+  if (graphId && Array.isArray(session?.projectsSnapshot)) {
+    const project = session.projectsSnapshot.find((candidate) => candidate.id === graphId);
+    if (project?.results) return project.results;
+  }
+  return session?.resultsSnapshot ?? defaultResultDefinitions();
 }
 
 export function defaultResultDefinitions() {
@@ -497,7 +507,7 @@ function normalizeGraph(value) {
 function normalizeGraphNode(value) {
   const record = asRecord(value);
   const type = stringValue(record.type);
-  if (type !== "play" && type !== "agent" && type !== "expression" && type !== "review") return null;
+  if (type !== "play" && type !== "agent" && type !== "expression" && type !== "review" && type !== "graph") return null;
   const id = stringValue(record.id) || cryptoId(type);
   return {
     id,
@@ -514,6 +524,9 @@ function normalizeGraphNode(value) {
     } : {}),
     ...(type === "expression" ? {
       resultId: normalizeStoredResultId(record.resultId) || "default",
+    } : {}),
+    ...(type === "graph" ? {
+      graphId: nullableString(record.graphId ?? record.projectId),
     } : {}),
   };
 }
@@ -584,6 +597,7 @@ function normalizeGraphSession(value) {
     projectId: nullableString(record.projectId),
     projectName: nullableString(record.projectName),
     graphSnapshot: isPlainRecord(record.graphSnapshot) ? normalizeGraph(record.graphSnapshot) : null,
+    projectsSnapshot: Array.isArray(record.projectsSnapshot) ? normalizeProjects(record.projectsSnapshot, null) : null,
     agentsSnapshot: Array.isArray(record.agentsSnapshot) ? normalizeAgents(record.agentsSnapshot) : null,
     resultsSnapshot: Array.isArray(record.resultsSnapshot) ? normalizeResults(record.resultsSnapshot) : null,
     agentSessions,
@@ -603,6 +617,7 @@ function normalizePendingReview(value, graphSessionId) {
   return {
     id: stringValue(record.id) || cryptoId("pending-review"),
     graphSessionId,
+    graphId: nullableString(record.graphId),
     reviewNodeId,
     agentNodeId,
     previousAgentSessionId,
@@ -655,6 +670,7 @@ function normalizeAgentSession(value, graphSessionId, fallbackSequence = 0) {
   return {
     id,
     graphSessionId,
+    graphId: nullableString(record.graphId),
     nodeId,
     agentId: nullableString(record.agentId),
     sequence: numberValue(record.sequence, fallbackSequence),
