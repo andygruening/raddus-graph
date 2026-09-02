@@ -477,6 +477,110 @@ test("graph cards can start a selected project graph in the same graph session",
   assert.equal(target.reviewPause, null);
 });
 
+test("completed child graphs continue to connected graph cards with the child result as the next prompt", () => {
+  const parentGraph = {
+    nodes: [
+      { id: "play-parent", type: "play" },
+      { id: "graph-a", type: "graph", graphId: "project-a" },
+      { id: "graph-b", type: "graph", graphId: "project-b" },
+    ],
+    edges: [
+      { id: "edge-play-graph-a", source: "play-parent", target: "graph-a", type: "runs" },
+      { id: "edge-graph-a-graph-b", source: "graph-a", target: "graph-b", type: "runs" },
+    ],
+  };
+  const graphA = {
+    nodes: [
+      { id: "play-a", type: "play" },
+      { id: "agent-a", type: "agent", agentId: "agent-a" },
+    ],
+    edges: [
+      { id: "edge-a-start", source: "play-a", target: "agent-a", type: "runs" },
+    ],
+  };
+  const graphB = {
+    nodes: [
+      { id: "play-b", type: "play" },
+      { id: "agent-b", type: "agent", agentId: "agent-b" },
+    ],
+    edges: [
+      { id: "edge-b-start", source: "play-b", target: "agent-b", type: "runs" },
+    ],
+  };
+
+  const target = continuationTargetForSession({
+    session: {
+      id: "graph-session-graph-chain",
+      projectId: "project-parent",
+      projectName: "Parent Graph",
+      playNodeId: "play-parent",
+      prompt: "Original graph prompt.",
+      agentSessions: [
+        {
+          id: "agent-session-a",
+          graphId: "project-a",
+          sequence: 1,
+          nodeId: "agent-a",
+          status: "completed",
+          previousAgentSessionId: null,
+          incomingExpressionNodeId: null,
+          incomingEdgeIds: ["edge-play-graph-a", "edge-a-start"],
+          incomingResultId: null,
+          terminalOutcome: {
+            state: "completed",
+            routedResultId: "completed",
+            summary: "Graph A finished.",
+            detail: "Use Graph A output for Graph B.",
+          },
+        },
+      ],
+    },
+    graph: parentGraph,
+    agents: [],
+    results: [],
+    projectId: "project-parent",
+    projectName: "Parent Graph",
+    projects: [
+      {
+        id: "project-parent",
+        name: "Parent Graph",
+        graph: parentGraph,
+        agents: [],
+        results: [],
+        lastPlaySelection: null,
+      },
+      {
+        id: "project-a",
+        name: "Graph A",
+        graph: graphA,
+        agents: [{ id: "agent-a", name: "Agent A", model: "gpt-5", systemPrompt: "" }],
+        results: [],
+        lastPlaySelection: null,
+      },
+      {
+        id: "project-b",
+        name: "Graph B",
+        graph: graphB,
+        agents: [{ id: "agent-b", name: "Agent B", model: "gpt-5", systemPrompt: "" }],
+        results: [],
+        lastPlaySelection: null,
+      },
+    ],
+  });
+
+  assert.equal(target.currentDefinition.graphId, "project-b");
+  assert.equal(target.currentAgentNode.id, "agent-b");
+  assert.equal(target.userPrompt, "Use Graph A output for Graph B.");
+  assert.deepEqual(target.visitedAgentSessionIds, ["agent-session-a"]);
+  assert.deepEqual(target.currentArrival, {
+    previousAgentSessionId: "agent-session-a",
+    incomingExpressionNodeId: null,
+    incomingEdgeIds: ["edge-graph-a-graph-b", "edge-b-start"],
+    incomingResultId: null,
+  });
+  assert.equal(target.reviewPause, null);
+});
+
 test("play nodes can start graph cards in the same graph session", () => {
   const target = continuationTargetForSession({
     session: {

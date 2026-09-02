@@ -3460,6 +3460,9 @@ function paletteConnectionForTarget(
   if (sourceCandidate.type === "graph" && target.type === "play") {
     return { source: target, target: sourceCandidate, type: "runs", targetNodeId: target.id };
   }
+  if (sourceCandidate.type === "graph" && target.type === "graph") {
+    return { source: target, target: sourceCandidate, type: "runs", targetNodeId: target.id };
+  }
   if ((sourceCandidate.type === "agent" || sourceCandidate.type === "review" || sourceCandidate.type === "graph") && target.type === "expression") {
     return {
       source: target,
@@ -3510,6 +3513,7 @@ function edgeForConnection(
   if (source.type === "play" && target.type === "agent") return { source: source.id, target: target.id, type: "runs" };
   if (source.type === "play" && target.type === "graph") return { source: source.id, target: target.id, type: "runs" };
   if (source.type === "graph" && target.type === "agent") return { source: source.id, target: target.id, type: "runs" };
+  if (source.type === "graph" && target.type === "graph") return { source: source.id, target: target.id, type: "runs" };
   if (source.type === "agent" && target.type === "expression") return { source: source.id, target: target.id, type: "evaluates" };
   if (source.type === "expression" && (target.type === "agent" || target.type === "review" || target.type === "graph")) {
     return {

@@ -122,6 +122,7 @@ export async function runGraphSession(sessionId) {
   await continueGraphSessionFromAgent({
     sessionId,
     definition: startRoute.definition,
+    returnContinuation: startRoute.returnContinuation,
     currentAgentNode: startRoute.node,
     visitedAgentSessionIds: [],
     currentArrival: startRoute.arrival,
@@ -132,6 +133,7 @@ export async function runGraphSession(sessionId) {
 async function continueGraphSessionFromAgent({
   sessionId,
   definition,
+  returnContinuation,
   currentAgentNode,
   visitedAgentSessionIds,
   currentArrival,
@@ -139,6 +141,7 @@ async function continueGraphSessionFromAgent({
 }) {
   visitedAgentSessionIds = [...visitedAgentSessionIds];
   let currentDefinition = definition;
+  let currentReturnContinuation = returnContinuation ?? null;
   let step = 0;
   for (; step < 50 && currentAgentNode; step += 1) {
     const session = await getSession(sessionId);
@@ -171,6 +174,25 @@ async function continueGraphSessionFromAgent({
     }
 
     const nextRoute = nextGraphRouteFromOutcome({ graph: currentDefinition.graph, currentAgentNode, outcome });
+    if (!nextRoute) {
+      const completionRoute = nextAgentRouteAfterGraphCompletion({
+        returnContinuation: currentReturnContinuation,
+        previousAgentSession: currentExecution,
+        fallbackUserPrompt: userPrompt ?? session.prompt,
+      });
+      if (!completionRoute) {
+        currentAgentNode = null;
+        currentArrival = null;
+        continue;
+      }
+      currentDefinition = completionRoute.definition;
+      currentReturnContinuation = completionRoute.returnContinuation ?? null;
+      currentAgentNode = completionRoute.node;
+      currentArrival = completionRoute.arrival;
+      userPrompt = completionRoute.userPrompt ?? userPrompt ?? session.prompt;
+      continue;
+    }
+
     if (nextRoute?.node.type === "review") {
       await pauseSessionForReview({
         sessionId,
@@ -185,6 +207,7 @@ async function continueGraphSessionFromAgent({
     }
     const nextAgentRoute = nextAgentRouteFromGraphRoute({
       definition: currentDefinition,
+      returnContinuation: currentReturnContinuation,
       route: nextRoute,
       previousAgentSession: currentExecution,
       fallbackUserPrompt: userPrompt ?? session.prompt,
@@ -192,6 +215,7 @@ async function continueGraphSessionFromAgent({
     currentAgentNode = nextAgentRoute?.node ?? null;
     currentArrival = nextAgentRoute?.arrival ?? null;
     currentDefinition = nextAgentRoute?.definition ?? currentDefinition;
+    currentReturnContinuation = nextAgentRoute?.returnContinuation ?? currentReturnContinuation;
     userPrompt = nextAgentRoute?.userPrompt ?? userPrompt ?? session.prompt;
   }
 
@@ -287,6 +311,11 @@ async function continueGraphSessionFromReview(sessionId, pendingReview, answer) 
   await continueGraphSessionFromAgent({
     sessionId,
     definition,
+    returnContinuation: returnContinuationForAgentSession(
+      session,
+      fallbackDefinition,
+      session.agentSessions.find((agentSession) => agentSession.id === pendingReview.previousAgentSessionId) ?? null,
+    ),
     currentAgentNode: agentNode,
     visitedAgentSessionIds: pendingReview.upstreamAgentSessionIds,
     currentArrival: {
@@ -309,6 +338,7 @@ async function continueGraphSessionFromPlan(sessionId, plan) {
   await continueGraphSessionFromAgent({
     sessionId,
     definition,
+    returnContinuation: plan.target.currentReturnContinuation,
     currentAgentNode: plan.target.currentAgentNode,
     visitedAgentSessionIds: plan.target.visitedAgentSessionIds,
     currentArrival: plan.target.currentArrival,
@@ -606,6 +636,67 @@ function graphDefinitionForPendingReview(fallbackDefinition, pendingReview) {
   return project?.graph ? graphDefinitionForProject(project, projects) : fallbackDefinition;
 }
 
+function returnContinuationForAgentSession(session, fallbackDefinition, agentSession, seenAgentSessionIds = new Set()) {
+  if (!agentSession?.id || seenAgentSessionIds.has(agentSession.id)) return null;
+  seenAgentSessionIds.add(agentSession.id);
+  const graphId = nullableString(agentSession.graphId);
+  if (!graphId || graphId === nullableString(fallbackDefinition?.graphId)) return null;
+
+  const directReturnContinuation = directReturnContinuationForAgentSession(fallbackDefinition, graphId, agentSession);
+  if (directReturnContinuation) return directReturnContinuation;
+
+  const previousAgentSession = session?.agentSessions?.find((candidate) => candidate.id === agentSession.previousAgentSessionId);
+  return previousAgentSession
+    ? returnContinuationForAgentSession(session, fallbackDefinition, previousAgentSession, seenAgentSessionIds)
+    : null;
+}
+
+function directReturnContinuationForAgentSession(fallbackDefinition, graphId, agentSession) {
+  const incomingEdgeIds = new Set(
+    Array.isArray(agentSession?.incomingEdgeIds)
+      ? agentSession.incomingEdgeIds.map(stringValue).filter(Boolean)
+      : [],
+  );
+  if (incomingEdgeIds.size === 0) return null;
+
+  for (const definition of graphDefinitionsForContinuation(fallbackDefinition)) {
+    const graphNode = graphCardNodeForIncomingGraph(definition, graphId, incomingEdgeIds);
+    if (graphNode) return { definition, graphNode, parent: null };
+  }
+  return null;
+}
+
+function graphDefinitionsForContinuation(fallbackDefinition) {
+  const definitions = [];
+  const seen = new Set();
+  function addDefinition(definition) {
+    if (!definition?.graph) return;
+    const key = nullableString(definition.graphId) ?? `graph:${definitions.length}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    definitions.push(definition);
+  }
+
+  addDefinition(fallbackDefinition);
+  const projects = Array.isArray(fallbackDefinition?.projects) ? fallbackDefinition.projects : [];
+  for (const project of projects) addDefinition(graphDefinitionForProject(project, projects));
+  return definitions;
+}
+
+function graphCardNodeForIncomingGraph(definition, graphId, incomingEdgeIds) {
+  const graph = definition?.graph;
+  if (!graph) return null;
+  for (const edgeId of incomingEdgeIds) {
+    const edge = graph.edges.find((candidate) => (
+      candidate.id === edgeId && (candidate.type === "runs" || candidate.type === "routes")
+    ));
+    if (!edge) continue;
+    const node = graph.nodes.find((candidate) => candidate.id === edge.target && candidate.type === "graph");
+    if (nullableString(node?.graphId) === graphId) return node;
+  }
+  return null;
+}
+
 export function continuationTargetForSession({
   session,
   graph,
@@ -631,6 +722,7 @@ export function continuationTargetForSession({
     if (!startRoute) throw new Error("No agent node or graph card is connected to this session's play node.");
     return {
       currentDefinition: startRoute.definition,
+      currentReturnContinuation: startRoute.returnContinuation,
       currentAgentNode: startRoute.node,
       currentArrival: startRoute.arrival,
       visitedAgentSessionIds: [],
@@ -641,6 +733,7 @@ export function continuationTargetForSession({
 
   const lastAgentSession = orderedSessions.at(-1);
   const currentDefinition = graphDefinitionForAgentSession(session, fallbackDefinition, lastAgentSession);
+  const currentReturnContinuation = returnContinuationForAgentSession(session, fallbackDefinition, lastAgentSession);
   const lastAgentNode = currentDefinition.graph.nodes.find((candidate) => candidate.id === lastAgentSession.nodeId && candidate.type === "agent");
   if (!lastAgentNode) throw new Error("The last agent node is no longer available in this graph.");
 
@@ -648,6 +741,7 @@ export function continuationTargetForSession({
   if (!lastOutcome || lastOutcome.state === "stopped" || lastAgentSession.status === "stopped") {
     return {
       currentDefinition,
+      currentReturnContinuation,
       currentAgentNode: lastAgentNode,
       currentArrival: arrivalForAgentSession(lastAgentSession),
       visitedAgentSessionIds: orderedSessions.slice(0, -1).map((agentSession) => agentSession.id),
@@ -657,13 +751,30 @@ export function continuationTargetForSession({
   }
 
   const nextRoute = nextGraphRouteFromOutcome({ graph: currentDefinition.graph, currentAgentNode: lastAgentNode, outcome: lastOutcome });
-  if (!nextRoute) throw new Error("No next agent, graph, or review card is connected to continue from the last result.");
-
   const visitedAgentSessionIds = orderedSessions.map((agentSession) => agentSession.id);
   const fallbackUserPrompt = userPromptForAgentRerun(session, currentDefinition, lastAgentSession);
+  if (!nextRoute) {
+    const completedGraphRoute = nextAgentRouteAfterGraphCompletion({
+      returnContinuation: currentReturnContinuation,
+      previousAgentSession: lastAgentSession,
+      fallbackUserPrompt,
+    });
+    if (!completedGraphRoute) throw new Error("No next agent, graph, or review card is connected to continue from the last result.");
+    return {
+      currentDefinition: completedGraphRoute.definition,
+      currentReturnContinuation: completedGraphRoute.returnContinuation,
+      currentAgentNode: completedGraphRoute.node,
+      currentArrival: completedGraphRoute.arrival,
+      visitedAgentSessionIds,
+      reviewPause: null,
+      userPrompt: completedGraphRoute.userPrompt ?? fallbackUserPrompt,
+    };
+  }
+
   if (nextRoute.node.type === "review") {
     return {
       currentDefinition,
+      currentReturnContinuation,
       currentAgentNode: null,
       currentArrival: null,
       visitedAgentSessionIds,
@@ -681,6 +792,7 @@ export function continuationTargetForSession({
 
   const nextAgentRoute = nextAgentRouteFromGraphRoute({
     definition: currentDefinition,
+    returnContinuation: currentReturnContinuation,
     route: nextRoute,
     previousAgentSession: lastAgentSession,
     fallbackUserPrompt,
@@ -688,6 +800,7 @@ export function continuationTargetForSession({
 
   return {
     currentDefinition: nextAgentRoute?.definition ?? currentDefinition,
+    currentReturnContinuation: nextAgentRoute?.returnContinuation ?? currentReturnContinuation,
     currentAgentNode: nextAgentRoute?.node ?? null,
     currentArrival: nextAgentRoute?.arrival ?? null,
     visitedAgentSessionIds,
@@ -988,7 +1101,7 @@ export function cliArgsForRunner(runner, agent, workspacePath, prompt) {
   };
 }
 
-function firstAgentRouteForStart(definition, startNodeId, visitedStartNodeIds = new Set(), prefixEdgeIds = []) {
+function firstAgentRouteForStart(definition, startNodeId, visitedStartNodeIds = new Set(), prefixEdgeIds = [], returnContinuation = null) {
   const graph = definition?.graph;
   if (!graph) return null;
   const sourceNodeId = stringValue(startNodeId);
@@ -1002,6 +1115,7 @@ function firstAgentRouteForStart(definition, startNodeId, visitedStartNodeIds = 
   if (targetNode?.type === "agent") {
     return {
       definition,
+      returnContinuation,
       node: targetNode,
       edgeIds,
       arrival: prefixEdgeIds.length > 0 || visitedStartNodeIds.size > 0 ? {
@@ -1015,34 +1129,112 @@ function firstAgentRouteForStart(definition, startNodeId, visitedStartNodeIds = 
   if (targetNode?.type !== "graph") return null;
   const nextVisitedStartNodeIds = new Set([...visitedStartNodeIds, visitKey]);
   const nextDefinition = graphDefinitionForGraphNode(targetNode, definition);
-  const nextStartNodeId = targetNode.graphId ? graphStartNodeId(nextDefinition) : targetNode.id;
+  const targetGraphId = nullableString(targetNode.graphId);
+  const nextStartNodeId = targetGraphId ? graphStartNodeId(nextDefinition) : targetNode.id;
   if (!nextStartNodeId) throw new Error(`Graph card ${targetNode.id} points to a graph without a play node.`);
-  return firstAgentRouteForStart(nextDefinition, nextStartNodeId, nextVisitedStartNodeIds, edgeIds);
+  const nextReturnContinuation = targetGraphId
+    ? { definition, graphNode: targetNode, parent: returnContinuation }
+    : returnContinuation;
+  return firstAgentRouteForStart(nextDefinition, nextStartNodeId, nextVisitedStartNodeIds, edgeIds, nextReturnContinuation);
 }
 
-function nextAgentRouteFromGraphRoute({ definition, route, previousAgentSession, fallbackUserPrompt }) {
+function nextAgentRouteFromGraphRoute({ definition, returnContinuation, route, previousAgentSession, fallbackUserPrompt }) {
   if (!route) return null;
   if (!previousAgentSession?.id) throw new Error("Cannot route from a graph card without a completed parent agent session.");
   if (route.node.type === "agent") {
     return {
       definition,
+      returnContinuation,
       node: route.node,
       arrival: arrivalForGraphRoute(route, previousAgentSession.id),
       userPrompt: fallbackUserPrompt,
     };
   }
   if (route.node.type !== "graph") return null;
-  const nextDefinition = graphDefinitionForGraphNode(route.node, definition);
-  const nextStartNodeId = route.node.graphId ? graphStartNodeId(nextDefinition) : route.node.id;
-  if (!nextStartNodeId) throw new Error(`Graph card ${route.node.id} points to a graph without a play node.`);
-  const graphStartRoute = firstAgentRouteForStart(nextDefinition, nextStartNodeId);
+  const graphStartRoute = agentRouteFromGraphNode({
+    definition,
+    returnContinuation,
+    graphNode: route.node,
+  });
   if (!graphStartRoute) throw new Error(`Graph card ${route.node.id} is not connected to an agent node.`);
   return {
     definition: graphStartRoute.definition,
+    returnContinuation: graphStartRoute.returnContinuation,
     node: graphStartRoute.node,
     arrival: arrivalForGraphRoute(route, previousAgentSession.id, graphStartRoute.edgeIds),
     userPrompt: graphPromptFromAgentSession(previousAgentSession) || fallbackUserPrompt,
   };
+}
+
+function nextAgentRouteAfterGraphCompletion({ returnContinuation, previousAgentSession, fallbackUserPrompt }) {
+  if (!returnContinuation || !previousAgentSession?.id) return null;
+  const route = nextRunRouteFromCompletedGraphCard(returnContinuation);
+  if (!route) {
+    return nextAgentRouteAfterGraphCompletion({
+      returnContinuation: returnContinuation.parent,
+      previousAgentSession,
+      fallbackUserPrompt,
+    });
+  }
+
+  const userPrompt = graphPromptFromAgentSession(previousAgentSession) || fallbackUserPrompt;
+  if (route.node.type === "agent") {
+    return {
+      definition: returnContinuation.definition,
+      returnContinuation: returnContinuation.parent,
+      node: route.node,
+      arrival: {
+        previousAgentSessionId: previousAgentSession.id,
+        incomingExpressionNodeId: null,
+        incomingEdgeIds: route.edgeIds,
+        incomingResultId: null,
+      },
+      userPrompt,
+    };
+  }
+
+  const graphStartRoute = agentRouteFromGraphNode({
+    definition: returnContinuation.definition,
+    returnContinuation: returnContinuation.parent,
+    graphNode: route.node,
+  });
+  if (!graphStartRoute) throw new Error(`Graph card ${route.node.id} is not connected to an agent node.`);
+  return {
+    definition: graphStartRoute.definition,
+    returnContinuation: graphStartRoute.returnContinuation,
+    node: graphStartRoute.node,
+    arrival: {
+      previousAgentSessionId: previousAgentSession.id,
+      incomingExpressionNodeId: null,
+      incomingEdgeIds: [...route.edgeIds, ...graphStartRoute.edgeIds],
+      incomingResultId: null,
+    },
+    userPrompt,
+  };
+}
+
+function nextRunRouteFromCompletedGraphCard(returnContinuation) {
+  const graph = returnContinuation?.definition?.graph;
+  const graphNodeId = returnContinuation?.graphNode?.id;
+  if (!graph || !graphNodeId) return null;
+  const edge = graph.edges.find((candidate) => candidate.source === graphNodeId && candidate.type === "runs");
+  if (!edge) return null;
+  const node = graph.nodes.find((candidate) => (
+    candidate.id === edge.target && (candidate.type === "agent" || candidate.type === "graph")
+  ));
+  if (!node) return null;
+  return { node, edgeIds: [edge.id] };
+}
+
+function agentRouteFromGraphNode({ definition, returnContinuation, graphNode }) {
+  const nextDefinition = graphDefinitionForGraphNode(graphNode, definition);
+  const targetGraphId = nullableString(graphNode.graphId);
+  const nextStartNodeId = targetGraphId ? graphStartNodeId(nextDefinition) : graphNode.id;
+  if (!nextStartNodeId) throw new Error(`Graph card ${graphNode.id} points to a graph without a play node.`);
+  const nextReturnContinuation = targetGraphId
+    ? { definition, graphNode, parent: returnContinuation ?? null }
+    : returnContinuation ?? null;
+  return firstAgentRouteForStart(nextDefinition, nextStartNodeId, new Set(), [], nextReturnContinuation);
 }
 
 function arrivalForGraphRoute(route, previousAgentSessionId, extraEdgeIds = []) {

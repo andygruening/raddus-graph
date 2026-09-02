@@ -23,6 +23,8 @@ test("graph cards are available in the canvas UI and styled like orange agent ca
   assert.ok(app.includes("<strong>{graphName}</strong>"), "Graph cards should render the selected graph name.");
   assert.ok(app.includes('node.type === "graph"'), "Canvas graph cards should have a graph-specific click action.");
   assert.ok(app.includes("selectProject(node.graphId)"), "Clicking a graph card should switch to that graph.");
+  assert.ok(app.includes('sourceCandidate.type === "graph" && target.type === "graph"'), "Dropping a graph card onto another graph card should connect them.");
+  assert.ok(app.includes('source.type === "graph" && target.type === "graph"'), "Graph cards should be directly connectable to graph cards.");
   assert.equal(app.includes("<strong>Graph</strong>"), false, "Graph cards should not render a generic Graph label.");
   assert.ok(app.includes("<GitPullRequest size={16}"), "Graph cards should use a graph-like icon.");
   assert.ok(graphBlock, "graph card CSS block should exist");
