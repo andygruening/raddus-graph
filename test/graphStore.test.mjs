@@ -237,6 +237,60 @@ test("terminal statuses route through built-in reserved results", async () => {
   }
 });
 
+test("agent sessions route custom results through their graph snapshot", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "raddus-graph-store-"));
+  process.env.RADDUS_GRAPH_DIR = dataDir;
+  try {
+    const store = await import(`../server/graphStore.mjs?graph-store-test=${Date.now()}-graph-session-results`);
+    await store.initializeGraphStore();
+
+    await store.addGraphSession({
+      id: "graph-session-child-results",
+      status: "running",
+      playNodeId: "play-parent",
+      prompt: "Run parent graph.",
+      repository: null,
+      workspacePath: join(dataDir, "sessions", "graph-session-child-results", "worktree"),
+      activeAgentSessionIds: [],
+      projectId: "project-parent",
+      projectName: "Parent Graph",
+      graphSnapshot: { nodes: [], edges: [] },
+      projectsSnapshot: [
+        {
+          id: "project-child",
+          name: "Child Graph",
+          graph: { nodes: [], edges: [] },
+          agents: [],
+          results: [{ id: "child-result", description: "Child-only result." }],
+        },
+      ],
+      agentsSnapshot: [],
+      resultsSnapshot: store.defaultResultDefinitions(),
+      agentSessions: [],
+      pendingReview: null,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+
+    const childSession = await store.createAgentSession("graph-session-child-results", {
+      nodeId: "agent-child",
+      graphId: "project-child",
+    });
+    const completed = await store.recordAgentSessionStatus("graph-session-child-results", childSession.agentSession.id, {
+      state: "completed",
+      resultId: "child-result",
+      summary: "Child graph completed.",
+    }, "test");
+
+    assert.equal(childSession.agentSession.graphId, "project-child");
+    assert.equal(completed.status.routedResultId, "child-result");
+    assert.equal(completed.status.routeReason, "matched_result");
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+    delete process.env.RADDUS_GRAPH_DIR;
+  }
+});
+
 test("legacy unknown and fallback result routes normalize to default", async () => {
   const dataDir = await mkdtemp(join(tmpdir(), "raddus-graph-store-"));
   process.env.RADDUS_GRAPH_DIR = dataDir;
@@ -464,6 +518,7 @@ test("graph store preserves review cards and pending review state", async () => 
     assert.deepEqual(saved.sessions[0].pendingReview, {
       id: "pending-review-a",
       graphSessionId: "graph-session-review",
+      graphId: null,
       reviewNodeId: "review-a",
       agentNodeId: "agent-a",
       previousAgentSessionId: "agent-session-a",
@@ -474,6 +529,51 @@ test("graph store preserves review cards and pending review state", async () => 
       question: "Should I continue?",
       createdAt: "2026-01-01T00:00:00.000Z",
     });
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+    delete process.env.RADDUS_GRAPH_DIR;
+  }
+});
+
+test("graph store preserves graph cards and their start routes", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "raddus-graph-store-"));
+  process.env.RADDUS_GRAPH_DIR = dataDir;
+  try {
+    const store = await import(`../server/graphStore.mjs?graph-store-test=${Date.now()}-graph-card`);
+    await store.initializeGraphStore();
+
+    const graph = {
+      nodes: [
+        { id: "play-a", type: "play", x: 0, y: 0, prompt: "Start", repository: null, branch: null },
+        { id: "graph-a", type: "graph", x: 180, y: 0, graphId: "project-child" },
+        { id: "agent-a", type: "agent", x: 380, y: 0, agentId: "agent-a" },
+      ],
+      edges: [
+        { id: "edge-play-graph", source: "play-a", target: "graph-a", type: "runs" },
+        { id: "edge-graph-agent", source: "graph-a", target: "agent-a", type: "runs" },
+      ],
+    };
+
+    const saved = await store.replaceGraphState({
+      selectedProjectId: "project-graph-card",
+      projects: [{
+        id: "project-graph-card",
+        name: "Graph Card Project",
+        graph,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      }],
+      graph,
+      agents: [{ id: "agent-a", name: "Agent A", model: "gpt-5", systemPrompt: "" }],
+      results: [],
+    });
+
+    assert.equal(saved.graph.nodes.find((node) => node.id === "graph-a")?.type, "graph");
+    assert.equal(saved.graph.nodes.find((node) => node.id === "graph-a")?.graphId, "project-child");
+    assert.deepEqual(saved.graph.edges.map((edge) => [edge.source, edge.target, edge.type]), [
+      ["play-a", "graph-a", "runs"],
+      ["graph-a", "agent-a", "runs"],
+    ]);
   } finally {
     await rm(dataDir, { recursive: true, force: true });
     delete process.env.RADDUS_GRAPH_DIR;

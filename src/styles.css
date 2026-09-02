@@ -853,6 +853,17 @@ a:focus-visible {
   padding: 10px;
 }
 
+.project-node.graph {
+  --node-accent: #f97316;
+  border-color: var(--node-accent);
+  width: 168px;
+  height: 72px;
+  min-height: 72px;
+  align-content: center;
+  gap: 0;
+  padding: 10px;
+}
+
 .project-node.expression {
   --node-accent: #7c3aed;
   border-color: var(--node-accent);
@@ -1157,6 +1168,10 @@ a:focus-visible {
   background: var(--brand-surface);
   color: var(--brand-hover);
   cursor: grabbing;
+}
+
+.palette-list > .palette-drag-item.graph > svg {
+  color: #f97316;
 }
 
 .palette-list > .palette-drag-item:hover,
