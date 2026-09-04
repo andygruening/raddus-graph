@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { cloneRepository, publishSessionChanges } from "./github.mjs";
 import {
   addGraphSession,
+  approvalResultId,
   createAgentSession,
   deleteGraphSession as deleteStoredGraphSession,
   nonCompletionResultIds,
@@ -23,6 +24,10 @@ const maxPromptHistoryEntries = 6;
 const maxPromptHistoryHandoffChars = 1600;
 const maxPromptHistorySummaryChars = 240;
 const maxPromptResultDescriptionChars = 120;
+const approvalResultDefinition = {
+  id: approvalResultId,
+  description: "Pause the graph and ask the user for approval.",
+};
 
 export function setGraphServerOrigin(origin) {
   graphServerOrigin = origin;
@@ -82,6 +87,67 @@ export async function createGraphSession(body) {
     projectsSnapshot: state.projects ?? [],
     agentsSnapshot: agents,
     resultsSnapshot: results,
+    agentSessions: [],
+    pendingReview: null,
+    error: null,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  });
+
+  queueMicrotask(() => {
+    runGraphSession(session.id).catch(async (error) => {
+      await failSession(session.id, error);
+    });
+  });
+
+  return session;
+}
+
+async function createLoopGraphSession({ sourceSession, definition, playNode }) {
+  const graph = definition?.graph;
+  const playNodeId = stringValue(playNode?.id);
+  if (!graph?.nodes?.some((node) => node.id === playNodeId && node.type === "play")) {
+    throw new Error("The loop target play node is no longer available.");
+  }
+
+  const sessionId = `graph-session-${new Date().toISOString().replace(/[^0-9]/g, "").slice(0, 14)}-${globalThis.crypto.randomUUID().slice(0, 8)}`;
+  const workspacePath = worktreePathForSession(sessionId);
+  await mkdir(sessionRootFor(sessionId), { recursive: true });
+
+  const repository = sourceSession.repository?.nameWithOwner
+    ? {
+      nameWithOwner: sourceSession.repository.nameWithOwner,
+      url: stringValue(sourceSession.repository.url),
+      branch: sourceSession.repository.branch || "main",
+    }
+    : null;
+
+  if (repository) {
+    await cloneRepository({
+      nameWithOwner: repository.nameWithOwner,
+      branch: repository.branch,
+      worktreePath: workspacePath,
+    });
+  } else {
+    await mkdir(workspacePath, { recursive: true });
+  }
+
+  const session = await addGraphSession({
+    id: sessionId,
+    status: "running",
+    playNodeId,
+    prompt: sourceSession.prompt,
+    repository,
+    workspacePath,
+    branchName: null,
+    prUrl: null,
+    activeAgentSessionIds: [],
+    projectId: nullableString(definition?.graphId) ?? nullableString(sourceSession.projectId),
+    projectName: nullableString(definition?.projectName) ?? nullableString(sourceSession.projectName),
+    graphSnapshot: graph,
+    projectsSnapshot: Array.isArray(sourceSession.projectsSnapshot) ? sourceSession.projectsSnapshot : definition?.projects ?? [],
+    agentsSnapshot: Array.isArray(definition?.agents) ? definition.agents : [],
+    resultsSnapshot: Array.isArray(definition?.results) ? definition.results : [],
     agentSessions: [],
     pendingReview: null,
     error: null,
@@ -185,6 +251,14 @@ async function continueGraphSessionFromAgent({
         currentArrival = null;
         continue;
       }
+      if (completionRoute.startPlayNode) {
+        await startNewSessionFromPlayRoute({
+          session: latestSession ?? session,
+          definition: completionRoute.definition,
+          playNode: completionRoute.startPlayNode,
+        });
+        return;
+      }
       currentDefinition = completionRoute.definition;
       currentReturnContinuation = completionRoute.returnContinuation ?? null;
       currentAgentNode = completionRoute.node;
@@ -193,11 +267,10 @@ async function continueGraphSessionFromAgent({
       continue;
     }
 
-    if (nextRoute?.node.type === "review") {
+    if (nextRoute.reviewPause) {
       await pauseSessionForReview({
         sessionId,
         definition: currentDefinition,
-        reviewNode: nextRoute.node,
         agentNode: currentAgentNode,
         agentSession: currentExecution,
         route: nextRoute,
@@ -212,6 +285,14 @@ async function continueGraphSessionFromAgent({
       previousAgentSession: currentExecution,
       fallbackUserPrompt: userPrompt ?? session.prompt,
     });
+    if (nextAgentRoute?.startPlayNode) {
+      await startNewSessionFromPlayRoute({
+        session: latestSession ?? session,
+        definition: nextAgentRoute.definition,
+        playNode: nextAgentRoute.startPlayNode,
+      });
+      return;
+    }
     currentAgentNode = nextAgentRoute?.node ?? null;
     currentArrival = nextAgentRoute?.arrival ?? null;
     currentDefinition = nextAgentRoute?.definition ?? currentDefinition;
@@ -230,13 +311,11 @@ async function continueGraphSessionFromAgent({
 export async function submitReviewResponse(sessionId, body) {
   const payload = asRecord(body);
   const answer = textValue(payload.answer);
-  const reviewNodeId = stringValue(payload.reviewNodeId);
   if (!answer) throw new Error("Enter a response before continuing the graph.");
 
   let pendingReview = null;
   const session = await updateGraphSession(sessionId, (current) => {
     if (current.status !== "waiting_review" || !current.pendingReview) throw new Error("Graph session is not waiting for review.");
-    if (reviewNodeId && current.pendingReview.reviewNodeId !== reviewNodeId) throw new Error("This review card is not waiting for input.");
     pendingReview = current.pendingReview;
     return {
       ...current,
@@ -335,6 +414,17 @@ async function continueGraphSessionFromPlan(sessionId, plan) {
   }
 
   const definition = plan.target.currentDefinition ?? plan;
+  if (plan.target.startPlayNode) {
+    const session = await getSession(sessionId);
+    if (!session) throw new Error(`Graph session not found: ${sessionId}`);
+    await startNewSessionFromPlayRoute({
+      session,
+      definition,
+      playNode: plan.target.startPlayNode,
+    });
+    return;
+  }
+
   await continueGraphSessionFromAgent({
     sessionId,
     definition,
@@ -344,6 +434,12 @@ async function continueGraphSessionFromPlan(sessionId, plan) {
     currentArrival: plan.target.currentArrival,
     userPrompt: plan.userPrompt,
   });
+}
+
+async function startNewSessionFromPlayRoute({ session, definition, playNode }) {
+  const nextSession = await createLoopGraphSession({ sourceSession: session, definition, playNode });
+  await completeSession(session.id, `Started new graph session ${nextSession.id} from play node ${playNode.id}.`);
+  return nextSession;
 }
 
 export async function stopGraphSession(sessionId) {
@@ -625,13 +721,13 @@ function graphDefinitionForPendingReview(fallbackDefinition, pendingReview) {
   const explicitDefinition = graphDefinitionForGraphId(pendingReview?.graphId, fallbackDefinition);
   if (explicitDefinition) return explicitDefinition;
   if (fallbackDefinition?.graph?.nodes?.some((node) => (
-    node.id === pendingReview?.agentNodeId || node.id === pendingReview?.reviewNodeId
+    node.id === pendingReview?.agentNodeId
   ))) {
     return fallbackDefinition;
   }
   const projects = Array.isArray(fallbackDefinition?.projects) ? fallbackDefinition.projects : [];
   const project = projects.find((candidate) => (
-    candidate.graph?.nodes?.some((node) => node.id === pendingReview?.agentNodeId || node.id === pendingReview?.reviewNodeId)
+    candidate.graph?.nodes?.some((node) => node.id === pendingReview?.agentNodeId)
   ));
   return project?.graph ? graphDefinitionForProject(project, projects) : fallbackDefinition;
 }
@@ -759,19 +855,20 @@ export function continuationTargetForSession({
       previousAgentSession: lastAgentSession,
       fallbackUserPrompt,
     });
-    if (!completedGraphRoute) throw new Error("No next agent, graph, or review card is connected to continue from the last result.");
+    if (!completedGraphRoute) throw new Error("No next agent, graph card, or play card is connected to continue from the last result.");
     return {
       currentDefinition: completedGraphRoute.definition,
       currentReturnContinuation: completedGraphRoute.returnContinuation,
-      currentAgentNode: completedGraphRoute.node,
+      currentAgentNode: completedGraphRoute.node ?? null,
       currentArrival: completedGraphRoute.arrival,
       visitedAgentSessionIds,
       reviewPause: null,
+      startPlayNode: completedGraphRoute.startPlayNode ?? null,
       userPrompt: completedGraphRoute.userPrompt ?? fallbackUserPrompt,
     };
   }
 
-  if (nextRoute.node.type === "review") {
+  if (nextRoute.reviewPause) {
     return {
       currentDefinition,
       currentReturnContinuation,
@@ -780,7 +877,6 @@ export function continuationTargetForSession({
       visitedAgentSessionIds,
       reviewPause: {
         definition: currentDefinition,
-        reviewNode: nextRoute.node,
         agentNode: lastAgentNode,
         agentSession: lastAgentSession,
         route: nextRoute,
@@ -805,6 +901,7 @@ export function continuationTargetForSession({
     currentArrival: nextAgentRoute?.arrival ?? null,
     visitedAgentSessionIds,
     reviewPause: null,
+    startPlayNode: nextAgentRoute?.startPlayNode ?? null,
     userPrompt: nextAgentRoute?.userPrompt ?? fallbackUserPrompt,
   };
 }
@@ -836,9 +933,10 @@ export function availableResultsForAgent({ graph, results, node }) {
   const graphNodes = Array.isArray(graph?.nodes) ? graph.nodes : [];
   const graphEdges = Array.isArray(graph?.edges) ? graph.edges : [];
   const resultDefinitions = Array.isArray(results) ? results : [];
+  const anyNodeIds = new Set(graphNodes.filter((candidate) => candidate.type === "any").map((candidate) => candidate.id));
   const evaluatedExpressionNodeIds = new Set(
     graphEdges
-      .filter((edge) => edge.source === node?.id && edge.type === "evaluates")
+      .filter((edge) => (edge.source === node?.id || anyNodeIds.has(edge.source)) && edge.type === "evaluates")
       .flatMap((edge) => {
         const expressionNode = graphNodes.find((candidate) => candidate.id === edge.target && candidate.type === "expression");
         return expressionNode ? [expressionNode.id] : [];
@@ -849,18 +947,20 @@ export function availableResultsForAgent({ graph, results, node }) {
       .filter((edge) => edge.type === "routes" && evaluatedExpressionNodeIds.has(edge.source))
       .flatMap((edge) => {
         const routeTarget = graphNodes.find((candidate) => (
-          candidate.id === edge.target && (candidate.type === "agent" || candidate.type === "review" || candidate.type === "graph")
+          candidate.id === edge.target && (candidate.type === "agent" || candidate.type === "graph" || candidate.type === "play")
         ));
         return edge.resultId && routeTarget && !nonCompletionResultIds.has(edge.resultId) ? [edge.resultId] : [];
       }),
   );
 
-  return resultDefinitions
+  const scopedResults = resultDefinitions
     .filter((result) => reachableResultIds.has(result.id) && !nonCompletionResultIds.has(result.id))
     .map((result) => ({
       id: result.id,
       description: result.description,
     }));
+  if (scopedResults.some((result) => result.id === approvalResultId)) return scopedResults;
+  return [...scopedResults, approvalResultDefinition];
 }
 
 export function agentSessionTranscriptOutput(agentSession) {
@@ -886,11 +986,11 @@ function behaviorSection(agent) {
 }
 
 function updatesSection(availableResults) {
-  const completedResultId = availableResults[0]?.id ?? "completed";
+  const completedResultId = availableResults.find((result) => result.id !== approvalResultId)?.id ?? "completed";
   return [
     'Write compact JSONL to `$RADDUS_GRAPH_STATUS_FILE`. Progress is optional: {"state":"working","summary":"Short update.","detail":"Optional detail."}',
     `Before exit, append exactly one terminal object: {"state":"completed","resultId":"${completedResultId}","summary":"Short result.","detail":"Downstream handoff."} or {"state":"failed","summary":"Short failure.","detail":"Blocker or next step."}`,
-    "Failed terminal results omit `resultId`. Review pauses put the exact user question in `detail`.",
+    "`ask-for-approval` pauses the graph and puts the exact user question in `detail`. Failed terminal results omit `resultId`.",
     resultListSection(availableResults),
   ].join("\n");
 }
@@ -1126,16 +1226,18 @@ function firstAgentRouteForStart(definition, startNodeId, visitedStartNodeIds = 
       } : null,
     };
   }
-  if (targetNode?.type !== "graph") return null;
-  const nextVisitedStartNodeIds = new Set([...visitedStartNodeIds, visitKey]);
-  const nextDefinition = graphDefinitionForGraphNode(targetNode, definition);
-  const targetGraphId = nullableString(targetNode.graphId);
-  const nextStartNodeId = targetGraphId ? graphStartNodeId(nextDefinition) : targetNode.id;
-  if (!nextStartNodeId) throw new Error(`Graph card ${targetNode.id} points to a graph without a play node.`);
-  const nextReturnContinuation = targetGraphId
-    ? { definition, graphNode: targetNode, parent: returnContinuation }
-    : returnContinuation;
-  return firstAgentRouteForStart(nextDefinition, nextStartNodeId, nextVisitedStartNodeIds, edgeIds, nextReturnContinuation);
+  if (targetNode?.type === "graph") {
+    const nextVisitedStartNodeIds = new Set([...visitedStartNodeIds, visitKey]);
+    const nextDefinition = graphDefinitionForGraphNode(targetNode, definition);
+    const targetGraphId = nullableString(targetNode.graphId);
+    const nextStartNodeId = targetGraphId ? graphStartNodeId(nextDefinition) : targetNode.id;
+    if (!nextStartNodeId) throw new Error(`Graph card ${targetNode.id} points to a graph without a play node.`);
+    const nextReturnContinuation = targetGraphId
+      ? { definition, graphNode: targetNode, parent: returnContinuation ?? null }
+      : returnContinuation ?? null;
+    return firstAgentRouteForStart(nextDefinition, nextStartNodeId, nextVisitedStartNodeIds, edgeIds, nextReturnContinuation);
+  }
+  return null;
 }
 
 function nextAgentRouteFromGraphRoute({ definition, returnContinuation, route, previousAgentSession, fallbackUserPrompt }) {
@@ -1146,6 +1248,16 @@ function nextAgentRouteFromGraphRoute({ definition, returnContinuation, route, p
       definition,
       returnContinuation,
       node: route.node,
+      arrival: arrivalForGraphRoute(route, previousAgentSession.id),
+      userPrompt: fallbackUserPrompt,
+    };
+  }
+  if (route.node.type === "play") {
+    return {
+      definition,
+      returnContinuation,
+      node: null,
+      startPlayNode: route.node,
       arrival: arrivalForGraphRoute(route, previousAgentSession.id),
       userPrompt: fallbackUserPrompt,
     };
@@ -1168,7 +1280,7 @@ function nextAgentRouteFromGraphRoute({ definition, returnContinuation, route, p
 
 function nextAgentRouteAfterGraphCompletion({ returnContinuation, previousAgentSession, fallbackUserPrompt }) {
   if (!returnContinuation || !previousAgentSession?.id) return null;
-  const route = nextRunRouteFromCompletedGraphCard(returnContinuation);
+  const route = nextRouteFromCompletedGraphCard(returnContinuation, previousAgentSession.terminalOutcome);
   if (!route) {
     return nextAgentRouteAfterGraphCompletion({
       returnContinuation: returnContinuation.parent,
@@ -1177,53 +1289,20 @@ function nextAgentRouteAfterGraphCompletion({ returnContinuation, previousAgentS
     });
   }
 
-  const userPrompt = graphPromptFromAgentSession(previousAgentSession) || fallbackUserPrompt;
-  if (route.node.type === "agent") {
-    return {
-      definition: returnContinuation.definition,
-      returnContinuation: returnContinuation.parent,
-      node: route.node,
-      arrival: {
-        previousAgentSessionId: previousAgentSession.id,
-        incomingExpressionNodeId: null,
-        incomingEdgeIds: route.edgeIds,
-        incomingResultId: null,
-      },
-      userPrompt,
-    };
-  }
-
-  const graphStartRoute = agentRouteFromGraphNode({
+  return nextAgentRouteFromGraphRoute({
     definition: returnContinuation.definition,
     returnContinuation: returnContinuation.parent,
-    graphNode: route.node,
+    route,
+    previousAgentSession,
+    fallbackUserPrompt: graphPromptFromAgentSession(previousAgentSession) || fallbackUserPrompt,
   });
-  if (!graphStartRoute) throw new Error(`Graph card ${route.node.id} is not connected to an agent node.`);
-  return {
-    definition: graphStartRoute.definition,
-    returnContinuation: graphStartRoute.returnContinuation,
-    node: graphStartRoute.node,
-    arrival: {
-      previousAgentSessionId: previousAgentSession.id,
-      incomingExpressionNodeId: null,
-      incomingEdgeIds: [...route.edgeIds, ...graphStartRoute.edgeIds],
-      incomingResultId: null,
-    },
-    userPrompt,
-  };
 }
 
-function nextRunRouteFromCompletedGraphCard(returnContinuation) {
+function nextRouteFromCompletedGraphCard(returnContinuation, outcome) {
   const graph = returnContinuation?.definition?.graph;
-  const graphNodeId = returnContinuation?.graphNode?.id;
-  if (!graph || !graphNodeId) return null;
-  const edge = graph.edges.find((candidate) => candidate.source === graphNodeId && candidate.type === "runs");
-  if (!edge) return null;
-  const node = graph.nodes.find((candidate) => (
-    candidate.id === edge.target && (candidate.type === "agent" || candidate.type === "graph")
-  ));
-  if (!node) return null;
-  return { node, edgeIds: [edge.id] };
+  const graphNode = returnContinuation?.graphNode;
+  if (!graph || !graphNode || !outcome) return null;
+  return nextGraphRouteFromOutcome({ graph, currentAgentNode: graphNode, outcome });
 }
 
 function agentRouteFromGraphNode({ definition, returnContinuation, graphNode }) {
@@ -1277,14 +1356,14 @@ function graphPromptFromAgentSession(agentSession) {
 
 export function nextGraphRouteFromOutcome({ graph, currentAgentNode, outcome }) {
   const routedResultId = outcome.routedResultId;
-  if (!routedResultId || outcome.state === "stopped") return null;
+  if (!currentAgentNode?.id || !routedResultId || outcome.state === "stopped") return null;
+  if (routedResultId === approvalResultId) return approvalRouteForGraph(graph);
 
-  const expressionEntries = graph.edges
-    .filter((edge) => edge.source === currentAgentNode.id && edge.type === "evaluates")
-    .flatMap((edge) => {
-      const node = graph.nodes.find((candidate) => candidate.id === edge.target && candidate.type === "expression");
-      return node ? [{ edge, node }] : [];
-    });
+  const graphNodes = Array.isArray(graph?.nodes) ? graph.nodes : [];
+  const anyNodeIds = currentAgentNode?.type === "agent"
+    ? new Set(graphNodes.filter((candidate) => candidate.type === "any").map((candidate) => candidate.id))
+    : new Set();
+  const expressionEntries = expressionEntriesForNode(graph, currentAgentNode.id, anyNodeIds);
   if (expressionEntries.length === 0) return null;
 
   const matchingRoute = routeForResult(graph, expressionEntries, routedResultId);
@@ -1292,21 +1371,55 @@ export function nextGraphRouteFromOutcome({ graph, currentAgentNode, outcome }) 
   return matchingRoute ?? defaultRoute;
 }
 
+function approvalRouteForGraph(graph) {
+  return {
+    node: null,
+    reviewPause: true,
+    expressionNodeId: null,
+    edgeIds: [],
+    resultId: approvalResultId,
+  };
+}
+
+function expressionEntriesForNode(graph, sourceNodeId, anyNodeIds) {
+  const entries = [];
+  const seenExpressionNodeIds = new Set();
+  function addEntriesForSource(sourceId) {
+    graph.edges
+      .filter((edge) => edge.source === sourceId && edge.type === "evaluates")
+      .forEach((edge) => {
+        if (seenExpressionNodeIds.has(edge.target)) return;
+        const node = graph.nodes.find((candidate) => candidate.id === edge.target && candidate.type === "expression");
+        if (!node) return;
+        seenExpressionNodeIds.add(node.id);
+        entries.push({ edge, node });
+      });
+  }
+
+  addEntriesForSource(sourceNodeId);
+  for (const anyNodeId of anyNodeIds) addEntriesForSource(anyNodeId);
+  return entries;
+}
+
 function routeForResult(graph, expressionEntries, resultId) {
-  for (const routeEdge of graph.edges) {
-    if (routeEdge.type !== "routes" || routeEdge.resultId !== resultId) continue;
-    const expressionEntry = expressionEntries.find((entry) => entry.node.id === routeEdge.source);
-    if (!expressionEntry) continue;
-    const node = graph.nodes.find((candidate) => (
-      candidate.id === routeEdge.target && (candidate.type === "agent" || candidate.type === "review" || candidate.type === "graph")
+  for (const expressionEntry of expressionEntries) {
+    const routeEdge = graph.edges.find((edge) => (
+      edge.type === "routes" &&
+      edge.source === expressionEntry.node.id &&
+      edge.resultId === resultId
     ));
-    if (!node) continue;
-    return {
-      node,
-      expressionNodeId: expressionEntry.node.id,
-      edgeIds: [expressionEntry.edge.id, routeEdge.id],
-      resultId: routeEdge.resultId ?? resultId,
-    };
+    if (!routeEdge) continue;
+    const node = graph.nodes.find((candidate) => (
+      candidate.id === routeEdge.target && (candidate.type === "agent" || candidate.type === "graph" || candidate.type === "play")
+    ));
+    if (node) {
+      return {
+        node,
+        expressionNodeId: expressionEntry.node.id,
+        edgeIds: [expressionEntry.edge.id, routeEdge.id],
+        resultId: routeEdge.resultId ?? resultId,
+      };
+    }
   }
   return null;
 }
@@ -1328,7 +1441,7 @@ function arrivalForAgentSession(agentSession) {
   };
 }
 
-async function pauseSessionForReview({ sessionId, definition, reviewNode, agentNode, agentSession, route, upstreamAgentSessionIds }) {
+async function pauseSessionForReview({ sessionId, definition, agentNode, agentSession, route, upstreamAgentSessionIds }) {
   if (!agentSession?.id) throw new Error("Cannot pause for review without a completed agent session.");
   const now = new Date().toISOString();
   await updateGraphSession(sessionId, (current) => ({
@@ -1339,7 +1452,7 @@ async function pauseSessionForReview({ sessionId, definition, reviewNode, agentN
       id: `pending-review-${globalThis.crypto.randomUUID().slice(0, 8)}`,
       graphSessionId: sessionId,
       graphId: nullableString(definition?.graphId),
-      reviewNodeId: reviewNode.id,
+      reviewNodeId: "approval-global",
       agentNodeId: agentNode.id,
       previousAgentSessionId: agentSession.id,
       incomingExpressionNodeId: route.expressionNodeId,

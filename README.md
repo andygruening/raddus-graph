@@ -8,7 +8,13 @@ Raddus Graph is a local web app for designing and running CLI-backed agent graph
 ## Features
 
 - Create local agent specs from a model, name, and system prompt.
+- Generate a new project graph from a prompt through a local Codex or Claude CLI agent.
+- Review the current graph with a local agent, inspect proposed change summaries, and apply the rebuilt graph after confirmation.
 - Build graph sessions from play nodes, agent nodes, and expression cards.
+- Use the permanent Any card to apply an expression route to every agent in a graph.
+- See transparent parent graph cues when another runnable graph card can execute the current graph.
+- Route expressions to play cards to continue a loop in a fresh graph session with the same launch parameters.
+- Use the top-center approval button when any agent emits `ask-for-approval`.
 - Define graph-scoped result IDs and route terminal outcomes through expression cards.
 - Persist graph data, agent specs, graph sessions, agent sessions, status records, retained worktrees, and PR mappings under `.raddus-graph/`.
 - Run Codex CLI or Claude CLI sessions from the local Node.js server based on the selected model.
@@ -124,7 +130,7 @@ DELETE /api/graph/sessions/:graphSessionId
 Removing a graph session stops active child processes first and deletes the retained session workspace.
 Completed, failed, and stopped graph sessions can be continued from the Sessions window. Continuation reuses the retained workspace, tries the current project graph first, and falls back to the stored session snapshot.
 
-Expression cards route only after terminal outcomes. `completed` routes by a valid emitted result ID. Unknown, invalid, or unbranched outcomes route through reserved `default`. `stopped` ends without routing.
+Expression cards route only after terminal outcomes. `completed` routes by a valid emitted result ID. Unknown, invalid, or unbranched outcomes route through reserved `default`. Expressions can route to agents, graph cards, or play cards. A play-card route starts a new graph session with the same launch prompt, repository, and branch. Play cards can start agents or graph cards directly; after that, graph cards route through expressions and return the result from the last agent node inside that graph. Any agent can emit `ask-for-approval` to pause the graph and show the top-center approval button. `stopped` ends without routing.
 
 The canvas can follow a graph session. In follow mode, the active agent node is highlighted, the previous node and incoming expression path are shown less strongly, and earlier visited nodes/routes keep subtle markers. Selecting a graph session from the Sessions window switches the canvas to that session's execution state.
 

@@ -5,7 +5,8 @@ import { normalizeModelId, normalizeModelReasoningEffort } from "./modelCatalog.
 
 export const graphStateFile = join(graphDataDir, "state.json");
 export const graphSessionsDir = join(graphDataDir, "sessions");
-export const reservedResultIds = new Set(["completed", "failed", "ask-for-approval", "default"]);
+export const approvalResultId = "ask-for-approval";
+export const reservedResultIds = new Set(["completed", "failed", approvalResultId, "default"]);
 export const legacyResultIds = new Set(["unknown", "fallback"]);
 export const nonCompletionResultIds = new Set(["default", "failed"]);
 
@@ -268,11 +269,6 @@ export function defaultResultDefinitions() {
       reserved: true,
     },
     {
-      id: "ask-for-approval",
-      description: "System route for pausing at a review card to ask for approval.",
-      reserved: true,
-    },
-    {
       id: "default",
       description: "System default route for unrecognized results or outcomes without a more-specific branch.",
       reserved: true,
@@ -366,6 +362,12 @@ function defaultGraphDocument() {
         prompt: "Describe the graph session you want to run.",
         repository: null,
         branch: null,
+      },
+      {
+        id: "any-global",
+        type: "any",
+        x: 72,
+        y: 176,
       },
     ],
     edges: [],
@@ -496,18 +498,27 @@ function normalizeResults(value) {
 
 function normalizeGraph(value) {
   const record = asRecord(value);
-  const nodes = Array.isArray(record.nodes) ? record.nodes.map(normalizeGraphNode).filter(Boolean) : defaultGraphDocument().nodes;
-  const nodeIds = new Set(nodes.map((node) => node.id));
+  const nodes = withRequiredAnyNode(
+    Array.isArray(record.nodes) ? record.nodes.map(normalizeGraphNode).filter(Boolean) : defaultGraphDocument().nodes,
+  );
+  const nodeById = new Map(nodes.map((node) => [node.id, node]));
   const edges = Array.isArray(record.edges)
-    ? record.edges.map((edge) => normalizeGraphEdge(edge, nodeIds)).filter(Boolean)
+    ? record.edges.map((edge) => normalizeGraphEdge(edge, nodeById)).filter(Boolean)
     : [];
-  return { nodes, edges };
+  const parentGraphReferencePositions = normalizePointMap(record.parentGraphReferencePositions);
+  return {
+    nodes,
+    edges,
+    ...(Object.keys(parentGraphReferencePositions).length > 0 ? { parentGraphReferencePositions } : {}),
+  };
 }
 
 function normalizeGraphNode(value) {
   const record = asRecord(value);
   const type = stringValue(record.type);
-  if (type !== "play" && type !== "agent" && type !== "expression" && type !== "review" && type !== "graph") return null;
+  if (type !== "play" && type !== "agent" && type !== "expression" && type !== "graph" && type !== "any") return null;
+  const expressionProperties = type === "expression" ? expressionNodeResultProperties(record.resultId) : null;
+  if (type === "expression" && !expressionProperties) return null;
   const id = stringValue(record.id) || cryptoId(type);
   return {
     id,
@@ -522,22 +533,28 @@ function normalizeGraphNode(value) {
     ...(type === "agent" ? {
       agentId: nullableString(record.agentId),
     } : {}),
-    ...(type === "expression" ? {
-      resultId: normalizeStoredResultId(record.resultId) || "default",
-    } : {}),
+    ...(expressionProperties ?? {}),
     ...(type === "graph" ? {
       graphId: nullableString(record.graphId ?? record.projectId),
     } : {}),
   };
 }
 
-function normalizeGraphEdge(value, nodeIds) {
+function expressionNodeResultProperties(value) {
+  const resultId = normalizeStoredResultId(value) || "default";
+  if (resultId === approvalResultId) return null;
+  return { resultId };
+}
+
+function normalizeGraphEdge(value, nodeById) {
   const record = asRecord(value);
   const source = stringValue(record.source);
   const target = stringValue(record.target);
-  if (!source || !target || !nodeIds.has(source) || !nodeIds.has(target)) return null;
+  const sourceNode = nodeById.get(source);
+  const targetNode = nodeById.get(target);
+  if (!source || !target || !sourceNode || !targetNode) return null;
   const type = stringValue(record.type);
-  if (type !== "runs" && type !== "evaluates" && type !== "routes") return null;
+  if (!isValidGraphEdge(type, sourceNode, targetNode)) return null;
   const resultId = normalizeStoredResultId(record.resultId);
   const bend = normalizePoint(record.bend);
   const waypoints = normalizePoints(record.waypoints);
@@ -558,8 +575,66 @@ function normalizeGraphEdge(value, nodeIds) {
   };
 }
 
+function withRequiredAnyNode(nodes) {
+  return withRequiredSingletonNode(nodes, "any", "any-global", 176);
+}
+
+function withRequiredSingletonNode(nodes, type, baseId, y) {
+  let keptNode = false;
+  const withoutDuplicateNodes = nodes.filter((node) => {
+    if (node.type !== type) return true;
+    if (keptNode) return false;
+    keptNode = true;
+    return true;
+  });
+  if (keptNode) return withoutDuplicateNodes;
+  const nodeIds = new Set(withoutDuplicateNodes.map((node) => node.id));
+  return [
+    ...withoutDuplicateNodes,
+    {
+      id: uniqueGraphNodeId(baseId, nodeIds),
+      type,
+      x: 72,
+      y,
+    },
+  ];
+}
+
+function uniqueGraphNodeId(baseId, nodeIds) {
+  let id = baseId;
+  let suffix = 2;
+  while (nodeIds.has(id)) {
+    id = `${baseId}-${suffix}`;
+    suffix += 1;
+  }
+  return id;
+}
+
+function isValidGraphEdge(type, sourceNode, targetNode) {
+  if (type === "runs") {
+    return sourceNode.type === "play" && (targetNode.type === "agent" || targetNode.type === "graph");
+  }
+  if (type === "evaluates") {
+    return (sourceNode.type === "agent" || sourceNode.type === "graph" || sourceNode.type === "any") && targetNode.type === "expression";
+  }
+  if (type === "routes") {
+    return sourceNode.type === "expression" && (targetNode.type === "agent" || targetNode.type === "graph" || targetNode.type === "play");
+  }
+  return false;
+}
+
 function normalizePoints(value) {
   return Array.isArray(value) ? value.map(normalizePoint).filter(Boolean) : [];
+}
+
+function normalizePointMap(value) {
+  const record = asRecord(value);
+  return Object.fromEntries(
+    Object.entries(record).flatMap(([key, point]) => {
+      const normalized = normalizePoint(point);
+      return normalized ? [[key, normalized]] : [];
+    }),
+  );
 }
 
 function normalizePoint(value) {
@@ -610,15 +685,14 @@ function normalizeGraphSession(value) {
 
 function normalizePendingReview(value, graphSessionId) {
   const record = asRecord(value);
-  const reviewNodeId = stringValue(record.reviewNodeId);
   const agentNodeId = stringValue(record.agentNodeId);
   const previousAgentSessionId = stringValue(record.previousAgentSessionId);
-  if (!reviewNodeId || !agentNodeId || !previousAgentSessionId) return null;
+  if (!agentNodeId || !previousAgentSessionId) return null;
   return {
     id: stringValue(record.id) || cryptoId("pending-review"),
     graphSessionId,
     graphId: nullableString(record.graphId),
-    reviewNodeId,
+    reviewNodeId: "approval-global",
     agentNodeId,
     previousAgentSessionId,
     incomingExpressionNodeId: nullableString(record.incomingExpressionNodeId),
@@ -775,6 +849,7 @@ function routeResultForStatus(state, emittedResultId, resultIds) {
   if (state === "failed") return { routedResultId: "failed", routeReason: "failed" };
   if (state !== "completed") return { routedResultId: null, routeReason: null };
   if (!emittedResultId) return { routedResultId: "completed", routeReason: "default_completed" };
+  if (emittedResultId === approvalResultId) return { routedResultId: approvalResultId, routeReason: "matched_global_result" };
   if (legacyResultIds.has(emittedResultId) || nonCompletionResultIds.has(emittedResultId)) return { routedResultId: "default", routeReason: "invalid_completion_result" };
   if (!resultIds.has(emittedResultId)) return { routedResultId: "default", routeReason: "unrecognized_result" };
   return { routedResultId: emittedResultId, routeReason: "matched_result" };

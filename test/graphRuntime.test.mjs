@@ -147,8 +147,11 @@ test("agent prompt is structured markdown with history output and user context l
   assert.match(prompt, /^# Agent Session\n/);
   assert.match(prompt, /## Repository\nRepo: owner\/repo @ feature\/session-prompts/);
   assert.match(prompt, /## Updates And Session Result\n[\s\S]*\$RADDUS_GRAPH_STATUS_FILE/);
-  assert.match(prompt, /Review pauses put the exact user question in `detail`/);
+  assert.match(prompt, /"resultId":"approved"/);
+  assert.doesNotMatch(prompt, /"resultId":"ask-for-approval"/);
+  assert.match(prompt, /`ask-for-approval` pauses the graph and puts the exact user question in `detail`/);
   assert.match(prompt, /Success routes: `approved` \(Approved result\)/);
+  assert.match(prompt, /`ask-for-approval` \(Pause the graph and ask the user for approval\.\)/);
   assert.equal(prompt.includes("`ignored`"), false);
   assert.match(prompt, /## History\n### 1\. Agent A\nResult: completed \/ approved - Tiny terminal summary/);
   assert.match(prompt, /Detailed terminal handoff\./);
@@ -173,9 +176,10 @@ test("agent prompt result IDs are limited to reachable expression routes", () =>
       { id: "expr-ready", type: "expression", resultId: "ready" },
       { id: "expr-blocked", type: "expression", resultId: "blocked" },
       { id: "expr-completed", type: "expression", resultId: "completed" },
-      { id: "expr-approval", type: "expression", resultId: "ask-for-approval" },
       { id: "expr-failed", type: "expression", resultId: "failed" },
       { id: "expr-default", type: "expression", resultId: "default" },
+      { id: "expr-loop", type: "expression", resultId: "loop" },
+      { id: "play-loop", type: "play" },
       { id: "expr-incomplete", type: "expression", resultId: "incomplete" },
       { id: "expr-disconnected", type: "expression", resultId: "manual" },
     ],
@@ -186,12 +190,12 @@ test("agent prompt result IDs are limited to reachable expression routes", () =>
       { id: "edge-blocked-b", source: "expr-blocked", target: "agent-b", type: "routes", resultId: "blocked" },
       { id: "edge-a-completed", source: "agent-a", target: "expr-completed", type: "evaluates" },
       { id: "edge-completed-b", source: "expr-completed", target: "agent-b", type: "routes", resultId: "completed" },
-      { id: "edge-a-approval", source: "agent-a", target: "expr-approval", type: "evaluates" },
-      { id: "edge-approval-review", source: "expr-approval", target: "agent-b", type: "routes", resultId: "ask-for-approval" },
       { id: "edge-a-failed", source: "agent-a", target: "expr-failed", type: "evaluates" },
       { id: "edge-failed-b", source: "expr-failed", target: "agent-b", type: "routes", resultId: "failed" },
       { id: "edge-a-default", source: "agent-a", target: "expr-default", type: "evaluates" },
       { id: "edge-default-b", source: "expr-default", target: "agent-b", type: "routes", resultId: "default" },
+      { id: "edge-a-loop", source: "agent-a", target: "expr-loop", type: "evaluates" },
+      { id: "edge-loop-play", source: "expr-loop", target: "play-loop", type: "routes", resultId: "loop" },
       { id: "edge-a-incomplete", source: "agent-a", target: "expr-incomplete", type: "evaluates" },
       { id: "edge-disconnected-b", source: "expr-disconnected", target: "agent-b", type: "routes", resultId: "manual" },
     ],
@@ -202,23 +206,69 @@ test("agent prompt result IDs are limited to reachable expression routes", () =>
     results: [
       { id: "ready", description: "Ready route" },
       { id: "blocked", description: "Blocked route" },
+      { id: "loop", description: "Loop route" },
       { id: "incomplete", description: "Incomplete route" },
       { id: "manual", description: "Disconnected route" },
       { id: "completed", description: "Built-in completed route", reserved: true },
       { id: "failed", description: "Built-in failed route", reserved: true },
-      { id: "ask-for-approval", description: "Built-in approval route", reserved: true },
       { id: "default", description: "Built-in default route", reserved: true },
     ],
     node: { id: "agent-a", type: "agent", agentId: "agent-a" },
   }), [
     { id: "ready", description: "Ready route" },
     { id: "blocked", description: "Blocked route" },
+    { id: "loop", description: "Loop route" },
     { id: "completed", description: "Built-in completed route" },
-    { id: "ask-for-approval", description: "Built-in approval route" },
+    { id: "ask-for-approval", description: "Pause the graph and ask the user for approval." },
   ]);
 });
 
-test("review routes pause at a review node and review answers become the next user context", () => {
+test("any card expressions apply to every agent while direct expressions take precedence", () => {
+  const graph = {
+    nodes: [
+      { id: "any-global", type: "any" },
+      { id: "agent-a", type: "agent", agentId: "agent-a" },
+      { id: "agent-b", type: "agent", agentId: "agent-b" },
+      { id: "agent-c", type: "agent", agentId: "agent-c" },
+      { id: "agent-d", type: "agent", agentId: "agent-d" },
+      { id: "expr-any-ready", type: "expression", resultId: "ready" },
+      { id: "expr-direct-ready", type: "expression", resultId: "ready" },
+    ],
+    edges: [
+      { id: "edge-any-ready", source: "any-global", target: "expr-any-ready", type: "evaluates" },
+      { id: "edge-any-ready-agent-d", source: "expr-any-ready", target: "agent-d", type: "routes", resultId: "ready" },
+      { id: "edge-agent-a-ready", source: "agent-a", target: "expr-direct-ready", type: "evaluates" },
+      { id: "edge-direct-ready-agent-c", source: "expr-direct-ready", target: "agent-c", type: "routes", resultId: "ready" },
+    ],
+  };
+
+  assert.deepEqual(availableResultsForAgent({
+    graph,
+    results: [{ id: "ready", description: "Ready route" }],
+    node: { id: "agent-b", type: "agent", agentId: "agent-b" },
+  }), [
+    { id: "ready", description: "Ready route" },
+    { id: "ask-for-approval", description: "Pause the graph and ask the user for approval." },
+  ]);
+
+  const anyRoute = nextGraphRouteFromOutcome({
+    graph,
+    currentAgentNode: { id: "agent-b", type: "agent", agentId: "agent-b" },
+    outcome: { state: "completed", routedResultId: "ready" },
+  });
+  assert.equal(anyRoute?.node.id, "agent-d");
+  assert.deepEqual(anyRoute?.edgeIds, ["edge-any-ready", "edge-any-ready-agent-d"]);
+
+  const directRoute = nextGraphRouteFromOutcome({
+    graph,
+    currentAgentNode: { id: "agent-a", type: "agent", agentId: "agent-a" },
+    outcome: { state: "completed", routedResultId: "ready" },
+  });
+  assert.equal(directRoute?.node.id, "agent-c");
+  assert.deepEqual(directRoute?.edgeIds, ["edge-agent-a-ready", "edge-direct-ready-agent-c"]);
+});
+
+test("approval pauses are global and review answers become the next user context", () => {
   const route = nextGraphRouteFromOutcome({
     graph: {
       nodes: [
@@ -238,9 +288,27 @@ test("review routes pause at a review node and review answers become the next us
     },
   });
 
-  assert.equal(route?.node.type, "review");
-  assert.equal(route?.node.id, "review-a");
-  assert.deepEqual(route?.edgeIds, ["edge-agent-expr", "edge-expr-review"]);
+  assert.equal(route, null);
+
+  const globalApprovalRoute = nextGraphRouteFromOutcome({
+    graph: {
+      nodes: [
+        { id: "agent-a", type: "agent", agentId: "agent-a" },
+      ],
+      edges: [],
+    },
+    currentAgentNode: { id: "agent-a", type: "agent", agentId: "agent-a" },
+    outcome: {
+      state: "completed",
+      routedResultId: "ask-for-approval",
+    },
+  });
+
+  assert.equal(globalApprovalRoute?.node, null);
+  assert.equal(globalApprovalRoute?.reviewPause, true);
+  assert.equal(globalApprovalRoute?.expressionNodeId, null);
+  assert.deepEqual(globalApprovalRoute?.edgeIds, []);
+  assert.equal(globalApprovalRoute?.resultId, "ask-for-approval");
 
   const question = reviewQuestionFromAgentSession({
     response: "Raw response",
@@ -324,19 +392,77 @@ test("completed graph sessions continue from the next routed agent", () => {
   assert.equal(target.reviewPause, null);
 });
 
-test("completed graph sessions continue through graph cards with parent result as the next prompt", () => {
+test("completed graph sessions can route expressions to play cards as new-session loops", () => {
+  const graph = {
+    nodes: [
+      { id: "play-a", type: "play" },
+      { id: "agent-a", type: "agent", agentId: "agent-a" },
+      { id: "expr-loop", type: "expression", resultId: "loop" },
+    ],
+    edges: [
+      { id: "edge-play-agent", source: "play-a", target: "agent-a", type: "runs" },
+      { id: "edge-agent-expr", source: "agent-a", target: "expr-loop", type: "evaluates" },
+      { id: "edge-expr-play", source: "expr-loop", target: "play-a", type: "routes", resultId: "loop" },
+    ],
+  };
+
+  const route = nextGraphRouteFromOutcome({
+    graph,
+    currentAgentNode: { id: "agent-a", type: "agent", agentId: "agent-a" },
+    outcome: {
+      state: "completed",
+      routedResultId: "loop",
+    },
+  });
+
+  assert.equal(route?.node.type, "play");
+  assert.equal(route?.node.id, "play-a");
+  assert.deepEqual(route?.edgeIds, ["edge-agent-expr", "edge-expr-play"]);
+
+  const target = continuationTargetForSession({
+    session: {
+      id: "graph-session-loop",
+      playNodeId: "play-a",
+      prompt: "Original graph prompt.",
+      agentSessions: [
+        {
+          id: "agent-session-a",
+          sequence: 1,
+          nodeId: "agent-a",
+          status: "completed",
+          terminalOutcome: {
+            state: "completed",
+            routedResultId: "loop",
+          },
+        },
+      ],
+    },
+    graph,
+  });
+
+  assert.equal(target.currentAgentNode, null);
+  assert.equal(target.startPlayNode.id, "play-a");
+  assert.deepEqual(target.visitedAgentSessionIds, ["agent-session-a"]);
+  assert.deepEqual(target.currentArrival, {
+    previousAgentSessionId: "agent-session-a",
+    incomingExpressionNodeId: "expr-loop",
+    incomingEdgeIds: ["edge-agent-expr", "edge-expr-play"],
+    incomingResultId: "loop",
+  });
+  assert.equal(target.reviewPause, null);
+});
+
+test("expression routes can target graph cards", () => {
   const graph = {
     nodes: [
       { id: "play-a", type: "play" },
       { id: "agent-a", type: "agent", agentId: "agent-a" },
       { id: "expr-child", type: "expression", resultId: "child" },
       { id: "graph-child", type: "graph" },
-      { id: "agent-b", type: "agent", agentId: "agent-b" },
     ],
     edges: [
       { id: "edge-agent-expr", source: "agent-a", target: "expr-child", type: "evaluates" },
       { id: "edge-expr-graph", source: "expr-child", target: "graph-child", type: "routes", resultId: "child" },
-      { id: "edge-graph-agent", source: "graph-child", target: "agent-b", type: "runs" },
     ],
   };
 
@@ -344,7 +470,10 @@ test("completed graph sessions continue through graph cards with parent result a
     graph,
     results: [{ id: "child", description: "Start the child graph." }],
     node: { id: "agent-a", type: "agent", agentId: "agent-a" },
-  }), [{ id: "child", description: "Start the child graph." }]);
+  }), [
+    { id: "child", description: "Start the child graph." },
+    { id: "ask-for-approval", description: "Pause the graph and ask the user for approval." },
+  ]);
 
   const route = nextGraphRouteFromOutcome({
     graph,
@@ -357,40 +486,6 @@ test("completed graph sessions continue through graph cards with parent result a
 
   assert.equal(route?.node.type, "graph");
   assert.equal(route?.node.id, "graph-child");
-
-  const target = continuationTargetForSession({
-    session: {
-      id: "graph-session-continue",
-      playNodeId: "play-a",
-      prompt: "Original graph prompt.",
-      agentSessions: [
-        {
-          id: "agent-session-a",
-          sequence: 1,
-          nodeId: "agent-a",
-          status: "completed",
-          terminalOutcome: {
-            state: "completed",
-            routedResultId: "child",
-            summary: "Parent graph finished.",
-            detail: "Use this parent result as the child graph prompt.",
-          },
-        },
-      ],
-    },
-    graph,
-  });
-
-  assert.equal(target.currentAgentNode.id, "agent-b");
-  assert.equal(target.userPrompt, "Use this parent result as the child graph prompt.");
-  assert.deepEqual(target.visitedAgentSessionIds, ["agent-session-a"]);
-  assert.deepEqual(target.currentArrival, {
-    previousAgentSessionId: "agent-session-a",
-    incomingExpressionNodeId: "expr-child",
-    incomingEdgeIds: ["edge-agent-expr", "edge-expr-graph", "edge-graph-agent"],
-    incomingResultId: "child",
-  });
-  assert.equal(target.reviewPause, null);
 });
 
 test("graph cards can start a selected project graph in the same graph session", () => {
@@ -477,16 +572,22 @@ test("graph cards can start a selected project graph in the same graph session",
   assert.equal(target.reviewPause, null);
 });
 
-test("completed child graphs continue to connected graph cards with the child result as the next prompt", () => {
+test("completed child graphs return the last agent result through parent graph-card expressions", () => {
   const parentGraph = {
     nodes: [
       { id: "play-parent", type: "play" },
+      { id: "agent-parent", type: "agent", agentId: "agent-parent" },
+      { id: "expr-start-a", type: "expression", resultId: "start-a" },
       { id: "graph-a", type: "graph", graphId: "project-a" },
+      { id: "expr-completed", type: "expression", resultId: "completed" },
       { id: "graph-b", type: "graph", graphId: "project-b" },
     ],
     edges: [
-      { id: "edge-play-graph-a", source: "play-parent", target: "graph-a", type: "runs" },
-      { id: "edge-graph-a-graph-b", source: "graph-a", target: "graph-b", type: "runs" },
+      { id: "edge-play-agent-parent", source: "play-parent", target: "agent-parent", type: "runs" },
+      { id: "edge-parent-expr-a", source: "agent-parent", target: "expr-start-a", type: "evaluates" },
+      { id: "edge-expr-graph-a", source: "expr-start-a", target: "graph-a", type: "routes", resultId: "start-a" },
+      { id: "edge-graph-a-expr", source: "graph-a", target: "expr-completed", type: "evaluates" },
+      { id: "edge-expr-graph-b", source: "expr-completed", target: "graph-b", type: "routes", resultId: "completed" },
     ],
   };
   const graphA = {
@@ -522,10 +623,10 @@ test("completed child graphs continue to connected graph cards with the child re
           sequence: 1,
           nodeId: "agent-a",
           status: "completed",
-          previousAgentSessionId: null,
+          previousAgentSessionId: "agent-session-parent",
           incomingExpressionNodeId: null,
-          incomingEdgeIds: ["edge-play-graph-a", "edge-a-start"],
-          incomingResultId: null,
+          incomingEdgeIds: ["edge-parent-expr-a", "edge-expr-graph-a", "edge-a-start"],
+          incomingResultId: "start-a",
           terminalOutcome: {
             state: "completed",
             routedResultId: "completed",
@@ -574,43 +675,76 @@ test("completed child graphs continue to connected graph cards with the child re
   assert.deepEqual(target.visitedAgentSessionIds, ["agent-session-a"]);
   assert.deepEqual(target.currentArrival, {
     previousAgentSessionId: "agent-session-a",
-    incomingExpressionNodeId: null,
-    incomingEdgeIds: ["edge-graph-a-graph-b", "edge-b-start"],
-    incomingResultId: null,
+    incomingExpressionNodeId: "expr-completed",
+    incomingEdgeIds: ["edge-graph-a-expr", "edge-expr-graph-b", "edge-b-start"],
+    incomingResultId: "completed",
   });
   assert.equal(target.reviewPause, null);
 });
 
-test("play nodes can start graph cards in the same graph session", () => {
+test("play nodes can start graph cards directly", () => {
+  const parentGraph = {
+    nodes: [
+      { id: "play-parent", type: "play" },
+      { id: "graph-child", type: "graph", graphId: "project-child" },
+    ],
+    edges: [
+      { id: "edge-play-graph", source: "play-parent", target: "graph-child", type: "runs" },
+    ],
+  };
+  const childGraph = {
+    nodes: [
+      { id: "play-child", type: "play" },
+      { id: "agent-child", type: "agent", agentId: "agent-child" },
+    ],
+    edges: [
+      { id: "edge-child-start", source: "play-child", target: "agent-child", type: "runs" },
+    ],
+  };
+
   const target = continuationTargetForSession({
     session: {
       id: "graph-session-start-graph",
-      playNodeId: "play-a",
+      projectId: "project-parent",
+      projectName: "Parent Graph",
+      playNodeId: "play-parent",
       prompt: "Run the graph card.",
       agentSessions: [],
     },
-    graph: {
-      nodes: [
-        { id: "play-a", type: "play" },
-        { id: "graph-a", type: "graph" },
-        { id: "agent-a", type: "agent", agentId: "agent-a" },
-      ],
-      edges: [
-        { id: "edge-play-graph", source: "play-a", target: "graph-a", type: "runs" },
-        { id: "edge-graph-agent", source: "graph-a", target: "agent-a", type: "runs" },
-      ],
-    },
+    graph: parentGraph,
+    projectId: "project-parent",
+    projectName: "Parent Graph",
+    projects: [
+      {
+        id: "project-parent",
+        name: "Parent Graph",
+        graph: parentGraph,
+        agents: [],
+        results: [],
+        lastPlaySelection: null,
+      },
+      {
+        id: "project-child",
+        name: "Child Graph",
+        graph: childGraph,
+        agents: [{ id: "agent-child", name: "Child Agent", model: "gpt-5", systemPrompt: "" }],
+        results: [],
+        lastPlaySelection: null,
+      },
+    ],
   });
 
-  assert.equal(target.currentAgentNode.id, "agent-a");
+  assert.equal(target.currentDefinition.graphId, "project-child");
+  assert.equal(target.currentAgentNode.id, "agent-child");
   assert.equal(target.userPrompt, "Run the graph card.");
   assert.deepEqual(target.currentArrival, {
     previousAgentSessionId: null,
     incomingExpressionNodeId: null,
-    incomingEdgeIds: ["edge-play-graph", "edge-graph-agent"],
+    incomingEdgeIds: ["edge-play-graph", "edge-child-start"],
     incomingResultId: null,
   });
   assert.deepEqual(target.visitedAgentSessionIds, []);
+  assert.equal(target.currentReturnContinuation.graphNode.id, "graph-child");
   assert.equal(target.reviewPause, null);
 });
 
@@ -695,7 +829,7 @@ test("completed graph sessions without a next route explain that they cannot con
       ],
       edges: [],
     },
-  }), /No next agent, graph, or review card is connected/);
+  }), /No next agent, graph card, or play card is connected/);
 });
 
 test("agent prompt history uses bounded recent handoffs", () => {

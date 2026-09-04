@@ -334,7 +334,7 @@ function projectNodeCenter(node: GraphNode): Point {
 
 export function projectNodeSizeForType(type: GraphNodeType): { width: number; height: number } {
   if (type === "expression") return { width: 140, height: 44 };
-  if (type === "play" || type === "review") return { width: 56, height: 56 };
+  if (type === "play" || type === "any") return { width: 56, height: 56 };
   if (type === "agent" || type === "graph") return { width: 168, height: 72 };
   return { width: 168, height: 72 };
 }

@@ -3,36 +3,22 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { projectNodeSizeForType } from "../src/edgeRouting.ts";
 
-test("review cards are available in the canvas UI and styled like start cards", async () => {
+test("approval review is global UI, not a canvas card or route target", async () => {
   const [app, css, api] = await Promise.all([
     readFile(new URL("../src/App.tsx", import.meta.url), "utf8"),
     readFile(new URL("../src/styles.css", import.meta.url), "utf8"),
     readFile(new URL("../src/api/RaddusGraphApi.ts", import.meta.url), "utf8"),
   ]);
-  const playBlock = css.match(/\.project-node\.play\s*\{(?<body>[\s\S]*?)\n\}/)?.groups?.body ?? "";
-  const reviewBlock = css.match(/\.project-node\.review\s*\{(?<body>[\s\S]*?)\n\}/)?.groups?.body ?? "";
 
-  assert.ok(api.includes('"play" | "agent" | "expression" | "review"'), "Graph node types should include review.");
-  assert.ok(api.includes('"running" | "waiting_review" | "completed"'), "Graph session status should include waiting_review.");
-  assert.deepEqual(projectNodeSizeForType("review"), projectNodeSizeForType("play"));
-  assert.deepEqual(projectNodeSizeForType("review"), { width: 56, height: 56 });
+  assert.ok(api.includes('"play" | "agent" | "expression" | "graph" | "any"'), "Graph node types should not include review.");
   assert.deepEqual(projectNodeSizeForType("play"), { width: 56, height: 56 });
-  assert.ok(app.includes('type PaletteTab = "agents" | "expressions" | "other"'), "The palette should include an Other tab.");
-  assert.ok(app.includes("<span>Other</span>"), "The Other tab should be visible in the palette.");
-  assert.ok(app.includes('activeTab === "other"'), "The Review palette item should live behind the Other tab.");
-  assert.ok(app.includes("function PaletteReviewButton"), "The palette should expose a review card.");
-  assert.ok(app.includes("function ReviewDialog"), "Clicking a pending review should open a response dialog.");
-  assert.ok(app.includes("submitReviewResponse"), "Review answers should call the resume API.");
-  assert.ok(app.includes("activeReviewNodeIds"), "Pending reviews should highlight their canvas card.");
-  assert.equal(app.includes("<strong>Start</strong>"), false, "Start canvas cards should be icon-only.");
-  assert.ok(app.includes("<MessageSquareText size={20}"), "Review canvas cards should use an icon-only layout.");
-  assert.equal(app.includes("project-edge-label"), false, "Route result IDs should not render above connection lines.");
-  assert.equal(css.includes("project-edge-label"), false, "Hidden route labels should not leave unused CSS behind.");
-  assert.ok(playBlock, "play card CSS block should exist");
-  assert.ok(reviewBlock, "review card CSS block should exist");
-  for (const block of [playBlock, reviewBlock]) {
-    assert.match(block, /width:\s*56px/);
-    assert.match(block, /height:\s*56px/);
-    assert.match(block, /min-height:\s*56px/);
-  }
+  assert.equal(app.includes('type: "review"'), false, "New projects should not include a review card.");
+  assert.equal(app.includes('node.type === "review"'), false, "Canvas cards should not render or open review nodes.");
+  assert.equal(app.includes('target.type === "review"'), false, "The UI should not create routes to review nodes.");
+  assert.equal(css.includes(".project-node.review"), false, "Review card styling should not remain on the canvas.");
+  assert.ok(app.includes("pendingApprovalSessions"), "The app should scan all sessions for pending approvals.");
+  assert.ok(app.includes("pending-approval-overlay"), "Pending approvals should render at the top center.");
+  assert.ok(app.includes('type: "approval-review"'), "Pending approvals should open a session-based review dialog.");
+  assert.ok(app.includes("api.submitReviewResponse(sessionId, { answer })"), "Review answers should submit without a review node id.");
+  assert.ok(css.includes(".pending-approval-button"), "Pending approvals should have a visible icon-only button style.");
 });
