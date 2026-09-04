@@ -231,6 +231,48 @@ a:focus-visible {
   gap: 8px;
 }
 
+.pending-approval-overlay {
+  position: absolute;
+  top: 16px;
+  left: 50%;
+  z-index: 12;
+  width: max-content;
+  transform: translateX(-50%);
+}
+
+.pending-approval-button {
+  position: relative;
+  border-color: color-mix(in srgb, var(--danger-fg) 48%, var(--border-subtle));
+  background: color-mix(in srgb, var(--danger-soft) 52%, var(--surface-bg));
+  color: var(--danger-fg);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--danger-fg) 10%, transparent), var(--popover-shadow);
+}
+
+.pending-approval-button:hover:not(:disabled),
+.pending-approval-button:focus-visible:not(:disabled) {
+  border-color: var(--danger-fg);
+  background: color-mix(in srgb, var(--danger-soft) 66%, var(--surface-bg));
+  color: var(--danger-fg);
+}
+
+.pending-approval-count {
+  position: absolute;
+  top: -7px;
+  right: -7px;
+  min-width: 18px;
+  height: 18px;
+  display: inline-grid;
+  place-items: center;
+  padding: 0 5px;
+  border: 2px solid var(--surface-bg);
+  border-radius: 999px;
+  background: var(--danger-fg);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 900;
+  line-height: 1;
+}
+
 .project-session-actions-group {
   width: max-content;
 }
@@ -510,6 +552,12 @@ a:focus-visible {
   --edge-color: var(--edge-blue);
 }
 
+.project-edge-group.parent-reference {
+  --edge-color: #f97316;
+  opacity: 0.52;
+  pointer-events: none;
+}
+
 .project-edge-group.execution-visited-route {
   --edge-color: var(--edge-blue);
   opacity: 0.8;
@@ -562,6 +610,23 @@ a:focus-visible {
 
 .project-edge-preview.palette-edge-preview {
   stroke: var(--edge-blue, #5f9dea);
+}
+
+.project-parent-reference-edge {
+  fill: none;
+  stroke: var(--edge-color);
+  stroke-width: 2;
+  stroke-dasharray: 4 8;
+  stroke-dashoffset: 0;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  pointer-events: none;
+}
+
+.project-parent-reference-edge-arrow {
+  fill: var(--edge-color);
+  opacity: 0.82;
+  pointer-events: none;
 }
 
 .project-edge-hit {
@@ -820,26 +885,17 @@ a:focus-visible {
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--node-accent) 14%, transparent), var(--popover-shadow);
 }
 
-.project-node.review {
-  --node-accent: #b45309;
+.project-node.any {
+  --node-accent: #dc2626;
   width: 56px;
   height: 56px;
   min-height: 56px;
   align-content: center;
   gap: 0;
-  overflow: visible;
+  overflow: hidden;
   padding: 0;
   border-color: color-mix(in srgb, var(--node-accent) 70%, var(--border-subtle));
   background: var(--surface-bg);
-}
-
-.project-node.review .project-card-remove {
-  top: -6px;
-  right: -6px;
-}
-
-.project-node.palette-node-preview.review {
-  overflow: hidden;
 }
 
 .project-node.agent {
@@ -862,6 +918,30 @@ a:focus-visible {
   align-content: center;
   gap: 0;
   padding: 10px;
+}
+
+.project-node.parent-graph-reference {
+  z-index: 0;
+  border-style: dashed;
+  background: color-mix(in srgb, var(--surface-bg) 72%, transparent);
+  box-shadow: 0 8px 22px color-mix(in srgb, var(--node-accent) 12%, transparent);
+  opacity: 0.56;
+  cursor: grab;
+}
+
+.project-node.parent-graph-reference:hover:not(.dragging),
+.project-node.parent-graph-reference:focus-visible {
+  opacity: 0.72;
+  box-shadow: 0 10px 28px color-mix(in srgb, var(--node-accent) 18%, transparent);
+  transform: none;
+}
+
+.project-node.parent-graph-reference.dragging {
+  z-index: 3;
+  opacity: 0.72;
+  cursor: grabbing;
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--node-accent) 28%, transparent), var(--modal-shadow);
+  transform: scale(1.018);
 }
 
 .project-node.expression {
@@ -1363,6 +1443,10 @@ textarea:focus {
   margin-right: auto;
 }
 
+.dialog-actions .project-generate-button {
+  margin-right: auto;
+}
+
 .settings-panel {
   min-height: 420px;
   display: grid;
@@ -1650,6 +1734,50 @@ textarea:focus {
   font-size: 14px;
   line-height: 1.45;
   white-space: pre-wrap;
+}
+
+.review-changes-list {
+  display: grid;
+  gap: 10px;
+}
+
+.review-change-item {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+  padding: 10px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--surface-bg) 82%, var(--panel-bg));
+}
+
+.review-change-item > span {
+  width: 24px;
+  height: 24px;
+  display: inline-grid;
+  place-items: center;
+  border-radius: 999px;
+  background: var(--brand-soft);
+  color: var(--brand-hover);
+  font-size: 12px;
+  font-weight: 850;
+}
+
+.review-change-item strong {
+  display: block;
+  min-width: 0;
+  color: var(--primary-text);
+  font-size: 13px;
+}
+
+.review-change-item p {
+  margin: 4px 0 0;
+  min-width: 0;
+  color: var(--secondary-text);
+  font-size: 12px;
+  line-height: 1.45;
 }
 
 .play-sessions-panel {

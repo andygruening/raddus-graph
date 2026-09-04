@@ -22,7 +22,7 @@ test("saving state applies the top-level graph to the selected project", async (
     const staleGraph = {
       nodes: [
         { id: "source", type: "agent", x: 0, y: 0, agentId: null },
-        { id: "target", type: "agent", x: 300, y: 160, agentId: null },
+        { id: "target", type: "expression", x: 300, y: 160, resultId: "completed" },
       ],
       edges: [
         { id: "edge-1", source: "source", target: "target", type: "evaluates" },
@@ -154,9 +154,74 @@ test("reserved result definitions include built-in terminal routes", async () =>
 
     const saved = await store.readGraphData();
 
-    assert.deepEqual(resultIds(saved.results), ["completed", "failed", "ask-for-approval", "default"]);
-    assert.deepEqual(saved.results.map((result) => result.reserved), [true, true, true, true]);
-    assert.deepEqual(resultIds(saved.projects[0].results), ["completed", "failed", "ask-for-approval", "default"]);
+    assert.deepEqual(resultIds(saved.results), ["completed", "failed", "default"]);
+    assert.deepEqual(saved.results.map((result) => result.reserved), [true, true, true]);
+    assert.deepEqual(resultIds(saved.projects[0].results), ["completed", "failed", "default"]);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+    delete process.env.RADDUS_GRAPH_DIR;
+  }
+});
+
+test("graph store keeps the required any card and removes review and approval expression cards", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "raddus-graph-store-"));
+  process.env.RADDUS_GRAPH_DIR = dataDir;
+  try {
+    const store = await import(`../server/graphStore.mjs?graph-store-test=${Date.now()}-any-card`);
+    await store.initializeGraphStore();
+
+    const saved = await store.replaceGraphState({
+      selectedProjectId: "project-any",
+      projects: [{
+        id: "project-any",
+        name: "Any Project",
+        graph: {
+          nodes: [
+            { id: "play-start", type: "play", x: 72, y: 96, prompt: "Start", repository: null, branch: null },
+            { id: "review-custom", type: "review", x: 72, y: 256 },
+            { id: "review-duplicate", type: "review", x: 72, y: 336 },
+            { id: "any-global", type: "any", x: 72, y: 176 },
+            { id: "any-duplicate", type: "any", x: 72, y: 416 },
+            { id: "agent-a", type: "agent", x: 340, y: 96, agentId: null },
+            { id: "expr-ready", type: "expression", x: 600, y: 96, resultId: "completed" },
+            { id: "expr-approval", type: "expression", x: 600, y: 176, resultId: "ask-for-approval" },
+          ],
+          edges: [
+            { id: "edge-any-ready", source: "any-global", target: "expr-ready", type: "evaluates" },
+            { id: "edge-agent-any", source: "agent-a", target: "any-global", type: "evaluates" },
+            { id: "edge-agent-approval", source: "agent-a", target: "expr-approval", type: "evaluates" },
+            { id: "edge-ready-review", source: "expr-ready", target: "review-custom", type: "routes", resultId: "completed" },
+          ],
+        },
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      }],
+      graph: {
+          nodes: [
+            { id: "play-start", type: "play", x: 72, y: 96, prompt: "Start", repository: null, branch: null },
+            { id: "review-custom", type: "review", x: 72, y: 256 },
+            { id: "review-duplicate", type: "review", x: 72, y: 336 },
+            { id: "any-global", type: "any", x: 72, y: 176 },
+            { id: "any-duplicate", type: "any", x: 72, y: 416 },
+            { id: "agent-a", type: "agent", x: 340, y: 96, agentId: null },
+            { id: "expr-ready", type: "expression", x: 600, y: 96, resultId: "completed" },
+            { id: "expr-approval", type: "expression", x: 600, y: 176, resultId: "ask-for-approval" },
+          ],
+          edges: [
+            { id: "edge-any-ready", source: "any-global", target: "expr-ready", type: "evaluates" },
+            { id: "edge-agent-any", source: "agent-a", target: "any-global", type: "evaluates" },
+            { id: "edge-agent-approval", source: "agent-a", target: "expr-approval", type: "evaluates" },
+            { id: "edge-ready-review", source: "expr-ready", target: "review-custom", type: "routes", resultId: "completed" },
+          ],
+        },
+      agents: [],
+      results: [],
+    });
+
+    assert.deepEqual(saved.graph.nodes.filter((node) => node.type === "any").map((node) => node.id), ["any-global"]);
+    assert.deepEqual(saved.graph.nodes.filter((node) => node.type === "review").map((node) => node.id), []);
+    assert.equal(saved.graph.nodes.some((node) => node.type === "expression" && node.resultId === "ask-for-approval"), false);
+    assert.deepEqual(saved.graph.edges.map((edge) => edge.id), ["edge-any-ready"]);
   } finally {
     await rm(dataDir, { recursive: true, force: true });
     delete process.env.RADDUS_GRAPH_DIR;
@@ -204,7 +269,7 @@ test("terminal statuses route through built-in reserved results", async () => {
       summary: "Needs approval.",
     }, "test");
     assert.equal(approval.status.routedResultId, "ask-for-approval");
-    assert.equal(approval.status.routeReason, "matched_result");
+    assert.equal(approval.status.routeReason, "matched_global_result");
 
     const failedSession = await store.createAgentSession("graph-session-results", { nodeId: "agent-failed" });
     const failed = await store.recordAgentSessionStatus("graph-session-results", failedSession.agentSession.id, {
@@ -448,7 +513,7 @@ test("legacy global agents and custom expressions are migrated into projects", a
   }
 });
 
-test("graph store preserves review cards and pending review state", async () => {
+test("graph store removes legacy review cards and preserves pending review state", async () => {
   const dataDir = await mkdtemp(join(tmpdir(), "raddus-graph-store-"));
   process.env.RADDUS_GRAPH_DIR = dataDir;
   try {
@@ -512,14 +577,14 @@ test("graph store preserves review cards and pending review state", async () => 
     });
 
     const saved = await store.readGraphData();
-    assert.equal(saved.graph.nodes.find((node) => node.id === "review-a")?.type, "review");
-    assert.equal(saved.graph.edges.find((edge) => edge.id === "edge-expr-review")?.target, "review-a");
+    assert.equal(saved.graph.nodes.some((node) => node.type === "review"), false);
+    assert.equal(saved.graph.edges.some((edge) => edge.target === "review-a"), false);
     assert.equal(saved.sessions[0].status, "waiting_review");
     assert.deepEqual(saved.sessions[0].pendingReview, {
       id: "pending-review-a",
       graphSessionId: "graph-session-review",
       graphId: null,
-      reviewNodeId: "review-a",
+      reviewNodeId: "approval-global",
       agentNodeId: "agent-a",
       previousAgentSessionId: "agent-session-a",
       incomingExpressionNodeId: "expr-review",
@@ -535,7 +600,7 @@ test("graph store preserves review cards and pending review state", async () => 
   }
 });
 
-test("graph store preserves graph cards and their start routes", async () => {
+test("graph store preserves expression-routed graph cards, play graph starts, and play loops", async () => {
   const dataDir = await mkdtemp(join(tmpdir(), "raddus-graph-store-"));
   process.env.RADDUS_GRAPH_DIR = dataDir;
   try {
@@ -545,13 +610,24 @@ test("graph store preserves graph cards and their start routes", async () => {
     const graph = {
       nodes: [
         { id: "play-a", type: "play", x: 0, y: 0, prompt: "Start", repository: null, branch: null },
-        { id: "graph-a", type: "graph", x: 180, y: 0, graphId: "project-child" },
-        { id: "agent-a", type: "agent", x: 380, y: 0, agentId: "agent-a" },
+        { id: "agent-a", type: "agent", x: 180, y: 0, agentId: "agent-a" },
+        { id: "expr-child", type: "expression", x: 380, y: 0, resultId: "child" },
+        { id: "graph-a", type: "graph", x: 580, y: 0, graphId: "project-child" },
+        { id: "expr-loop", type: "expression", x: 380, y: 120, resultId: "loop" },
       ],
       edges: [
-        { id: "edge-play-graph", source: "play-a", target: "graph-a", type: "runs" },
-        { id: "edge-graph-agent", source: "graph-a", target: "agent-a", type: "runs" },
+        { id: "edge-play-agent", source: "play-a", target: "agent-a", type: "runs" },
+        { id: "edge-agent-expr-child", source: "agent-a", target: "expr-child", type: "evaluates" },
+        { id: "edge-expr-child-graph", source: "expr-child", target: "graph-a", type: "routes", resultId: "child" },
+        { id: "edge-graph-expr-loop", source: "graph-a", target: "expr-loop", type: "evaluates" },
+        { id: "edge-expr-loop-play", source: "expr-loop", target: "play-a", type: "routes", resultId: "loop" },
+        { id: "edge-play-graph-legacy", source: "play-a", target: "graph-a", type: "runs" },
+        { id: "edge-graph-agent-legacy", source: "graph-a", target: "agent-a", type: "runs" },
       ],
+      parentGraphReferencePositions: {
+        "project-parent:graph-to-child": { x: 640, y: 128 },
+        malformed: { x: "nope", y: 128 },
+      },
     };
 
     const saved = await store.replaceGraphState({
@@ -570,10 +646,17 @@ test("graph store preserves graph cards and their start routes", async () => {
 
     assert.equal(saved.graph.nodes.find((node) => node.id === "graph-a")?.type, "graph");
     assert.equal(saved.graph.nodes.find((node) => node.id === "graph-a")?.graphId, "project-child");
-    assert.deepEqual(saved.graph.edges.map((edge) => [edge.source, edge.target, edge.type]), [
-      ["play-a", "graph-a", "runs"],
-      ["graph-a", "agent-a", "runs"],
+    assert.deepEqual(saved.graph.edges.map((edge) => [edge.source, edge.target, edge.type, edge.resultId ?? null]), [
+      ["play-a", "agent-a", "runs", null],
+      ["agent-a", "expr-child", "evaluates", null],
+      ["expr-child", "graph-a", "routes", "child"],
+      ["graph-a", "expr-loop", "evaluates", null],
+      ["expr-loop", "play-a", "routes", "loop"],
+      ["play-a", "graph-a", "runs", null],
     ]);
+    assert.deepEqual(saved.graph.parentGraphReferencePositions, {
+      "project-parent:graph-to-child": { x: 640, y: 128 },
+    });
   } finally {
     await rm(dataDir, { recursive: true, force: true });
     delete process.env.RADDUS_GRAPH_DIR;

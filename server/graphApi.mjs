@@ -1,4 +1,5 @@
 import { graphDataDir } from "./config.mjs";
+import { generateProjectFromPrompt, reviewProjectFromPrompt } from "./graphGenerator.mjs";
 import { listBranches, listRepositories } from "./github.mjs";
 import { readGraphData, replaceGraphState } from "./graphStore.mjs";
 import { appendCallbackStatus, continueGraphSession, createGraphSession, deleteGraphSession, stopGraphSession, submitReviewResponse } from "./graphRuntime.mjs";
@@ -51,6 +52,24 @@ export async function handleGraphApi(req, res, url) {
     const repo = url.searchParams.get("repo")?.trim();
     if (!repo) throw new HttpError(400, "Missing repo query parameter.");
     sendJson(res, 200, await listBranches(repo));
+    return;
+  }
+
+  if (resource === "project-generations" && req.method === "POST" && segments.length === 1) {
+    try {
+      sendJson(res, 201, { project: await generateProjectFromPrompt(asPayload(await readJsonBody(req))) });
+    } catch (error) {
+      throw new HttpError(400, error instanceof Error ? error.message : String(error));
+    }
+    return;
+  }
+
+  if (resource === "project-reviews" && req.method === "POST" && segments.length === 1) {
+    try {
+      sendJson(res, 201, { review: await reviewProjectFromPrompt(asPayload(await readJsonBody(req))) });
+    } catch (error) {
+      throw new HttpError(400, error instanceof Error ? error.message : String(error));
+    }
     return;
   }
 

@@ -1,5 +1,5 @@
 export type RunnerId = "codex" | "claude";
-export type GraphNodeType = "play" | "agent" | "expression" | "review" | "graph";
+export type GraphNodeType = "play" | "agent" | "expression" | "graph" | "any";
 export type GraphEdgeType = "runs" | "evaluates" | "routes";
 export type CardAnchor = "top" | "right" | "bottom" | "left";
 export type EdgeRoutingMode = "auto" | "manual";
@@ -65,6 +65,7 @@ export interface GraphEdge {
 export interface GraphDocument {
   nodes: GraphNode[];
   edges: GraphEdge[];
+  parentGraphReferencePositions?: Record<string, { x: number; y: number }>;
 }
 
 export interface PlayLaunchSelection {
@@ -144,7 +145,7 @@ export interface PendingReview {
   id: string;
   graphSessionId: string;
   graphId: string | null;
-  reviewNodeId: string;
+  reviewNodeId: string | null;
   agentNodeId: string;
   previousAgentSessionId: string;
   incomingExpressionNodeId: string | null;
@@ -188,6 +189,18 @@ export interface GraphState {
   sessions: GraphSession[];
   updatedAt: string;
   dataDir: string;
+}
+
+export type GeneratedProjectDraft = Pick<ProjectRecord, "name" | "graph" | "agents" | "results">;
+
+export interface ProjectReviewChange {
+  summary: string;
+  detail: string;
+}
+
+export interface ProjectGraphReview {
+  changes: ProjectReviewChange[];
+  project: GeneratedProjectDraft;
 }
 
 export interface RepositoryOption {
@@ -259,6 +272,14 @@ export class RaddusGraphApi {
     return requestJson<BranchListResult>(`/api/graph/branches?repo=${encodeURIComponent(repo)}`);
   }
 
+  generateProject(payload: { prompt: string }): Promise<{ project: GeneratedProjectDraft }> {
+    return requestJson<{ project: GeneratedProjectDraft }>("/api/graph/project-generations", jsonInit("POST", payload));
+  }
+
+  reviewProject(payload: { prompt: string; project: ProjectRecord }): Promise<{ review: ProjectGraphReview }> {
+    return requestJson<{ review: ProjectGraphReview }>("/api/graph/project-reviews", jsonInit("POST", payload));
+  }
+
   listSessions(): Promise<{ sessions: GraphSession[] }> {
     return requestJson<{ sessions: GraphSession[] }>("/api/graph/sessions");
   }
@@ -279,7 +300,7 @@ export class RaddusGraphApi {
     return requestJson<{ removedSessionId: string; sessions: GraphSession[] }>(`/api/graph/sessions/${encodeURIComponent(sessionId)}`, jsonInit("DELETE"));
   }
 
-  submitReviewResponse(sessionId: string, payload: { reviewNodeId: string; answer: string }): Promise<{ session: GraphSession }> {
+  submitReviewResponse(sessionId: string, payload: { answer: string }): Promise<{ session: GraphSession }> {
     return requestJson<{ session: GraphSession }>(`/api/graph/sessions/${encodeURIComponent(sessionId)}/review-response`, jsonInit("POST", payload));
   }
 }
