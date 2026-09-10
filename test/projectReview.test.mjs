@@ -64,7 +64,7 @@ test("graph review normalizes returned changes and replacement project", () => {
 
   assert.deepEqual(review.changes.map((change) => change.summary), ["Added approval path.", "Tightened handoff routing."]);
   assert.equal(review.project.name, "Reviewed Project");
-  assert.deepEqual(review.project.results.map((result) => result.id), ["completed", "failed", "default", "ready"]);
+  assert.deepEqual(review.project.results.map((result) => result.id), ["completed", "failed", "max-runs-reached", "default", "ready"]);
   assert.equal(review.project.graph.nodes.some((node) => node.type === "review"), false);
   assert.equal(review.project.graph.nodes.some((node) => node.type === "any"), true);
   assert.equal(review.project.graph.nodes.some((node) => node.type === "expression" && node.resultId === "ask-for-approval"), false);

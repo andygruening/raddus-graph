@@ -6,9 +6,10 @@ import { normalizeModelId, normalizeModelReasoningEffort } from "./modelCatalog.
 export const graphStateFile = join(graphDataDir, "state.json");
 export const graphSessionsDir = join(graphDataDir, "sessions");
 export const approvalResultId = "ask-for-approval";
-export const reservedResultIds = new Set(["completed", "failed", approvalResultId, "default"]);
+export const maxRunsReachedResultId = "max-runs-reached";
+export const reservedResultIds = new Set(["completed", "failed", maxRunsReachedResultId, approvalResultId, "default"]);
 export const legacyResultIds = new Set(["unknown", "fallback"]);
-export const nonCompletionResultIds = new Set(["default", "failed"]);
+export const nonCompletionResultIds = new Set(["default", "failed", maxRunsReachedResultId]);
 
 let writeQueue = Promise.resolve();
 
@@ -266,6 +267,11 @@ export function defaultResultDefinitions() {
     {
       id: "failed",
       description: "System route for a failed terminal outcome.",
+      reserved: true,
+    },
+    {
+      id: maxRunsReachedResultId,
+      description: "System route when an agent card has reached its maximum runs for the graph session.",
       reserved: true,
     },
     {
@@ -532,6 +538,7 @@ function normalizeGraphNode(value) {
     } : {}),
     ...(type === "agent" ? {
       agentId: nullableString(record.agentId),
+      maxRunsPerSession: positiveIntegerValue(record.maxRunsPerSession ?? record.max_runs_per_session),
     } : {}),
     ...(expressionProperties ?? {}),
     ...(type === "graph" ? {
@@ -802,7 +809,7 @@ function normalizeAgentSessionStatus(value, graphSessionId, agentSession, result
   const record = asRecord(value);
   const state = nodeStateValue(record.state) || "working";
   const emittedResultId = normalizeResultId(record.resultId ?? record.emittedResultId);
-  const result = routeResultForStatus(state, emittedResultId, resultIds);
+  const result = serverRoutedResultForStatus(state, record, source) ?? routeResultForStatus(state, emittedResultId, resultIds);
   return {
     id: cryptoId("status"),
     graphSessionId,
@@ -841,6 +848,15 @@ function terminalOutcomeFromStatus(status) {
     stdout: status.stdout,
     stderr: status.stderr,
     createdAt: status.createdAt,
+  };
+}
+
+function serverRoutedResultForStatus(state, record, source) {
+  const routedResultId = normalizeResultId(record.routedResultId);
+  if (source !== "server" || state !== "completed" || routedResultId !== maxRunsReachedResultId) return null;
+  return {
+    routedResultId: maxRunsReachedResultId,
+    routeReason: stringValue(record.routeReason) || "max_runs_reached",
   };
 }
 
@@ -944,6 +960,13 @@ function textValue(value) {
 
 function numberValue(value, fallback) {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function positiveIntegerValue(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return null;
+  const integer = Math.floor(number);
+  return integer > 0 ? integer : null;
 }
 
 function nextAgentSessionSequence(agentSessions) {

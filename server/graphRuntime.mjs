@@ -1,4 +1,4 @@
-import { mkdir, readFile, rm } from "node:fs/promises";
+import { mkdir, readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { cloneRepository, publishSessionChanges } from "./github.mjs";
 import {
@@ -6,6 +6,7 @@ import {
   approvalResultId,
   createAgentSession,
   deleteGraphSession as deleteStoredGraphSession,
+  maxRunsReachedResultId,
   nonCompletionResultIds,
   readGraphData,
   recordAgentSessionProcessOutput,
@@ -213,17 +214,24 @@ async function continueGraphSessionFromAgent({
     const session = await getSession(sessionId);
     if (!session || session.status === "stopped") return;
 
-    const agentSessionId = await runAgentNode({
-      session,
-      graphId: currentDefinition.graphId,
-      graph: currentDefinition.graph,
-      agents: currentDefinition.agents,
-      results: currentDefinition.results,
-      node: currentAgentNode,
-      upstreamAgentSessionIds: visitedAgentSessionIds,
-      arrival: currentArrival,
-      userPrompt,
-    });
+    const agentSessionId = maxRunsReachedForNode({ session, graphId: currentDefinition.graphId, node: currentAgentNode })
+      ? await completeAgentNodeWithMaxRunsReached({
+        session,
+        graphId: currentDefinition.graphId,
+        node: currentAgentNode,
+        arrival: currentArrival,
+      })
+      : await runAgentNode({
+        session,
+        graphId: currentDefinition.graphId,
+        graph: currentDefinition.graph,
+        agents: currentDefinition.agents,
+        results: currentDefinition.results,
+        node: currentAgentNode,
+        upstreamAgentSessionIds: visitedAgentSessionIds,
+        arrival: currentArrival,
+        userPrompt,
+      });
     if (!agentSessionId) return;
     visitedAgentSessionIds.push(agentSessionId);
 
@@ -476,6 +484,63 @@ export async function appendCallbackStatus(sessionId, agentSessionId, payload) {
   return recordAgentSessionStatus(sessionId, agentSessionId, payload, "callback");
 }
 
+async function completeAgentNodeWithMaxRunsReached({ session, graphId, node, arrival }) {
+  const maxRuns = maxRunsPerSessionForNode(node);
+  const runCount = agentNodeRunCountForSession({ session, graphId, node });
+  const created = await createAgentSession(session.id, {
+    nodeId: node.id,
+    graphId,
+    agentId: node.agentId,
+    previousAgentSessionId: arrival?.previousAgentSessionId ?? null,
+    incomingExpressionNodeId: arrival?.incomingExpressionNodeId ?? null,
+    incomingEdgeIds: arrival?.incomingEdgeIds ?? [],
+    incomingResultId: arrival?.incomingResultId ?? null,
+    summary: `Maximum runs reached for ${node.id}.`,
+  });
+  const agentSession = created.agentSession;
+  if (!agentSession) {
+    await failSession(session.id, new Error(`Could not create a max-runs route event for node ${node.id}.`));
+    return null;
+  }
+
+  await recordAgentSessionStatus(session.id, agentSession.id, {
+    state: "completed",
+    summary: "Maximum runs per session reached.",
+    detail: `Node ${node.id} has already run ${runCount} time${runCount === 1 ? "" : "s"} in this graph session${maxRuns ? `; limit is ${maxRuns}.` : "."}`,
+    routedResultId: maxRunsReachedResultId,
+    routeReason: "max_runs_reached",
+  }, "server");
+  return agentSession.id;
+}
+
+export function maxRunsReachedForNode({ session, graphId, node }) {
+  const maxRuns = maxRunsPerSessionForNode(node);
+  return maxRuns !== null && agentNodeRunCountForSession({ session, graphId, node }) >= maxRuns;
+}
+
+export function agentNodeRunCountForSession({ session, graphId, node }) {
+  const nodeId = stringValue(node?.id);
+  if (!nodeId) return 0;
+  const normalizedGraphId = nullableString(graphId);
+  return orderedAgentSessionsForRuntime(session).filter((agentSession) => (
+    agentSession.nodeId === nodeId &&
+    nullableString(agentSession.graphId) === normalizedGraphId &&
+    !isMaxRunsReachedRouteEvent(agentSession)
+  )).length;
+}
+
+function maxRunsPerSessionForNode(node) {
+  const number = numberValue(node?.maxRunsPerSession, Number.NaN);
+  if (!Number.isFinite(number)) return null;
+  const integer = Math.floor(number);
+  return integer > 0 ? integer : null;
+}
+
+function isMaxRunsReachedRouteEvent(agentSession) {
+  const outcome = agentSession?.terminalOutcome ?? null;
+  return outcome?.routedResultId === maxRunsReachedResultId && outcome?.routeReason === "max_runs_reached";
+}
+
 async function runAgentNode({ session, graphId, graph, agents, results, node, upstreamAgentSessionIds, arrival, userPrompt }) {
   const created = await createAgentSession(session.id, {
     nodeId: node.id,
@@ -524,8 +589,8 @@ async function runAgentNode({ session, graphId, graph, agents, results, node, up
     return agentSession.id;
   }
 
-  const statusFilePath = statusFilePathForAgentSession(session.workspacePath, agentSession.id);
-  await rm(statusFilePath, { force: true }).catch(() => undefined);
+  const statusFilePath = statusFilePathForGraphSession(session.workspacePath);
+  const statusFileStartOffset = await fileSize(statusFilePath);
 
   const prompt = buildAgentPrompt({ session, graph, agents, results, node, agent, agentSession, upstreamAgentSessionIds, statusFilePath, userPrompt });
   await setAgentSessionPrompt(session.id, agentSession.id, prompt);
@@ -552,8 +617,7 @@ async function runAgentNode({ session, graphId, graph, agents, results, node, up
     stdout: result.stdout,
     stderr: result.stderr,
   });
-  await recordStatusFileCallbacks(session.id, agentSession.id, statusFilePath);
-  await rm(statusFilePath, { force: true }).catch(() => undefined);
+  await recordStatusFileCallbacks(session.id, agentSession.id, statusFilePath, statusFileStartOffset);
 
   let current = await getSession(session.id);
   const latestAgentSession = current?.agentSessions.find((candidate) => candidate.id === agentSession.id) ?? null;
@@ -1074,12 +1138,12 @@ function longestBacktickRun(text) {
   return Math.max(0, ...[...text.matchAll(/`+/g)].map((match) => match[0].length));
 }
 
-async function recordStatusFileCallbacks(sessionId, agentSessionId, statusFilePath) {
+async function recordStatusFileCallbacks(sessionId, agentSessionId, statusFilePath, startOffset = 0) {
   const current = await getSession(sessionId);
   const agentSession = current?.agentSessions.find((candidate) => candidate.id === agentSessionId) ?? null;
   if (!agentSession || agentSession.terminalOutcome) return;
 
-  const { payloads, errors } = await readStatusPayloadsFromFile(statusFilePath);
+  const { payloads, errors } = await readStatusPayloadsFromFile(statusFilePath, startOffset);
   if (errors.length > 0) {
     await recordAgentSessionStatus(sessionId, agentSessionId, {
       state: "working",
@@ -1096,9 +1160,9 @@ async function recordStatusFileCallbacks(sessionId, agentSessionId, statusFilePa
   }
 }
 
-async function readStatusPayloadsFromFile(statusFilePath) {
+async function readStatusPayloadsFromFile(statusFilePath, startOffset = 0) {
   try {
-    return statusPayloadsFromText(await readFile(statusFilePath, "utf8"));
+    return statusPayloadsFromText(statusFileTextAfterOffset(await readFile(statusFilePath), startOffset));
   } catch (error) {
     if (error?.code === "ENOENT") return { payloads: [], errors: [] };
     return {
@@ -1106,6 +1170,22 @@ async function readStatusPayloadsFromFile(statusFilePath) {
       errors: [`Could not read local status file: ${error instanceof Error ? error.message : String(error)}`],
     };
   }
+}
+
+async function fileSize(filePath) {
+  try {
+    return (await stat(filePath)).size;
+  } catch (error) {
+    if (error?.code === "ENOENT") return 0;
+    throw error;
+  }
+}
+
+export function statusFileTextAfterOffset(content, startOffset = 0) {
+  const buffer = Buffer.isBuffer(content) ? content : Buffer.from(String(content ?? ""), "utf8");
+  const offset = Math.max(0, Math.floor(numberValue(startOffset, 0)));
+  const safeOffset = offset <= buffer.length ? offset : 0;
+  return buffer.subarray(safeOffset).toString("utf8");
 }
 
 export function statusPayloadsFromText(text) {
@@ -1168,8 +1248,8 @@ function parseJsonValue(text) {
   }
 }
 
-function statusFilePathForAgentSession(workspacePath, agentSessionId) {
-  return join(workspacePath, `.raddus-graph-status-${agentSessionId}.jsonl`);
+export function statusFilePathForGraphSession(workspacePath) {
+  return join(workspacePath, "raddus-graph-status.jsonl");
 }
 
 export function cliArgsForRunner(runner, agent, workspacePath, prompt) {
@@ -1195,8 +1275,12 @@ export function cliArgsForRunner(runner, agent, workspacePath, prompt) {
     };
   }
 
+  const args = ["-p", prompt, "--model", agent.model];
+  if (agent.modelReasoningEffort) {
+    args.push("--effort", agent.modelReasoningEffort);
+  }
   return {
-    args: ["-p", prompt, "--model", agent.model],
+    args,
     input: undefined,
   };
 }

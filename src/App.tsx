@@ -8,6 +8,7 @@ import {
   ChevronDown,
   ChevronUp,
   CircleDot,
+  FolderOpen,
   GitPullRequest,
   Info,
   Layers,
@@ -81,7 +82,7 @@ type EdgeEndpoint = "source" | "target";
 type EdgeAnchorDrag = { edgeId: string; endpoint: EdgeEndpoint } | null;
 type DialogState =
   | { type: "agent-create" }
-  | { type: "agent-details"; agentId: string }
+  | { type: "agent-details"; agentId: string; nodeId?: string }
   | { type: "play"; nodeId: string }
   | { type: "graph-play" }
   | { type: "approval-review"; sessionId: string }
@@ -155,7 +156,7 @@ type BrowserWindowWithLegacyAudio = Window & typeof globalThis & {
 
 const paletteTabs: PaletteTab[] = ["agents", "expressions", "other"];
 const api = new RaddusGraphApi();
-const reservedResultIds = new Set(["completed", "failed", "ask-for-approval", "default"]);
+const reservedResultIds = new Set(["completed", "failed", "max-runs-reached", "ask-for-approval", "default"]);
 const protectedResultIds = new Set([...reservedResultIds, "unknown", "fallback"]);
 const paletteCollapsedStorageKey = "raddus-graph:card-palette-collapsed";
 let agentHandoffAudioContext: AudioContext | null = null;
@@ -273,10 +274,14 @@ export default function App() {
   }, [state]);
 
   React.useEffect(() => {
-    if (!followedSessionId || !state) return;
-    const followedSession = state.sessions.find((session) => session.id === followedSessionId);
-    if (!followedSession || (followedSession.projectId && followedSession.projectId !== state.selectedProjectId)) {
-      setFollowedSessionId(null);
+    if (!state) return;
+    const followedSession = followedSessionId ? state.sessions.find((session) => session.id === followedSessionId) ?? null : null;
+    if (followedSession && graphSessionIncludesProject(followedSession, state.selectedProjectId)) return;
+
+    const latestSession = latestSessionForProject(state.sessions, state.selectedProjectId);
+    const nextFollowedSessionId = latestSession?.id ?? null;
+    if (nextFollowedSessionId !== followedSessionId) {
+      setFollowedSessionId(nextFollowedSessionId);
       setFocusedAgentSessionId(null);
     }
   }, [followedSessionId, state]);
@@ -542,7 +547,12 @@ export default function App() {
       setFocusedAgentSessionId(null);
     }
     setFollowedSessionId(sessionId);
-    if (session?.projectId && current?.selectedProjectId !== session.projectId && current?.projects.some((project) => project.id === session.projectId)) {
+    if (
+      session?.projectId &&
+      current &&
+      !graphSessionIncludesProject(session, current.selectedProjectId) &&
+      current.projects.some((project) => project.id === session.projectId)
+    ) {
       selectProject(session.projectId, { followLatestSession: false });
     }
   }
@@ -716,6 +726,10 @@ export default function App() {
   }
 
   function updateAgent(agentId: string, patch: Partial<AgentSpec>) {
+    updateAgentDetails(agentId, patch);
+  }
+
+  function updateAgentDetails(agentId: string, patch: Partial<AgentSpec>, nodeId?: string, nodePatch?: Partial<GraphNode>) {
     mutateState((current) => withActiveProject(current, {
       agents: current.agents.map((agent) => {
         if (agent.id !== agentId) return agent;
@@ -732,6 +746,12 @@ export default function App() {
           updatedAt: new Date().toISOString(),
         };
       }),
+      ...(nodeId && nodePatch ? {
+        graph: {
+          ...current.graph,
+          nodes: current.graph.nodes.map((node) => node.id === nodeId ? { ...node, ...nodePatch } : node),
+        },
+      } : {}),
     }));
   }
 
@@ -1092,6 +1112,15 @@ export default function App() {
       setError(errorMessage(continueError));
     } finally {
       setContinuingSessionId(null);
+    }
+  }
+
+  async function openSessionWorkspace(sessionId: string) {
+    setError(null);
+    try {
+      await api.openSessionWorkspace(sessionId);
+    } catch (openError) {
+      setError(errorMessage(openError));
     }
   }
 
@@ -1543,7 +1572,7 @@ export default function App() {
   const selectedProject = state ? selectedProjectForState(state) : null;
   const playNodes = graph.nodes.filter(isPlayNode);
   const parentGraphReferences = state && selectedProject ? parentGraphReferencesForState(state, selectedProject) : [];
-  const graphSessions = state?.sessions.filter((session) => session.projectId === state.selectedProjectId) ?? [];
+  const graphSessions = state?.sessions.filter((session) => graphSessionIncludesProject(session, state.selectedProjectId)) ?? [];
   const activeExpressionResultId = state && dialog?.type === "expression"
     ? selectedRouteResultForExpression(state, dialog.nodeId)
     : state && dialog?.type === "expression-definition"
@@ -1821,7 +1850,6 @@ export default function App() {
                         : paletteDragPreview?.connection?.targetNodeId === node.id
                           ? "valid"
                           : "idle";
-                  const latestAgentSession = executionView?.latestAgentSessionByNodeId.get(node.id) ?? null;
                   return (
                     <ProjectNodeCard
                       key={node.id}
@@ -1835,12 +1863,7 @@ export default function App() {
                       onPointerDown={(event) => beginNodeDrag(event, node.id)}
                       onRemove={() => requestDeleteNode(node.id)}
                       onOpen={() => {
-                        if (followedSession && latestAgentSession) {
-                          setFocusedAgentSessionId(latestAgentSession.id);
-                          setDialog({ type: "sessions" });
-                          return;
-                        }
-                        if (node.type === "agent" && node.agentId) setDialog({ type: "agent-details", agentId: node.agentId });
+                        if (node.type === "agent" && node.agentId) setDialog({ type: "agent-details", agentId: node.agentId, nodeId: node.id });
                         if (node.type === "play") setDialog({ type: "play", nodeId: node.id });
                         if (node.type === "expression") setDialog({ type: "expression", nodeId: node.id });
                         if (node.type === "graph") {
@@ -1912,10 +1935,11 @@ export default function App() {
       {state && dialog?.type === "agent-details" ? (
         <AgentDialog
           agent={activeAgents.find((agent) => agent.id === dialog.agentId) ?? null}
+          agentNode={dialog.nodeId ? state.graph.nodes.find((node) => node.id === dialog.nodeId && node.type === "agent") ?? null : null}
           models={models}
           onClose={() => setDialog(null)}
-          onSave={(draft) => {
-            updateAgent(dialog.agentId, draft);
+          onSave={(draft, nodePatch) => {
+            updateAgentDetails(dialog.agentId, draft, dialog.nodeId, nodePatch);
             setDialog(null);
           }}
           onDelete={() => requestDeleteAgent(dialog.agentId)}
@@ -2018,6 +2042,7 @@ export default function App() {
           onRefresh={() => void refreshSessions()}
           onFollowSession={followGraphSession}
           onContinueSession={(sessionId) => void continueSession(sessionId)}
+          onOpenWorkspace={(sessionId) => void openSessionWorkspace(sessionId)}
           onStop={requestStopSession}
           onRemoveSession={requestRemoveSession}
           onClose={() => setDialog(null)}
@@ -2840,15 +2865,17 @@ function AgentCliStatusRow({ label, loading, available }: { label: string; loadi
 
 function AgentDialog({
   agent,
+  agentNode,
   models,
   onClose,
   onSave,
   onDelete,
 }: {
   agent?: AgentSpec | null;
+  agentNode?: GraphNode | null;
   models: ModelCatalogEntry[];
   onClose: () => void;
-  onSave: (draft: AgentDraft) => void;
+  onSave: (draft: AgentDraft, nodePatch?: Partial<GraphNode>) => void;
   onDelete?: () => void;
 }) {
   const editing = Boolean(agent);
@@ -2858,6 +2885,7 @@ function AgentDialog({
     modelReasoningEffort: agent?.modelReasoningEffort ?? null,
     systemPrompt: agent?.systemPrompt ?? "",
   }));
+  const [nodeMaxRunsDraft, setNodeMaxRunsDraft] = React.useState(() => maxRunsPerSessionInputValue(agentNode?.maxRunsPerSession));
 
   React.useEffect(() => {
     setDraft({
@@ -2868,10 +2896,14 @@ function AgentDialog({
     });
   }, [agent, models]);
 
+  React.useEffect(() => {
+    setNodeMaxRunsDraft(maxRunsPerSessionInputValue(agentNode?.maxRunsPerSession));
+  }, [agentNode?.id, agentNode?.maxRunsPerSession]);
+
   if (editing && !agent) return null;
 
   const selectedModel = modelEntryForId(models, draft.model);
-  const reasoningEfforts = selectedModel?.runner === "codex" ? selectedModel.reasoningEfforts ?? [] : [];
+  const reasoningEfforts = selectedModel?.reasoningEfforts ?? [];
   const selectedReasoningEffort = reasoningEfforts.some((option) => option.id === draft.modelReasoningEffort) ? draft.modelReasoningEffort ?? "" : "";
 
   function setModel(modelId: string) {
@@ -2879,7 +2911,7 @@ function AgentDialog({
     setDraft({
       ...draft,
       model: modelId,
-      modelReasoningEffort: nextModel?.runner === "codex"
+      modelReasoningEffort: nextModel?.reasoningEfforts?.length
         ? normalizeDraftModelReasoningEffort(modelId, draft.modelReasoningEffort, models)
         : null,
     });
@@ -2891,7 +2923,9 @@ function AgentDialog({
         className="form-grid"
         onSubmit={(event) => {
           event.preventDefault();
-          onSave(draft);
+          onSave(draft, agentNode?.type === "agent" ? {
+            maxRunsPerSession: normalizeMaxRunsPerSessionInput(nodeMaxRunsDraft),
+          } : undefined);
         }}
       >
         <FormSection title="Agent">
@@ -2927,6 +2961,21 @@ function AgentDialog({
             <textarea rows={9} value={draft.systemPrompt} onChange={(event) => setDraft({ ...draft, systemPrompt: event.target.value })} />
           </label>
         </FormSection>
+        {agentNode?.type === "agent" ? (
+          <FormSection title="Node">
+            <label>
+              <span>Maximum runs per session</span>
+              <input
+                type="number"
+                min={1}
+                step={1}
+                inputMode="numeric"
+                value={nodeMaxRunsDraft}
+                onChange={(event) => setNodeMaxRunsDraft(event.target.value)}
+              />
+            </label>
+          </FormSection>
+        ) : null}
         <div className="dialog-actions">
           {onDelete ? (
             <button className="danger-button" type="button" onClick={onDelete}>
@@ -3342,6 +3391,7 @@ function SessionsDialog({
   onRefresh,
   onFollowSession,
   onContinueSession,
+  onOpenWorkspace,
   onStop,
   onRemoveSession,
   onClose,
@@ -3353,6 +3403,7 @@ function SessionsDialog({
   onRefresh: () => void;
   onFollowSession: (sessionId: string) => void;
   onContinueSession: (sessionId: string) => void;
+  onOpenWorkspace: (sessionId: string) => void;
   onStop: (sessionId: string) => void;
   onRemoveSession: (sessionId: string) => void;
   onClose: () => void;
@@ -3462,6 +3513,15 @@ function SessionsDialog({
                     <span className={`status-pill ${selectedSession.status}`}>{selectedSession.status}</span>
                   </div>
                   <div className="session-actions">
+                    <button
+                      className="secondary-button compact-button"
+                      type="button"
+                      onClick={() => onOpenWorkspace(selectedSession.id)}
+                      title="Open workspace directory"
+                    >
+                      <FolderOpen size={15} aria-hidden="true" />
+                      Workspace
+                    </button>
                     {selectedSession.prUrl ? (
                       <a className="secondary-button compact-button" href={selectedSession.prUrl} target="_blank" rel="noreferrer">
                         <GitPullRequest size={15} aria-hidden="true" />
@@ -4182,6 +4242,11 @@ function defaultProjectResults(): ResultDefinition[] {
       reserved: true,
     },
     {
+      id: "max-runs-reached",
+      description: "System route when an agent card has reached its maximum runs for the graph session.",
+      reserved: true,
+    },
+    {
       id: "default",
       description: "System default route for unrecognized results or outcomes without a more-specific branch.",
       reserved: true,
@@ -4208,8 +4273,22 @@ function modelEntryForId(models: ModelCatalogEntry[], modelId: string): ModelCat
 function normalizeDraftModelReasoningEffort(modelId: string, effort: string | null | undefined, models: ModelCatalogEntry[]): string | null {
   const normalized = typeof effort === "string" ? effort.trim() : "";
   const model = modelEntryForId(models, modelId);
-  if (!normalized || model?.runner !== "codex") return null;
-  return model.reasoningEfforts?.some((option) => option.id === normalized) ? normalized : null;
+  if (!normalized) return null;
+  return model?.reasoningEfforts?.some((option) => option.id === normalized) ? normalized : null;
+}
+
+function maxRunsPerSessionInputValue(value: number | null | undefined): string {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return "";
+  return String(Math.floor(value));
+}
+
+function normalizeMaxRunsPerSessionInput(value: string): number | null {
+  const text = value.trim();
+  if (!text) return null;
+  const number = Number(text);
+  if (!Number.isFinite(number)) return null;
+  const integer = Math.floor(number);
+  return integer > 0 ? integer : null;
 }
 
 function reasoningEffortOptionLabel(option: ReasoningEffortOption) {
@@ -4276,11 +4355,19 @@ function agentSessionAgentName(session: GraphSession, agentSession: AgentSession
 function latestSessionForProject(sessions: GraphSession[], projectId: string | null | undefined) {
   return sessions
     .map((session, index) => ({ session, index }))
-    .filter(({ session }) => session.projectId === projectId)
+    .filter(({ session }) => graphSessionIncludesProject(session, projectId))
     .sort((left, right) => {
       const dateComparison = right.session.createdAt.localeCompare(left.session.createdAt);
       return dateComparison || left.index - right.index;
     })[0]?.session ?? null;
+}
+
+function graphSessionIncludesProject(session: GraphSession, projectId: string | null | undefined): boolean {
+  if (!projectId) return false;
+  if (session.projectId === projectId) return true;
+  if (session.agentSessions.some((agentSession) => agentSession.graphId === projectId)) return true;
+  const pendingReview = session.pendingReview;
+  return pendingReview?.graphId === projectId;
 }
 
 function pendingApprovalTitle(session: GraphSession) {

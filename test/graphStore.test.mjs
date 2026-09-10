@@ -108,7 +108,7 @@ test("saving project state preserves the last play selection", async () => {
   }
 });
 
-test("saving agents preserves supported Codex reasoning effort", async () => {
+test("saving agents preserves supported model reasoning effort", async () => {
   const dataDir = await mkdtemp(join(tmpdir(), "raddus-graph-store-"));
   process.env.RADDUS_GRAPH_DIR = dataDir;
   try {
@@ -136,9 +136,9 @@ test("saving agents preserves supported Codex reasoning effort", async () => {
     });
 
     assert.equal(saved.agents.find((agent) => agent.id === "agent-codex")?.modelReasoningEffort, "high");
-    assert.equal(saved.agents.find((agent) => agent.id === "agent-claude")?.modelReasoningEffort, null);
+    assert.equal(saved.agents.find((agent) => agent.id === "agent-claude")?.modelReasoningEffort, "high");
     assert.equal(saved.projects[0].agents.find((agent) => agent.id === "agent-codex")?.modelReasoningEffort, "high");
-    assert.equal(saved.projects[0].agents.find((agent) => agent.id === "agent-claude")?.modelReasoningEffort, null);
+    assert.equal(saved.projects[0].agents.find((agent) => agent.id === "agent-claude")?.modelReasoningEffort, "high");
   } finally {
     await rm(dataDir, { recursive: true, force: true });
     delete process.env.RADDUS_GRAPH_DIR;
@@ -154,9 +154,49 @@ test("reserved result definitions include built-in terminal routes", async () =>
 
     const saved = await store.readGraphData();
 
-    assert.deepEqual(resultIds(saved.results), ["completed", "failed", "default"]);
-    assert.deepEqual(saved.results.map((result) => result.reserved), [true, true, true]);
-    assert.deepEqual(resultIds(saved.projects[0].results), ["completed", "failed", "default"]);
+    assert.deepEqual(resultIds(saved.results), ["completed", "failed", "max-runs-reached", "default"]);
+    assert.deepEqual(saved.results.map((result) => result.reserved), [true, true, true, true]);
+    assert.deepEqual(resultIds(saved.projects[0].results), ["completed", "failed", "max-runs-reached", "default"]);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+    delete process.env.RADDUS_GRAPH_DIR;
+  }
+});
+
+test("agent card maximum runs are persisted on the node, not the agent spec", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "raddus-graph-store-"));
+  process.env.RADDUS_GRAPH_DIR = dataDir;
+  try {
+    const store = await import(`../server/graphStore.mjs?graph-store-test=${Date.now()}-node-max-runs`);
+    await store.initializeGraphStore();
+
+    const graph = {
+      nodes: [
+        { id: "agent-a-card", type: "agent", x: 0, y: 0, agentId: "shipper", maxRunsPerSession: 2 },
+        { id: "agent-b-card", type: "agent", x: 180, y: 0, agentId: "shipper", maxRunsPerSession: 5 },
+        { id: "agent-invalid-card", type: "agent", x: 360, y: 0, agentId: "shipper", maxRunsPerSession: 0 },
+      ],
+      edges: [],
+    };
+
+    const saved = await store.replaceGraphState({
+      selectedProjectId: "project-node-max-runs",
+      projects: [{
+        id: "project-node-max-runs",
+        name: "Node Max Runs",
+        graph,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      }],
+      graph,
+      agents: [{ id: "shipper", name: "Shipper", model: "gpt-5.5", systemPrompt: "" }],
+      results: [],
+    });
+
+    assert.equal(saved.graph.nodes.find((node) => node.id === "agent-a-card")?.maxRunsPerSession, 2);
+    assert.equal(saved.graph.nodes.find((node) => node.id === "agent-b-card")?.maxRunsPerSession, 5);
+    assert.equal(saved.graph.nodes.find((node) => node.id === "agent-invalid-card")?.maxRunsPerSession, null);
+    assert.equal("maxRunsPerSession" in saved.agents[0], false);
   } finally {
     await rm(dataDir, { recursive: true, force: true });
     delete process.env.RADDUS_GRAPH_DIR;
@@ -287,6 +327,26 @@ test("terminal statuses route through built-in reserved results", async () => {
     }, "test");
     assert.equal(invalid.status.routedResultId, "default");
     assert.equal(invalid.status.routeReason, "invalid_completion_result");
+
+    const agentMaxSession = await store.createAgentSession("graph-session-results", { nodeId: "agent-max" });
+    const agentMax = await store.recordAgentSessionStatus("graph-session-results", agentMaxSession.agentSession.id, {
+      state: "completed",
+      resultId: "max-runs-reached",
+      summary: "Tried to control app-owned routing.",
+    }, "test");
+    assert.equal(agentMax.status.routedResultId, "default");
+    assert.equal(agentMax.status.routeReason, "invalid_completion_result");
+
+    const serverMaxSession = await store.createAgentSession("graph-session-results", { nodeId: "agent-server-max" });
+    const serverMax = await store.recordAgentSessionStatus("graph-session-results", serverMaxSession.agentSession.id, {
+      state: "completed",
+      summary: "Maximum runs per session reached.",
+      routedResultId: "max-runs-reached",
+      routeReason: "max_runs_reached",
+    }, "server");
+    assert.equal(serverMax.status.emittedResultId, null);
+    assert.equal(serverMax.status.routedResultId, "max-runs-reached");
+    assert.equal(serverMax.status.routeReason, "max_runs_reached");
 
     const unrecognizedSession = await store.createAgentSession("graph-session-results", { nodeId: "agent-unrecognized" });
     const unrecognized = await store.recordAgentSessionStatus("graph-session-results", unrecognizedSession.agentSession.id, {

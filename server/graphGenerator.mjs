@@ -11,6 +11,10 @@ const maxResults = 12;
 const maxNodes = 36;
 const allowedNodeTypes = new Set(["play", "agent", "expression", "graph", "any"]);
 const allowedEdgeTypes = new Set(["runs", "evaluates", "routes"]);
+const layoutOrigin = { x: 72, y: 96 };
+const layoutColumnGap = 268;
+const layoutRowGap = 128;
+const maxLayoutRank = 18;
 
 export async function generateProjectFromPrompt(body) {
   const payload = asRecord(body);
@@ -121,11 +125,11 @@ export function buildGraphGenerationPrompt(userPrompt, model) {
     '  "results": [{"id": "approved", "description": "What this terminal result means"}],',
     '  "graph": {',
     '    "nodes": [',
-    '      {"key": "start", "type": "play", "x": 72, "y": 96, "prompt": "Starter prompt shown on the play card"},',
-    '      {"key": "any", "type": "any", "x": 72, "y": 176},',
-    '      {"key": "planner-card", "type": "agent", "agentKey": "planner", "x": 340, "y": 96},',
-    '      {"key": "approved-route", "type": "expression", "resultId": "approved", "x": 600, "y": 96},',
-    '      {"key": "shipper-card", "type": "agent", "agentKey": "shipper", "x": 860, "y": 96}',
+    '      {"key": "start", "type": "play", "prompt": "Starter prompt shown on the play card"},',
+    '      {"key": "any", "type": "any"},',
+    '      {"key": "planner-card", "type": "agent", "agentKey": "planner"},',
+    '      {"key": "approved-route", "type": "expression", "resultId": "approved"},',
+    '      {"key": "shipper-card", "type": "agent", "agentKey": "shipper"}',
     "    ],",
     '    "edges": [',
     '      {"source": "start", "target": "planner-card", "type": "runs"},',
@@ -143,9 +147,10 @@ export function buildGraphGenerationPrompt(userPrompt, model) {
     "- Route play starts with runs edges to agents or graph cards, agent/graph/any-to-expression with evaluates edges, and expression-to-agent/graph/play with routes edges.",
     "- Graph cards can be started directly by play nodes; otherwise connect graph cards only through expression routes. A graph card returns the result from the last agent node inside that graph through graph-card expression routes.",
     "- Connect the any node only to expression nodes. Expressions connected from any apply to every agent in the graph.",
-    "- Keep the graph compact: 2-6 agents, at most 3 custom results, and readable left-to-right coordinates.",
+    "- Keep the graph compact: 2-6 agents and at most 3 custom results.",
+    "- Do not include layout fields such as x, y, waypoints, bends, or anchors. The app calculates node layout from the graph topology.",
     "- Do not create graph-card nodes or references to other projects for new project generation.",
-    "- Custom result IDs must be lowercase kebab-case or snake_case and must not be completed, failed, default, unknown, fallback, or ask-for-approval.",
+    "- Custom result IDs must be lowercase kebab-case or snake_case and must not be completed, failed, max-runs-reached, default, unknown, fallback, or ask-for-approval.",
     "",
     "User prompt:",
     markdownFence(userPrompt, "md"),
@@ -174,21 +179,22 @@ export function buildGraphReviewPrompt({ userPrompt, project, model }) {
     "Rules:",
     `- Use model ${model} implicitly; do not put model IDs in the JSON.`,
     "- Return a full replacement project, not a partial patch.",
-    "- Preserve useful existing agents, result IDs, coordinates, and routes unless the review prompt gives a reason to change them.",
+    "- Preserve useful existing agents, result IDs, and routes unless the review prompt gives a reason to change them.",
     "- Use one play node as the graph start and one any node for global result routing.",
     "- Do not create review nodes or routes to review nodes. Agents can emit ask-for-approval to pause the graph globally without an expression node or route edge.",
     "- Use expression nodes only when a preceding agent can emit a named result that changes routing.",
     "- Route play starts with runs edges to agents or graph cards, agent/graph/any-to-expression with evaluates edges, and expression-to-agent/graph/play with routes edges.",
     "- Graph cards can be started directly by play nodes; otherwise connect graph cards only through expression routes. A graph card returns the result from the last agent node inside that graph through graph-card expression routes.",
     "- Connect the any node only to expression nodes. Expressions connected from any apply to every agent in the graph.",
-    "- Keep the graph compact: 2-8 agents, at most 5 custom results, and readable left-to-right coordinates.",
+    "- Keep the graph compact: 2-8 agents and at most 5 custom results.",
+    "- Do not include layout fields such as x, y, waypoints, bends, or anchors. The app calculates node layout from the graph topology.",
     "- Preserve existing valid graph-card nodes when useful, but do not invent references to unknown projects.",
-    "- Custom result IDs must be lowercase kebab-case or snake_case and must not be completed, failed, default, unknown, fallback, or ask-for-approval.",
+    "- Custom result IDs must be lowercase kebab-case or snake_case and must not be completed, failed, max-runs-reached, default, unknown, fallback, or ask-for-approval.",
     "- Include one change summary for every meaningful graph, agent, or result change.",
     "- If no changes are useful, return the current project unchanged and one summary saying no graph changes are recommended.",
     "",
     "Current project JSON:",
-    markdownFence(JSON.stringify(project, null, 2), "json"),
+    markdownFence(JSON.stringify(projectWithoutLayoutFields(project), null, 2), "json"),
     "",
     "Review prompt:",
     markdownFence(userPrompt, "md"),
@@ -407,7 +413,7 @@ function normalizeGeneratedGraph(value, { agents, results, fallbackPrompt }) {
   ensureStartEdge(nodes, edges);
 
   const graph = {
-    nodes: nodes.map((node) => stripInternalKeys(node)),
+    nodes: autoLayoutGeneratedGraph(nodes, edges).map((node) => stripInternalKeys(node)),
     edges,
   };
   return {
@@ -418,15 +424,13 @@ function normalizeGeneratedGraph(value, { agents, results, fallbackPrompt }) {
 }
 
 function normalizeGeneratedNode(record, context) {
-  const x = numberValue(record.x, 72 + context.index * 260);
-  const y = numberValue(record.y, 96 + (context.index % 3) * 128);
   if (context.type === "play") {
     return {
       id: context.id,
       key: context.key,
       type: "play",
-      x,
-      y,
+      x: 0,
+      y: 0,
       prompt: stringValue(record.prompt) || playPromptValue(context.fallbackPrompt),
       repository: null,
       branch: null,
@@ -439,8 +443,8 @@ function normalizeGeneratedNode(record, context) {
       id: context.id,
       key: context.key,
       type: "agent",
-      x,
-      y,
+      x: 0,
+      y: 0,
       agentId: agent.id,
     };
   }
@@ -449,8 +453,8 @@ function normalizeGeneratedNode(record, context) {
       id: context.id,
       key: context.key,
       type: "any",
-      x,
-      y,
+      x: 0,
+      y: 0,
     };
   }
   if (context.type === "expression") {
@@ -461,8 +465,8 @@ function normalizeGeneratedNode(record, context) {
       id: context.id,
       key: context.key,
       type: "expression",
-      x,
-      y,
+      x: 0,
+      y: 0,
       resultId,
     };
   }
@@ -473,12 +477,179 @@ function normalizeGeneratedNode(record, context) {
       id: context.id,
       key: context.key,
       type: "graph",
-      x,
-      y,
+      x: 0,
+      y: 0,
       graphId,
     };
   }
   return null;
+}
+
+export function autoLayoutGeneratedGraph(nodes, edges) {
+  const nodeById = new Map(nodes.map((node) => [node.id, node]));
+  const originalIndexById = new Map(nodes.map((node, index) => [node.id, index]));
+  const incomingByTarget = incomingEdgesByTarget(edges, nodeById);
+  const feedbackEdgeIds = feedbackLayoutEdgeIds(nodes, edges, nodeById);
+  const feedbackSourceNodeIds = new Set(edges.filter((edge) => feedbackEdgeIds.has(edge.id)).map((edge) => edge.source));
+  const rankById = generatedGraphLayoutRanks(nodes, edges, nodeById, feedbackEdgeIds);
+  const rowById = new Map();
+  const ranks = [...new Set(nodes.map((node) => rankById.get(node.id) ?? fallbackLayoutRank(node)))].sort((left, right) => left - right);
+
+  for (const rank of ranks) {
+    const occupiedRows = new Set();
+    const rankNodes = nodes
+      .filter((node) => (rankById.get(node.id) ?? fallbackLayoutRank(node)) === rank)
+      .sort((left, right) => layoutNodeSort(left, right, { feedbackSourceNodeIds, incomingByTarget, originalIndexById, rankById, rowById }));
+
+    for (const node of rankNodes) {
+      const desiredRow = desiredLayoutRow(node, { feedbackSourceNodeIds, incomingByTarget, rankById, rowById });
+      const row = nearestAvailableLayoutRow(desiredRow, occupiedRows);
+      occupiedRows.add(row);
+      rowById.set(node.id, row);
+    }
+  }
+
+  return nodes.map((node) => {
+    const rank = rankById.get(node.id) ?? fallbackLayoutRank(node);
+    const row = rowById.get(node.id) ?? 0;
+    return {
+      ...node,
+      x: layoutOrigin.x + rank * layoutColumnGap,
+      y: layoutOrigin.y + row * layoutRowGap,
+    };
+  });
+}
+
+function generatedGraphLayoutRanks(nodes, edges, nodeById, feedbackEdgeIds) {
+  const rankById = new Map(nodes.map((node) => [node.id, fallbackLayoutRank(node)]));
+
+  for (const node of nodes) {
+    if (node.type === "play" || node.type === "any") rankById.set(node.id, 0);
+  }
+
+  for (let pass = 0; pass < nodes.length; pass += 1) {
+    let changed = false;
+    for (const edge of edges) {
+      if (feedbackEdgeIds.has(edge.id)) continue;
+      const source = nodeById.get(edge.source);
+      const target = nodeById.get(edge.target);
+      if (!source || !target || source.type === "any" || target.type === "play" || target.type === "any") continue;
+      const sourceRank = rankById.get(source.id) ?? fallbackLayoutRank(source);
+      const nextRank = Math.min(maxLayoutRank, sourceRank + 1);
+      if ((rankById.get(target.id) ?? 0) >= nextRank) continue;
+      rankById.set(target.id, nextRank);
+      changed = true;
+    }
+    if (!changed) break;
+  }
+
+  return rankById;
+}
+
+function feedbackLayoutEdgeIds(nodes, edges, nodeById) {
+  const outgoingBySource = outgoingEdgesBySource(edges, nodeById);
+  const visitStateById = new Map();
+  const feedbackEdgeIds = new Set();
+
+  function visit(nodeId) {
+    visitStateById.set(nodeId, "visiting");
+    for (const edge of outgoingBySource.get(nodeId) ?? []) {
+      const target = nodeById.get(edge.target);
+      if (!target || target.type === "play" || target.type === "any") continue;
+      const targetState = visitStateById.get(target.id);
+      if (targetState === "visiting") {
+        feedbackEdgeIds.add(edge.id);
+        continue;
+      }
+      if (!targetState) visit(target.id);
+    }
+    visitStateById.set(nodeId, "visited");
+  }
+
+  for (const node of nodes) {
+    if (node.type === "play" && !visitStateById.has(node.id)) visit(node.id);
+  }
+  for (const node of nodes) {
+    if (node.type !== "any" && !visitStateById.has(node.id)) visit(node.id);
+  }
+
+  return feedbackEdgeIds;
+}
+
+function outgoingEdgesBySource(edges, nodeById) {
+  const outgoingBySource = new Map();
+  for (const edge of edges) {
+    if (!nodeById.has(edge.source) || !nodeById.has(edge.target)) continue;
+    const outgoing = outgoingBySource.get(edge.source) ?? [];
+    outgoing.push(edge);
+    outgoingBySource.set(edge.source, outgoing);
+  }
+  return outgoingBySource;
+}
+
+function fallbackLayoutRank(node) {
+  if (node.type === "play" || node.type === "any") return 0;
+  return 1;
+}
+
+function incomingEdgesByTarget(edges, nodeById) {
+  const incomingByTarget = new Map();
+  for (const edge of edges) {
+    if (!nodeById.has(edge.source) || !nodeById.has(edge.target)) continue;
+    const incoming = incomingByTarget.get(edge.target) ?? [];
+    incoming.push(edge);
+    incomingByTarget.set(edge.target, incoming);
+  }
+  return incomingByTarget;
+}
+
+function layoutNodeSort(left, right, context) {
+  return layoutPredecessorRowScore(left, context) - layoutPredecessorRowScore(right, context) ||
+    layoutNodeTypeOrder(left) - layoutNodeTypeOrder(right) ||
+    (context.originalIndexById.get(left.id) ?? 0) - (context.originalIndexById.get(right.id) ?? 0) ||
+    left.id.localeCompare(right.id);
+}
+
+function layoutPredecessorRowScore(node, { feedbackSourceNodeIds = new Set(), incomingByTarget, rankById, rowById }) {
+  const nodeRank = rankById.get(node.id) ?? fallbackLayoutRank(node);
+  const predecessorRows = (incomingByTarget.get(node.id) ?? []).flatMap((edge) => {
+    const sourceRank = rankById.get(edge.source);
+    const sourceRow = rowById.get(edge.source);
+    return sourceRank !== undefined && sourceRank < nodeRank && sourceRow !== undefined ? [sourceRow] : [];
+  });
+  const row = predecessorRows.length === 0
+    ? defaultLayoutRow(node)
+    : predecessorRows.reduce((sum, row) => sum + row, 0) / predecessorRows.length;
+  return feedbackSourceNodeIds.has(node.id) ? row + 2 : row;
+}
+
+function desiredLayoutRow(node, context) {
+  return Math.round(layoutPredecessorRowScore(node, context));
+}
+
+function defaultLayoutRow(node) {
+  if (node.type === "any") return 1;
+  return 0;
+}
+
+function layoutNodeTypeOrder(node) {
+  if (node.type === "play") return 0;
+  if (node.type === "agent" || node.type === "graph") return 1;
+  if (node.type === "expression") return 2;
+  if (node.type === "any") return 3;
+  return 4;
+}
+
+function nearestAvailableLayoutRow(row, occupiedRows) {
+  const base = Number.isFinite(row) ? Math.max(0, Math.round(row)) : 0;
+  if (!occupiedRows.has(base)) return base;
+  for (let offset = 1; offset <= occupiedRows.size + 1; offset += 1) {
+    const lower = base - offset;
+    const higher = base + offset;
+    if (lower >= 0 && !occupiedRows.has(lower)) return lower;
+    if (!occupiedRows.has(higher)) return higher;
+  }
+  return occupiedRows.size;
 }
 
 function normalizeGeneratedEdges(value, { nodes, nodeIdByKey, resultIds, customResults }) {
@@ -595,6 +766,29 @@ function normalizeGraphReviewChanges(value) {
       detail: compactSingleLine(detail, 320),
     }];
   });
+}
+
+function projectWithoutLayoutFields(project) {
+  const record = asRecord(project);
+  const graph = asRecord(record.graph);
+  return {
+    ...record,
+    graph: {
+      ...graph,
+      nodes: (Array.isArray(graph.nodes) ? graph.nodes : []).map(nodeWithoutLayoutFields),
+      edges: (Array.isArray(graph.edges) ? graph.edges : []).map(edgeWithoutLayoutFields),
+    },
+  };
+}
+
+function nodeWithoutLayoutFields(node) {
+  const { x, y, ...topologyNode } = asRecord(node);
+  return topologyNode;
+}
+
+function edgeWithoutLayoutFields(edge) {
+  const { routingMode, waypoints, bend, sourceAnchor, targetAnchor, ...topologyEdge } = asRecord(edge);
+  return topologyEdge;
 }
 
 function stripInternalKeys(record) {
@@ -719,8 +913,4 @@ function stringValue(value) {
 
 function textValue(value) {
   return typeof value === "string" ? value : "";
-}
-
-function numberValue(value, fallback) {
-  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
