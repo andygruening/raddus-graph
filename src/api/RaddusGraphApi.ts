@@ -14,6 +14,22 @@ export interface ModelCatalogEntry {
   defaultReasoningEffort?: string | null;
 }
 
+export interface ModelCatalogRunner {
+  id: RunnerId;
+  label: string;
+  command: string;
+  available: boolean;
+  source: string;
+  error: string | null;
+  version?: string;
+}
+
+export interface ModelCatalogResult {
+  models: ModelCatalogEntry[];
+  runners: ModelCatalogRunner[];
+  checkedAt: string;
+}
+
 export interface ReasoningEffortOption {
   id: string;
   label: string;
@@ -45,6 +61,7 @@ export interface GraphNode {
   repository?: string | null;
   branch?: string | null;
   agentId?: string | null;
+  maxRunsPerSession?: number | null;
   resultId?: string;
   graphId?: string | null;
 }
@@ -256,8 +273,8 @@ export class RaddusGraphApi {
     return requestJson<GraphState>("/api/graph/state", jsonInit("PUT", state));
   }
 
-  getModels(): Promise<{ models: ModelCatalogEntry[] }> {
-    return requestJson<{ models: ModelCatalogEntry[] }>("/api/graph/models");
+  getModels(): Promise<ModelCatalogResult> {
+    return requestJson<ModelCatalogResult>("/api/graph/models");
   }
 
   getCliStatus(): Promise<AgentCliStatusResult> {
@@ -294,6 +311,10 @@ export class RaddusGraphApi {
 
   continueSession(sessionId: string): Promise<{ session: GraphSession }> {
     return requestJson<{ session: GraphSession }>(`/api/graph/sessions/${encodeURIComponent(sessionId)}/continue`, jsonInit("POST"));
+  }
+
+  openSessionWorkspace(sessionId: string): Promise<{ workspacePath: string }> {
+    return requestJson<{ workspacePath: string }>(`/api/graph/sessions/${encodeURIComponent(sessionId)}/open-workspace`, jsonInit("POST"));
   }
 
   deleteSession(sessionId: string): Promise<{ removedSessionId: string; sessions: GraphSession[] }> {

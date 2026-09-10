@@ -72,6 +72,73 @@ test("child graphs show non-removable parent graph references", async () => {
   assert.match(css, /\.project-node\.parent-graph-reference\.dragging/);
 });
 
+test("child graph views can follow parent-launched sessions", async () => {
+  const app = await readFile(new URL("../src/App.tsx", import.meta.url), "utf8");
+
+  assert.ok(
+    app.includes("graphSessionIncludesProject(session, state.selectedProjectId)"),
+    "The selected project's sessions should include parent sessions that have entered the child graph.",
+  );
+  assert.ok(
+    app.includes("agentSession.graphId === projectId"),
+    "A graph session should be considered relevant to a child project when an agent session ran inside it.",
+  );
+  assert.ok(
+    app.includes("pendingReview?.graphId === projectId"),
+    "Waiting review sessions should remain visible when the pending review belongs to the child graph.",
+  );
+  assert.ok(
+    app.includes("const nextFollowedSessionId = latestSession?.id ?? null"),
+    "The canvas should reattach to the latest relevant session after polling or hot reload.",
+  );
+  assert.equal(
+    app.includes("session.projectId === state.selectedProjectId"),
+    false,
+    "Child project follow state should not be limited to sessions launched directly from that project.",
+  );
+});
+
+test("clicking canvas nodes does not open the sessions dialog", async () => {
+  const app = await readFile(new URL("../src/App.tsx", import.meta.url), "utf8");
+  const nodeMapStart = app.indexOf("{state?.graph.nodes.map");
+  const parentReferenceStart = app.indexOf("{parentGraphReferences.map", nodeMapStart);
+  const nodeMapBlock = app.slice(nodeMapStart, parentReferenceStart);
+
+  assert.ok(nodeMapStart >= 0 && parentReferenceStart > nodeMapStart, "Canvas node rendering block should be present.");
+  assert.equal(
+    nodeMapBlock.includes('setDialog({ type: "sessions" })'),
+    false,
+    "Canvas node clicks should not open the sessions dialog.",
+  );
+  assert.equal(
+    nodeMapBlock.includes("setFocusedAgentSessionId(latestAgentSession.id)"),
+    false,
+    "Canvas node clicks should not focus transcript turns as a side effect.",
+  );
+});
+
+test("agent details window edits maximum runs on the selected node card", async () => {
+  const [app, api] = await Promise.all([
+    readFile(new URL("../src/App.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../src/api/RaddusGraphApi.ts", import.meta.url), "utf8"),
+  ]);
+  const nodeMapStart = app.indexOf("{state?.graph.nodes.map");
+  const parentReferenceStart = app.indexOf("{parentGraphReferences.map", nodeMapStart);
+  const nodeMapBlock = app.slice(nodeMapStart, parentReferenceStart);
+
+  assert.ok(api.includes("maxRunsPerSession?: number | null"), "Graph nodes should carry the per-card run limit.");
+  assert.ok(app.includes('| { type: "agent-details"; agentId: string; nodeId?: string }'), "Agent details dialog state should optionally bind a selected node.");
+  assert.ok(
+    nodeMapBlock.includes('setDialog({ type: "agent-details", agentId: node.agentId, nodeId: node.id })'),
+    "Opening an agent card should bind the dialog to that card's node id.",
+  );
+  assert.ok(app.includes("agentNode={dialog.nodeId ? state.graph.nodes.find"), "AgentDialog should receive the selected graph node.");
+  assert.ok(app.includes("<span>Maximum runs per session</span>"), "AgentDialog should render the node-scoped number input.");
+  assert.ok(app.includes("normalizeMaxRunsPerSessionInput(nodeMaxRunsDraft)"), "The number input should save through the node patch.");
+  assert.ok(app.includes("updateAgentDetails(dialog.agentId, draft, dialog.nodeId, nodePatch)"), "Agent and node edits should save together.");
+  assert.ok(app.includes('onOpenAgent={(agent) => setDialog({ type: "agent-details", agentId: agent.id })}'), "Palette agent details should remain agent-only.");
+});
+
 test("canvas keyboard shortcuts use graph, palette, sessions, play, create, and session chords", async () => {
   const app = await readFile(new URL("../src/App.tsx", import.meta.url), "utf8");
 

@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { availableResultsForAgent, buildAgentPrompt, cliArgsForRunner, continuationTargetForSession, nextGraphRouteFromOutcome, reviewQuestionFromAgentSession, statusPayloadsFromText } from "../server/graphRuntime.mjs";
+import { basename } from "node:path";
+import { agentNodeRunCountForSession, availableResultsForAgent, buildAgentPrompt, cliArgsForRunner, continuationTargetForSession, maxRunsReachedForNode, nextGraphRouteFromOutcome, reviewQuestionFromAgentSession, statusFilePathForGraphSession, statusFileTextAfterOffset, statusPayloadsFromText } from "../server/graphRuntime.mjs";
 
 test("runAgentNode receives userPrompt before building an agent prompt", async () => {
   const source = await readFile(new URL("../server/graphRuntime.mjs", import.meta.url), "utf8");
@@ -45,6 +46,18 @@ test("codex runner args include explicit reasoning effort when selected", () => 
   ]);
 });
 
+test("claude runner args include explicit reasoning effort when selected", () => {
+  const { args, input } = cliArgsForRunner(
+    "claude",
+    { model: "claude-sonnet-4-6", modelReasoningEffort: "high" },
+    "/tmp/raddus-workspace",
+    "Run the graph.",
+  );
+
+  assert.equal(input, undefined);
+  assert.deepEqual(args, ["-p", "Run the graph.", "--model", "claude-sonnet-4-6", "--effort", "high"]);
+});
+
 test("status file parser accepts newline-delimited JSON callbacks", () => {
   const { payloads, errors } = statusPayloadsFromText([
     '{"state":"working","summary":"Started implementation."}',
@@ -69,6 +82,25 @@ test("status file parser rejects non-object entries without dropping valid lines
   assert.equal(payloads[0].state, "working");
   assert.equal(payloads[1].state, "failed");
   assert.equal(errors.length, 2);
+});
+
+test("graph session status file is shared, visible, and retained after parsing", async () => {
+  const source = await readFile(new URL("../server/graphRuntime.mjs", import.meta.url), "utf8");
+  const statusFileName = basename(statusFilePathForGraphSession("/tmp/raddus-workspace"));
+  const previousRun = '{"state":"completed","resultId":"done","summary":"Previous agent."}\n';
+  const currentRun = '{"state":"working","summary":"Current agent started."}\n{"state":"completed","resultId":"done","summary":"Current agent done."}\n';
+  const { payloads, errors } = statusPayloadsFromText(statusFileTextAfterOffset(
+    Buffer.from(previousRun + currentRun, "utf8"),
+    Buffer.byteLength(previousRun),
+  ));
+
+  assert.equal(source.includes("rm(statusFilePath"), false);
+  assert.equal(source.includes("`.raddus-graph-status-"), false);
+  assert.equal(source.includes("statusFilePathForAgentSession"), false);
+  assert.equal(statusFileName, "raddus-graph-status.jsonl");
+  assert.equal(statusFileName.startsWith("."), false);
+  assert.deepEqual(errors, []);
+  assert.deepEqual(payloads.map((payload) => payload.summary), ["Current agent started.", "Current agent done."]);
 });
 
 test("agent prompt is structured markdown with history output and user context last", () => {
@@ -177,6 +209,7 @@ test("agent prompt result IDs are limited to reachable expression routes", () =>
       { id: "expr-blocked", type: "expression", resultId: "blocked" },
       { id: "expr-completed", type: "expression", resultId: "completed" },
       { id: "expr-failed", type: "expression", resultId: "failed" },
+      { id: "expr-max-runs", type: "expression", resultId: "max-runs-reached" },
       { id: "expr-default", type: "expression", resultId: "default" },
       { id: "expr-loop", type: "expression", resultId: "loop" },
       { id: "play-loop", type: "play" },
@@ -192,6 +225,8 @@ test("agent prompt result IDs are limited to reachable expression routes", () =>
       { id: "edge-completed-b", source: "expr-completed", target: "agent-b", type: "routes", resultId: "completed" },
       { id: "edge-a-failed", source: "agent-a", target: "expr-failed", type: "evaluates" },
       { id: "edge-failed-b", source: "expr-failed", target: "agent-b", type: "routes", resultId: "failed" },
+      { id: "edge-a-max-runs", source: "agent-a", target: "expr-max-runs", type: "evaluates" },
+      { id: "edge-max-runs-b", source: "expr-max-runs", target: "agent-b", type: "routes", resultId: "max-runs-reached" },
       { id: "edge-a-default", source: "agent-a", target: "expr-default", type: "evaluates" },
       { id: "edge-default-b", source: "expr-default", target: "agent-b", type: "routes", resultId: "default" },
       { id: "edge-a-loop", source: "agent-a", target: "expr-loop", type: "evaluates" },
@@ -211,6 +246,7 @@ test("agent prompt result IDs are limited to reachable expression routes", () =>
       { id: "manual", description: "Disconnected route" },
       { id: "completed", description: "Built-in completed route", reserved: true },
       { id: "failed", description: "Built-in failed route", reserved: true },
+      { id: "max-runs-reached", description: "Built-in max runs route", reserved: true },
       { id: "default", description: "Built-in default route", reserved: true },
     ],
     node: { id: "agent-a", type: "agent", agentId: "agent-a" },
@@ -221,6 +257,118 @@ test("agent prompt result IDs are limited to reachable expression routes", () =>
     { id: "completed", description: "Built-in completed route" },
     { id: "ask-for-approval", description: "Pause the graph and ask the user for approval." },
   ]);
+});
+
+test("maximum runs are scoped to the selected graph node card", () => {
+  const session = {
+    agentSessions: [
+      {
+        id: "agent-session-a-1",
+        sequence: 1,
+        graphId: "project-main",
+        nodeId: "shipper-a",
+        agentId: "shipper",
+        terminalOutcome: { state: "completed", routedResultId: "completed", routeReason: "default_completed" },
+      },
+      {
+        id: "agent-session-a-2",
+        sequence: 2,
+        graphId: "project-main",
+        nodeId: "shipper-a",
+        agentId: "shipper",
+        terminalOutcome: { state: "failed", routedResultId: "failed", routeReason: "failed" },
+      },
+      {
+        id: "agent-session-b-1",
+        sequence: 3,
+        graphId: "project-main",
+        nodeId: "shipper-b",
+        agentId: "shipper",
+        terminalOutcome: { state: "completed", routedResultId: "completed", routeReason: "default_completed" },
+      },
+      {
+        id: "agent-session-child",
+        sequence: 4,
+        graphId: "project-child",
+        nodeId: "shipper-a",
+        agentId: "shipper",
+        terminalOutcome: { state: "completed", routedResultId: "completed", routeReason: "default_completed" },
+      },
+      {
+        id: "agent-session-max",
+        sequence: 5,
+        graphId: "project-main",
+        nodeId: "shipper-a",
+        agentId: "shipper",
+        terminalOutcome: { state: "completed", routedResultId: "max-runs-reached", routeReason: "max_runs_reached" },
+      },
+    ],
+  };
+
+  assert.equal(agentNodeRunCountForSession({
+    session,
+    graphId: "project-main",
+    node: { id: "shipper-a", type: "agent", agentId: "shipper" },
+  }), 2);
+  assert.equal(maxRunsReachedForNode({
+    session,
+    graphId: "project-main",
+    node: { id: "shipper-a", type: "agent", agentId: "shipper", maxRunsPerSession: 2 },
+  }), true);
+  assert.equal(maxRunsReachedForNode({
+    session,
+    graphId: "project-main",
+    node: { id: "shipper-b", type: "agent", agentId: "shipper", maxRunsPerSession: 2 },
+  }), false);
+});
+
+test("max-runs-reached routes are app-owned and hidden from agent prompts", () => {
+  const graph = {
+    nodes: [
+      { id: "agent-a", type: "agent", agentId: "agent-a" },
+      { id: "agent-b", type: "agent", agentId: "agent-b" },
+      { id: "expr-max-runs", type: "expression", resultId: "max-runs-reached" },
+    ],
+    edges: [
+      { id: "edge-a-max-runs", source: "agent-a", target: "expr-max-runs", type: "evaluates" },
+      { id: "edge-max-runs-b", source: "expr-max-runs", target: "agent-b", type: "routes", resultId: "max-runs-reached" },
+    ],
+  };
+
+  const availableResults = availableResultsForAgent({
+    graph,
+    results: [{ id: "max-runs-reached", description: "Node limit reached.", reserved: true }],
+    node: { id: "agent-a", type: "agent", agentId: "agent-a", maxRunsPerSession: 1 },
+  });
+  assert.deepEqual(availableResults, [
+    { id: "ask-for-approval", description: "Pause the graph and ask the user for approval." },
+  ]);
+
+  const prompt = buildAgentPrompt({
+    session: {
+      id: "graph-session-max-runs",
+      prompt: "Run the graph.",
+      repository: null,
+      workspacePath: "/tmp/raddus-workspace",
+      agentSessions: [],
+    },
+    graph,
+    agents: [{ id: "agent-a", name: "Agent A", model: "gpt-5", systemPrompt: "" }],
+    results: [{ id: "max-runs-reached", description: "Node limit reached.", reserved: true }],
+    node: { id: "agent-a", type: "agent", agentId: "agent-a", maxRunsPerSession: 1 },
+    agent: { id: "agent-a", name: "Agent A", model: "gpt-5", systemPrompt: "" },
+    agentSession: { id: "agent-session-a" },
+    upstreamAgentSessionIds: [],
+  });
+  assert.equal(prompt.includes("max-runs-reached"), false);
+
+  const route = nextGraphRouteFromOutcome({
+    graph,
+    currentAgentNode: { id: "agent-a", type: "agent", agentId: "agent-a", maxRunsPerSession: 1 },
+    outcome: { state: "completed", routedResultId: "max-runs-reached" },
+  });
+  assert.equal(route?.node.id, "agent-b");
+  assert.deepEqual(route?.edgeIds, ["edge-a-max-runs", "edge-max-runs-b"]);
 });
 
 test("any card expressions apply to every agent while direct expressions take precedence", () => {

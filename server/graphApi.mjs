@@ -3,7 +3,8 @@ import { generateProjectFromPrompt, reviewProjectFromPrompt } from "./graphGener
 import { listBranches, listRepositories } from "./github.mjs";
 import { readGraphData, replaceGraphState } from "./graphStore.mjs";
 import { appendCallbackStatus, continueGraphSession, createGraphSession, deleteGraphSession, stopGraphSession, submitReviewResponse } from "./graphRuntime.mjs";
-import { modelCatalog } from "./modelCatalog.mjs";
+import { refreshModelCatalog } from "./modelCatalog.mjs";
+import { openWorkspaceDirectory } from "./openWorkspaceDirectory.mjs";
 import { commandWorks } from "./processUtils.mjs";
 import { HttpError } from "./errors.mjs";
 import { asPayload, readJsonBody, sendJson } from "./httpUtils.mjs";
@@ -24,7 +25,7 @@ export async function handleGraphApi(req, res, url) {
   }
 
   if (resource === "models" && req.method === "GET" && segments.length === 1) {
-    sendJson(res, 200, { models: modelCatalog });
+    sendJson(res, 200, await refreshModelCatalog());
     return;
   }
 
@@ -110,6 +111,13 @@ export async function handleGraphApi(req, res, url) {
     } catch (error) {
       throw new HttpError(400, error instanceof Error ? error.message : String(error));
     }
+    return;
+  }
+
+  if (resource === "sessions" && id && child === "open-workspace" && req.method === "POST" && segments.length === 3) {
+    const session = (await readGraphData()).sessions.find((candidate) => candidate.id === id);
+    if (!session) throw new HttpError(404, "Graph session not found.");
+    sendJson(res, 200, await openWorkspaceDirectory(session.workspacePath));
     return;
   }
 
